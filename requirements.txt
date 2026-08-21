@@ -1,8 +1,13 @@
-# 后端依赖（模型推理由 Ollama 完成，因此无需安装 torch/transformers 等重量级依赖）
+# 后端依赖（模型推理由 Ollama 完成）
 fastapi>=0.110
 uvicorn[standard]>=0.29
 requests>=2.31
 pillow>=10.0
+
+# 文生图 / 图片微改（Stable Diffusion，diffusers）
+diffusers>=0.30
+accelerate>=0.30
+torch>=2.2
 
 # 打包应用
 pyinstaller>=6.0

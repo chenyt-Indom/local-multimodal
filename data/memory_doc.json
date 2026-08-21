@@ -1,0 +1,33 @@
+{
+  "sections": [
+    {
+      "id": "0124e7f7f96d",
+      "title": "工作背景",
+      "content": "",
+      "created_at": 1787328585.6526499,
+      "updated_at": 1787328585.6526504
+    },
+    {
+      "id": "4ac2d8e109ab",
+      "title": "个人背景",
+      "content": "",
+      "created_at": 1787328585.6526582,
+      "updated_at": 1787328585.6526582
+    },
+    {
+      "id": "2fde197cc67d",
+      "title": "当前关注",
+      "content": "",
+      "created_at": 1787328585.652661,
+      "updated_at": 1787328585.652661
+    },
+    {
+      "id": "76f6b0ce862b",
+      "title": "近期动态",
+      "content": "",
+      "created_at": 1787328585.652663,
+      "updated_at": 1787328585.652663
+    }
+  ],
+  "updated_at": 1787328595.1670895
+}

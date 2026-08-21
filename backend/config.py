@@ -21,6 +21,19 @@ DEFAULT_CONFIG = {
     "num_ctx": 4096,
     # Qwen3-VL 思考模式会先占用大量 token，放大配额避免回答被思考吃光
     "max_tokens": 2048,
+    # —— 能力开关（前端控制）——
+    "rag_enabled": False,        # 知识库检索增强生成开关
+    "web_enabled": False,        # 联网搜索开关（默认关闭，打开才会联网）
+    "memory_enabled": True,      # 长期记忆开关
+    "auto_memorize": True,       # 对话后自动提取重要内容存入短期记忆
+    # 联网搜索每轮最多注入结果条数
+    "web_top_k": 4,
+    # RAG 每轮最多检索文档数
+    "rag_top_k": 4,
+    # 记忆每轮最多注入条数
+    "memory_top_k": 5,
+    # 可调用的外部 API 工具（前端设置界面可配置）
+    "api_tools": [],
 }
 
 

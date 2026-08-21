@@ -55,8 +55,10 @@ class OllamaClient:
 
     # ---------- 对话 ----------
     def chat(self, messages: list, model: str, stream: bool = True,
-             images_base64: list | None = None, params: dict | None = None):
-        """发送对话。images_base64 为图片 base64 字符串列表（附加到最后一条 user 消息）。"""
+             images_base64: list | None = None, params: dict | None = None,
+             tools: list | None = None):
+        """发送对话。images_base64 为图片 base64 字符串列表（附加到最后一条 user 消息）。
+        tools 为函数调用 schema 列表，用于 Agent 工具循环。"""
         payload = {"model": model, "messages": messages, "stream": stream}
         if params:
             payload["options"] = {
@@ -64,6 +66,8 @@ class OllamaClient:
                 "num_ctx": params.get("num_ctx"),
                 "num_predict": params.get("max_tokens"),
             }
+        if tools:
+            payload["tools"] = tools
         # 把图片附加到最后一条 user 消息
         if images_base64:
             last_user = next(x for x in reversed(messages) if x["role"] == "user")

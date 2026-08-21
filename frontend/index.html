@@ -7,13 +7,13 @@
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <!-- 侧边栏：模型管理 + 设置 -->
+  <!-- 侧边栏：状态 + 文段式记忆库 -->
   <aside class="sidebar" id="sidebar">
     <div class="brand">
       <div class="logo">◉</div>
       <div>
         <h1>本地多模态</h1>
-        <p class="sub">Qwen3-VL 本地助手 · 数据不出机</p>
+        <p class="sub">Qwen 智能体 · 数据不出机</p>
       </div>
     </div>
 
@@ -21,65 +21,69 @@
       <span class="dot" id="statusDot"></span>
       <div>
         <b id="statusTitle">检测中…</b>
-        <p id="statusDetail">正在连接 Ollama</p>
+        <p id="statusDetail">正在连接本地模型</p>
       </div>
     </div>
 
-    <section class="panel">
-      <h2>模型管理</h2>
-      <div class="model-select">
-        <label>推理模型</label>
-        <select id="modelSelect"></select>
+    <!-- 抱负操作无需按钮：直接对话驱动 -->
+    <section class="panel memory" id="memoryPanel">
+      <h2>🧠 记忆库 · 文段式</h2>
+      <p class="hint">记忆按分区文段整体维护（如 工作背景 / 个人背景 / 当前关注 / 近期动态）。AI 会自动更新补充；你也可直接编辑、删除、新增文段。</p>
+      <div class="row">
+        <input type="text" id="secTitleInput" placeholder="新分区标题，如 工作背景" />
+        <button class="btn sm" id="secAdd">＋ 新增</button>
       </div>
-      <button class="btn" id="refreshModels">刷新模型列表</button>
-      <details>
-        <summary>下载默认模型（约 8GB）</summary>
-        <p class="hint">确保 Ollama 已安装，点击后开始拉取 <code>qwen3-vl:8b</code>。</p>
-        <button class="btn primary" id="pullModel">开始下载</button>
-      </details>
-    </section>
-
-    <section class="panel">
-      <h2>推理参数</h2>
-      <label>温度 <span id="tempVal">0.7</span></label>
-      <input type="range" id="temperature" min="0" max="2" step="0.05" value="0.7" />
-      <label>上下文长度 num_ctx</label>
-      <input type="number" id="numCtx" value="4096" min="512" step="512" />
-      <label>最大生成长度</label>
-      <input type="number" id="maxTokens" value="1024" min="64" step="64" />
-      <button class="btn" id="saveConfig">保存参数</button>
-      <p class="hint saved" id="saveTip">✔ 已保存</p>
+      <div class="mini-toolbar">
+        <button class="btn sm ghost" id="memRefresh">刷新</button>
+        <button class="btn sm ghost danger" id="memClearAll">清空全部</button>
+      </div>
+      <div class="list" id="memoryList">
+        <p class="hint">暂无记忆文段。AI 会在对话中按"分区文段"自动写入，也可手动新增。</p>
+      </div>
     </section>
   </aside>
 
   <!-- 主聊天区 -->
-  <main class="main">
+  <main class="main" id="main">
     <header class="chat-header">
       <button class="icon-btn" id="toggleSidebar">☰</button>
-      <h2>多模态对话</h2>
-      <span class="privacy">🔒 完全本地·本地可离线运行</span>
+      <h2>智能体对话</h2>
+      <span class="privacy">🤖 自主规划 · 调用工具 · 完全本地</span>
     </header>
+
+    <!-- 顶部正中：能力开关（极简，仅开关，无复杂输入） -->
+    <div class="top-bar" id="topBar">
+      <label class="pill" data-cfg="memory_enabled"><i class="sw"></i>长期记忆</label>
+      <label class="pill" data-cfg="rag_enabled"><i class="sw"></i>知识库</label>
+      <label class="pill" data-cfg="web_enabled"><i class="sw"></i>联网</label>
+      <label class="pill" data-cfg="auto_memorize"><i class="sw"></i>自动记忆</label>
+    </div>
 
     <div class="messages" id="messages">
       <div class="msg bot">
         <div class="bubble">
-          你好，我是本地多模态助手。可以帮我做什么？<br />
-          · 写周报、邮件、文案<br />
-          · 总结文章 / 文档<br />
-          · 「看图」按钮上传图片，让我描述或识别内容
+          你好，我是你的本地智能体。<br />
+          · 直接描述需求，我会 <b>自主规划并调用工具</b> 完成任务<br />
+          &nbsp;&nbsp;📁 读取 / 搜索 / 修改本机文件 &nbsp;·&nbsp; 🎨 文生图 &nbsp;·&nbsp; 🖼 图片微改<br />
+          &nbsp;&nbsp;🧠 按"分区文段"持续更新长期记忆 &nbsp;·&nbsp; 🕐 查询时间<br />
+          · <b>拖拽图片</b>到聊天框可传给 AI 理解，或要求我"把这张图…"进行微改<br />
+          · 需要长期记住的内容交给我判断，随时可在左侧记忆库查看/编辑
         </div>
       </div>
     </div>
 
     <div class="composer">
       <div class="attachments" id="attachments"></div>
+      <div class="drop-hint" id="dropHint">松开鼠标导入图片/文件</div>
       <div class="input-row">
         <button class="icon-btn" id="attachBtn" title="上传图片">🖼</button>
+        <button class="icon-btn" id="videoBtn" title="上传视频">🎬</button>
         <input type="file" id="fileInput" accept="image/*" multiple hidden />
-        <textarea id="input" rows="1" placeholder="输入指令…（Enter 发送，Shift+Enter 换行）"></textarea>
+        <input type="file" id="videoInput" accept="video/*" hidden />
+        <textarea id="input" rows="1" placeholder="描述需求：画一只机器人 · 读取报告.txt 并改错别字 · 记住我喜欢中文交流 · （拖图可微改）"></textarea>
         <button class="btn primary send" id="sendBtn">发送</button>
       </div>
-      <p class="tip">支持多模态：文字、图片识别。全部在本机运行，不经过任何外部服务器。</p>
+      <p class="tip">智能体模式：直接说指令，AI 自主规划并调用工具完成任务。数据均在本机处理。</p>
     </div>
   </main>
 
