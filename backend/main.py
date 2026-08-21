@@ -8,7 +8,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import Response, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 
 import os
@@ -89,10 +89,14 @@ async def chat(req: ChatRequest):
         return resp.json()
 
     async def gen():
-        for line in resp.iter_lines(decode_unicode=True):
-            if line:
-                yield line + "\n"
-    return Response(gen(), media_type="application/x-ndjson")
+        # iter_lines() 可能返回 bytes，需统一解码成 str 再拼接
+        for line in resp.iter_lines(decode_unicode=False):
+            if not line:
+                continue
+            if isinstance(line, bytes):
+                line = line.decode("utf-8")
+            yield line + "\n"
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
 # ---------- 前端 ----------

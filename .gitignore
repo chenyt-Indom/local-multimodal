@@ -9,6 +9,7 @@ config.json
 build/exe/
 build/warn-*.txt
 build/*.pyc
+build/本地多模态助手/
 dist/
 *.spec.bak
 

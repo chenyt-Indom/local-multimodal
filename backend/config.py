@@ -17,8 +17,10 @@ DEFAULT_CONFIG = {
     "default_model": "qwen3-vl:8b",
     # 推理参数
     "temperature": 0.7,
-    "num_ctx": 8192,
-    "max_tokens": 1024,
+    # 12GB 显卡建议 4096：Q4 模型仅占~6GB，为上下文/浏览器留足显存余量
+    "num_ctx": 4096,
+    # Qwen3-VL 思考模式会先占用大量 token，放大配额避免回答被思考吃光
+    "max_tokens": 2048,
 }
 
 

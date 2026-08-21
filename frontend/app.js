@@ -156,7 +156,24 @@
     // 更新上下文
     history.push({ role: "user", content: promptText });
 
-    const think = showThinking("本地模型思考中…");
+    // 思考过程与回答分开展示（Qwen3-VL 会先输出 message.thinking）
+    const thinkWrap = document.createElement("div");
+    thinkWrap.className = "msg bot";
+    const thinkBubble = document.createElement("div");
+    thinkBubble.className = "bubble thinking";
+    thinkBubble.textContent = "本地模型思考中…";
+    thinkWrap.appendChild(thinkBubble);
+    messagesEl.appendChild(thinkWrap);
+
+    const answerWrap = document.createElement("div");
+    answerWrap.className = "msg bot";
+    const answerBubble = document.createElement("div");
+    answerBubble.className = "bubble";
+    answerBubble.textContent = "…";
+    answerWrap.appendChild(answerBubble);
+    messagesEl.appendChild(answerWrap);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+
     streaming = true;
     $("#sendBtn").disabled = true;
 
@@ -169,9 +186,7 @@
       }
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
-      let buf = "", answer = "";
-      const botBubble = think.querySelector(".bubble");
-      botBubble.classList.remove("thinking");
+      let buf = "", thinking = "", answer = "";
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
@@ -181,19 +196,27 @@
           if (!line.trim()) continue;
           try {
             const obj = JSON.parse(line);
-            if (obj.message && obj.message.content) {
-              answer += obj.message.content;
-              botBubble.textContent = answer + "▌";
+            if (obj.message) {
+              if (obj.message.thinking) {
+                thinking += obj.message.thinking;
+                thinkBubble.textContent = "🧠 " + thinking + "▌";
+              }
+              if (obj.message.content) {
+                answer += obj.message.content;
+                answerBubble.textContent = answer + "▌";
+              }
             }
             if (obj.done) break;
           } catch {}
         }
         messagesEl.scrollTop = messagesEl.scrollHeight;
       }
-      botBubble.textContent = answer;
+      thinkBubble.textContent = thinking ? "思考过程\n" + thinking : "（无思考输出）";
+      answerBubble.textContent = answer;
+      if (!answer) { answerWrap.style.display = "none"; answer = "（模型仅返回了思考过程，未给出回答）"; }
       if (answer) history.push({ role: "assistant", content: answer });
     } catch (err) {
-      think.querySelector(".bubble").textContent = "❌ " + err.message + "（可能内存/模型未就绪，请查看状态）";
+      answerBubble.textContent = "❌ " + err.message + "（可能内存/模型未就绪，请查看状态）";
     } finally {
       streaming = false; $("#sendBtn").disabled = false;
     }
