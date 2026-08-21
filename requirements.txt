@@ -1,0 +1,8 @@
+# 后端依赖（模型推理由 Ollama 完成，因此无需安装 torch/transformers 等重量级依赖）
+fastapi>=0.110
+uvicorn[standard]>=0.29
+requests>=2.31
+pillow>=10.0
+
+# 打包应用
+pyinstaller>=6.0

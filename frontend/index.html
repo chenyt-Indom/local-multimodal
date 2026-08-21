@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>本地多模态助手</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!-- 侧边栏：模型管理 + 设置 -->
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="logo">◉</div>
+      <div>
+        <h1>本地多模态</h1>
+        <p class="sub">Qwen3-VL 离线助手 · 数据不出机</p>
+      </div>
+    </div>
+
+    <div class="status-card" id="statusCard">
+      <span class="dot" id="statusDot"></span>
+      <div>
+        <b id="statusTitle">检测中…</b>
+        <p id="statusDetail">正在连接 Ollama</p>
+      </div>
+    </div>
+
+    <section class="panel">
+      <h2>模型管理</h2>
+      <div class="model-select">
+        <label>推理模型</label>
+        <select id="modelSelect"></select>
+      </div>
+      <button class="btn" id="refreshModels">刷新模型列表</button>
+      <details>
+        <summary>下载默认模型（约 8GB）</summary>
+        <p class="hint">确保 Ollama 已安装，点击后开始拉取 <code>qwen3-vl:8b</code>。</p>
+        <button class="btn primary" id="pullModel">开始下载</button>
+      </details>
+    </section>
+
+    <section class="panel">
+      <h2>推理参数</h2>
+      <label>温度 <span id="tempVal">0.7</span></label>
+      <input type="range" id="temperature" min="0" max="2" step="0.05" value="0.7" />
+      <label>上下文长度 num_ctx</label>
+      <input type="number" id="numCtx" value="8192" min="512" step="512" />
+      <label>最大生成长度</label>
+      <input type="number" id="maxTokens" value="1024" min="64" step="64" />
+      <button class="btn" id="saveConfig">保存参数</button>
+      <p class="hint saved" id="saveTip">✔ 已保存</p>
+    </section>
+  </aside>
+
+  <!-- 主聊天区 -->
+  <main class="main">
+    <header class="chat-header">
+      <button class="icon-btn" id="toggleSidebar">☰</button>
+      <h2>多模态对话</h2>
+      <span class="privacy">🔒 完全本地·离线运行</span>
+    </header>
+
+    <div class="messages" id="messages">
+      <div class="msg bot">
+        <div class="bubble">
+          你好，我是本地多模态助手。可以帮我做什么？<br />
+          · 写周报、邮件、文案<br />
+          · 总结文章 / 文档<br />
+          · 「看图」按钮上传图片，让我描述或识别内容
+        </div>
+      </div>
+    </div>
+
+    <div class="composer">
+      <div class="attachments" id="attachments"></div>
+      <div class="input-row">
+        <button class="icon-btn" id="attachBtn" title="上传图片">🖼</button>
+        <input type="file" id="fileInput" accept="image/*" multiple hidden />
+        <textarea id="input" rows="1" placeholder="输入指令…（Enter 发送，Shift+Enter 换行）"></textarea>
+        <button class="btn primary send" id="sendBtn">发送</button>
+      </div>
+      <p class="tip">支持多模态：文字、图片识别。全部在本机运行，不经过任何外部服务器。</p>
+    </div>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

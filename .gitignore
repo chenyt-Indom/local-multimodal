@@ -1,0 +1,25 @@
+# 运行产物
+__pycache__/
+*.pyc
+
+# 配置（含用户自定义参数，不提交）
+config.json
+
+# 打包产物
+build/exe/
+build/warn-*.txt
+build/*.pyc
+dist/
+*.spec.bak
+
+# 虚拟环境
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# 系统
+Thumbs.db
+.DS_Store
