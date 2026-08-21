@@ -5,6 +5,10 @@ __pycache__/
 # 配置（含用户自定义参数，不提交）
 config.json
 
+# Docker 模型权重副本（6GB，不入版本库，由构建脚本注入）
+docker/models/
+docker/data/
+
 # 打包产物
 build/exe/
 build/warn-*.txt

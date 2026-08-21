@@ -1,0 +1,32 @@
+# -*- 本地多模态助手 —— 完整自包含镜像 docker-compose（镜像含 Ollama + Qwen3-VL-8B 模型 + 应用）
+# 使用：
+#   docker compose up -d --build
+# 然后浏览器访问 http://127.0.0.1:8000
+name: local-multimodal
+
+services:
+  multimodal:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: local-multimodal:latest
+    container_name: multimodal-assistant
+    restart: unless-stopped
+    ports:
+      # 应用界面
+      - "8000:8000"
+      # Ollama API（可选用，方便外部调试）
+      - "11434:11434"
+    # 显存充足时允许 GPU 加速（Windows Docker Desktop + WSL2 显卡透传）
+    devices:
+      - "/dev/dxg:/dev/dxg"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+    # 会话/日志数据持久化（保存在 docker/data 目录，位于 D 盘）
+    volumes:
+      - ./data:/workspace/data

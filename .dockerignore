@@ -1,0 +1,18 @@
+# PyInstaller 构建产物
+build/
+dist/
+# Python
+__pycache__/
+*.pyc
+# 运行时配置
+config.json
+# 环境与 IDE
+.venv/
+venv/
+.vscode/
+.idea/
+# 系统
+Thumbs.db
+.DS_Store
+# 会话/日志数据（不入构建上下文）
+docker/data/data/

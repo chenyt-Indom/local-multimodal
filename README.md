@@ -91,6 +91,27 @@ build.bat
 ```
 完成后生成 `dist/本地多模态助手.exe`，单文件、无需安装，复制到任意目录即可运行（仍需已装 Ollama 与模型）。
 
+## 🐳 Docker 一键部署（完整自包含镜像）
+
+镜像内置 **Ollama + Qwen3-VL-8B 模型 + 后端 + 前端**，约 20GB，拉取后无需下载模型、完全离线开箱即用。
+
+```bash
+cd docker
+.\prepare_model_context.bat   # 可选：把本机已下载的模型复制为构建上下文（避免联网重下6GB）
+.\start_docker.bat             # 双击/命令行：构建镜像并启动容器，随后自动打开浏览器
+```
+
+- 界面地址：http://127.0.0.1:8000
+- 停止容器：`docker\stop_docker.bat`
+- 手动构建：`docker compose up -d --build`
+- 镜像导出/导入（便于离线分发到其他机器）：
+  ```bash
+  docker save -o local-multimodal-latest.tar local-multimodal:latest   # 导出
+  docker load -i local-multimodal-latest.tar                            # 导入
+  ```
+
+> 说明：无 NVIDIA 容器运行时（WSL2 未配 GPU 透传）时会以 **CPU 模式**推理，功能完整但较慢；配好 GPU 后自动加速。
+
 ## 🔧 参数说明
 
 配置集中在 `config.json`（前端「推理参数」可在线修改并自动保存）：
