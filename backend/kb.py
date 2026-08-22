@@ -11,8 +11,9 @@ import re
 import json
 import math
 import time
+from . import config
 
-KB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "kb")
+KB_DIR = config.data("data", "kb")
 INDEX_FILE = os.path.join(KB_DIR, "_index.json")
 
 STOP_WORDS = set("的 了 在 是 和 与 我 你 他 她 它 们 一 有 也 都 要 把 让 这 那 就 吗 呢 啊 吧 很 会 可以 请 并 及 或 上 下 中 的 关于 什么是 如何 怎么".split())

@@ -4,11 +4,43 @@
 """
 import json
 import os
+import sys
 
-# 项目根目录（兼容 PyInstaller 打包运行）
+# 项目根 / 后端包目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
 
-CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+
+def is_frozen() -> bool:
+    """是否处于 PyInstaller 打包运行状态。"""
+    return bool(getattr(sys, "frozen", False))
+
+
+def res_root() -> str:
+    """只读打包资源根（打包后为 _MEIPASS/_internal；源码运行时为项目根）。
+    frontend、SD 模型权重等只读资源都放这里。"""
+    return getattr(sys, "_MEIPASS", PROJECT_ROOT)
+
+
+def data_root() -> str:
+    """可写运行数据根（打包后为 exe 同级目录，可随 U 盘拷贝；源码运行为项目根）。
+    config.json、data/ 记忆与会话等运行时数据放这里。"""
+    return os.path.dirname(sys.executable) if is_frozen() else PROJECT_ROOT
+
+
+def res(*parts: str) -> str:
+    """拼只读资源路径。"""
+    return os.path.join(res_root(), *parts)
+
+
+def data(*parts: str) -> str:
+    """拼可写数据路径，并确保父目录存在。"""
+    path = os.path.join(data_root(), *parts)
+    os.makedirs(os.path.dirname(path) or data_root(), exist_ok=True)
+    return path
+
+
+CONFIG_FILE = data("config.json")
 
 DEFAULT_CONFIG = {
     # Ollama 本地服务地址（请保证 ollama serve 已启动）
@@ -17,8 +49,9 @@ DEFAULT_CONFIG = {
     "default_model": "qwen3-vl:8b",
     # 推理参数
     "temperature": 0.7,
-    # 12GB 显卡建议 4096：Q4 模型仅占~6GB，为上下文/浏览器留足显存余量
-    "num_ctx": 4096,
+    # 16GB 显卡建议 8192：Q4 模型仅占~6GB，放大上下文保证图片/视频帧的
+    # 视觉 token 不被截断，模型才能看清图并给出高质量描述
+    "num_ctx": 8192,
     # Qwen3-VL 思考模式会先占用大量 token，放大配额避免回答被思考吃光
     "max_tokens": 2048,
     # —— 能力开关（前端控制）——

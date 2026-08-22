@@ -20,8 +20,9 @@ import json
 import time
 import random
 import hashlib
+from . import config
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
+DATA_DIR = config.data("data")
 MEMORY_DOC_FILE = os.path.join(DATA_DIR, "memory_doc.json")
 TRANSCRIPT_DIR = os.path.join(DATA_DIR, "transcript")
 

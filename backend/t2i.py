@@ -10,10 +10,25 @@ import base64
 import io
 import os
 import threading
+from . import config
 
 MODEL_REPO = os.environ.get("SD_MODEL", "stabilityai/sd-turbo")
-# 本地已下载的模型目录（通过 ModelScope 下载的 fp16 权重），优先使用，避免联网拉取
-LOCAL_MODEL_DIR = os.environ.get("SD_MODEL_DIR", r"D:\local-multimodal-models\sd-turbo")
+# 本地已下载的模型目录（通过 ModelScope 下载的 fp16 权重），优先使用，避免联网拉取。
+# 打包运行时会自动探测随应用分发的 sd_model 资源目录；源码运行时用环境变量或本机路径。
+def _resolve_model_dir() -> str:
+    env = os.environ.get("SD_MODEL_DIR")
+    if env:
+        return env
+    candidates = [
+        config.res("sd_model"),               # 打包后：_internal/sd_model
+        r"D:\local-multimodal-models\sd-turbo",  # 源码本机路径
+    ]
+    for c in candidates:
+        if os.path.isdir(c) and os.path.exists(os.path.join(c, "model_index.json")):
+            return c
+    return candidates[0]
+
+LOCAL_MODEL_DIR = _resolve_model_dir()
 _device = None
 _pipe = None            # 文生图（txt2img）流水线
 _edit_pipe = None       # 图生图（img2img 微改）流水线

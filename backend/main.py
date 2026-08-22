@@ -33,8 +33,8 @@ def _now_str() -> str:
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
                    allow_headers=["*"])
 
-# 前端静态目录
-FRONTEND_DIR = os.path.join(config.BASE_DIR, "..", "frontend")
+# 前端静态目录（打包后为只读打包资源）
+FRONTEND_DIR = config.res("frontend")
 
 
 # ---------- 数据模型 ----------
@@ -44,6 +44,75 @@ class ChatRequest(BaseModel):
     images_b64: list[str] | None = None   # 附加到本轮 user 消息的图片
     stream: bool = True
     session_id: str | None = None         # 会话标识，用于历史会话透视归档
+
+
+# ---------- 图片保存 ----------
+class SaveImageRequest(BaseModel):
+    b64: str | None = None                # 图片 base64 正文（无 data: 前缀）
+    filename: str | None = None           # 期望文件名（自动去重）
+    mime: str | None = None               # 如 image/png
+    subdir: str | None = None             # 可选子目录，默认 saved_images
+
+
+@app.post("/api/save_image")
+def save_image(req: SaveImageRequest):
+    """把图片（base64）保存到应用可写的本地目录，返回最终绝对路径。
+
+    解决桌面端 pywebview 里 <a download + data URI> 无法保存的问题：
+    图片由后端写盘，前端用返回路径提示用户，并可通过系统的
+    os.startfile 打开对应文件夹。
+    """
+    import re, time, uuid
+    if not req.b64:
+        raise HTTPException(400, "缺少图片数据")
+    try:
+        raw = base64.b64decode(req.b64)
+    except Exception as e:
+        raise HTTPException(400, f"base64 解码失败: {e}")
+    if not raw:
+        raise HTTPException(400, "图片数据为空")
+
+    subdir = req.subdir or "saved_images"
+    root = config.data(subdir)
+    os.makedirs(root, exist_ok=True)
+
+    base_name = (req.filename or "image").strip() or "image"
+    ext = (req.mime or "image/png").split("/")[-1].split(";")[0].lower()
+    if ext not in ("png", "jpg", "jpeg", "webp"):
+        ext = "png"
+    if not base_name.lower().endswith(f".{ext}"):
+        base_name += f".{ext}"
+
+    safe = re.sub(r"[^\w.\-]", "_", base_name, flags=re.UNICODE) or "image.png"
+    path = os.path.join(root, safe)
+    stem, e = os.path.splitext(safe)
+    i = 1
+    while os.path.exists(path):
+        path = os.path.join(root, f"{stem}_{i}{e}")
+        i += 1
+    with open(path, "wb") as f:
+        f.write(raw)
+    return {"ok": True, "path": path.replace("/", "\\"),
+            "filename": os.path.basename(path)}
+
+
+class OpenFolderRequest(BaseModel):
+    path: str | None = None
+
+
+@app.post("/api/open_folder")
+def open_folder(req: OpenFolderRequest = None):
+    """在系统文件管理器中打开指定路径（默认打开 saved_images 目录）。"""
+    target = (req.path if req and req.path else None) or config.data("saved_images")
+    os.makedirs(target, exist_ok=True)
+    if os.path.isfile(target):
+        target = os.path.dirname(target)
+    try:
+        import subprocess
+        subprocess.Popen(["explorer", target.replace("/", "\\")])
+        return {"ok": True, "path": target}
+    except Exception as e:
+        raise HTTPException(500, f"打开文件夹失败: {e}")
 
 
 # ---------- 健康 / 配置 ----------
@@ -101,8 +170,10 @@ class _SystemPrompt:
             "当前时间：" + _now_str(),
             "你是本地多模态助手，像一位能干的项目助理。你的所有处理都在用户本机完成，注意保护隐私。",
             "你可以调用以下工具来完成具体任务，而不仅是空谈：\n"
-            "- 图形生成：当用户明确要求「画图/生成图片/制作配图/AI绘画/画一只××」时，你必须调用 generate_image 工具真实生成（prompt 用英文描述），绝不能只口头描述；只有调用工具才算完成。\n"
-            "- 图片微改：当用户给了/引用一张图并希望局部修改（如「把这张图的背景改成夜晚」「给猫戴帽子」「换个颜色」），调用 edit_image；用户拖入本轮的图片优先，或填 source 为本地图片路径。\n"
+            "- 视觉识别（直接看，不要调用工具）：当图片/视频已经附在当前对话中（用户拖入/上传），直接用你自身的多模态视觉能力识别、描述或分析其内容即可，绝对不要为「看图」调用任何工具。只有以下三种情况才需要调用工具：\n"
+            "  ① 用户明确要求「画图/生成图片/制作配图/AI绘画/画一只××」→ 调用 generate_image 工具真实生成（prompt 用英文描述），绝不能只口头描述，只有调用工具才算完成；\n"
+            "  ② 用户明确要求对某张图做局部修改（如「把这张图的背景改成夜晚」「给猫戴帽子」「换个颜色」）→ 调用 edit_image；用户拖入本轮的图片优先，或填 source 为本地图片路径；\n"
+            "  ③ 用户给的是一个本地文件路径、要你读取该文件 → 调用 read_file。\n"
             "- 文件系统：浏览用户目录、读取任意本地文件、按关键词搜索、写入或修改文件。\n"
             "- 记忆：记忆按【分区文段】整体维护（工作背景/个人背景/当前关注/近期动态…）。遇到值得长期记住的用户稳定信息、偏好、关键事实时，主动调用 remember 把对应分区的**整段文段**重写成合并新旧信息后的最新版（**自主判断，只记重要的，不要把所有问答都写入**）；"
             "当用户问「你还记得吗/我们之前说过」或需要历史信息时调用 search_memory。\n"
@@ -229,7 +300,7 @@ async def chat(req: ChatRequest):
 def _wants_search(text: str) -> bool:
     """判断用户话语是否隐含需要联网搜索的意图。"""
     import re
-    return bool(re.search(r"搜索|查一下|网上|最新|新闻|搜一下|怎么看|近况", text, re.I))
+    return bool(re.search(r"搜索|查一下|网上查|最新消息|实时新闻|搜一下|去网上|联网查", text, re.I))
 
 
 # ---------- 长期记忆 API（分区文段）----------

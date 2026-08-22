@@ -250,12 +250,49 @@
     ov.innerHTML = `<div class="lb-box">
       <img src="data:${mime || "image/png"};base64,${b64}">
       <div class="lb-cap"></div>
+      <div class="lb-tools">
+        <button class="lb-save">💾 保存到本地</button>
+        <button class="lb-open">📂 打开所在文件夹</button>
+      </div>
       <button class="lb-close" title="关闭">✕</button>
-      <a class="lb-dl" download="generated.png" href="data:${mime || "image/png"};base64,${b64}">保存图片</a>
     </div>`;
     ov.querySelector(".lb-cap").textContent = prompt || "";
     ov.onclick = (e) => { if (e.target === ov) ov.remove(); };
     ov.querySelector(".lb-close").onclick = () => ov.remove();
+
+    const cap = ov.querySelector(".lb-cap");
+    let lastPath = null;
+    ov.querySelector(".lb-save").onclick = async (e) => {
+      e.stopPropagation();
+      const fn = "generated_" + Date.now() + (mime === "image/jpeg" ? ".jpg" : ".png");
+      const body = { b64: b64, filename: fn, mime: mime || "image/png" };
+      try {
+        const r = await fetch("/api/save_image", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const d = await r.json();
+        if (d.ok) { lastPath = d.path; cap.textContent = "✅ 已保存：" + d.path; }
+        else cap.textContent = "❌ 保存失败：" + (d.detail || "");
+      } catch (err) {
+        cap.textContent = "❌ 保存失败：" + err;
+      }
+    };
+    ov.querySelector(".lb-open").onclick = async (e) => {
+      e.stopPropagation();
+      try {
+        const r = await fetch("/api/open_folder", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: lastPath }),
+        });
+        const d = await r.json();
+        cap.textContent = d.ok ? "📂 已打开：" + d.path : ("❌ " + (d.detail || ""));
+      } catch (err) {
+        cap.textContent = "❌ " + err;
+      }
+    };
     document.body.appendChild(ov);
   }
 
@@ -337,6 +374,31 @@
     messagesEl.scrollTop = messagesEl.scrollHeight;
 
     let thinking = "", answer = "";
+    // ---------- 思考过程平滑逐字播放 ----------
+    // Ollama 对 qwen3-vl 等推理模型常把 thinking 一次性整体返回（非逐 token），
+    // 为避免"和回答一起弹出来"，这里把到达的增量拆成小块逐步渲染，
+    // 使思考内容在答案输出之前就能持续、实时地逐字增长。
+    let thinkPending = "";      // 待逐字播放的增量缓冲
+    let thinkTimer = null;
+    const pushThinking = (delta) => {
+      thinkPending += delta;
+      if (thinkTimer === null) {
+        thinkTimer = setInterval(() => {
+          const STEP = 5;                       // 每帧播放字速
+          if (thinkPending) {
+            const take = Math.min(STEP, thinkPending.length);
+            thinking += thinkPending.slice(0, take);
+            thinkPending = thinkPending.slice(take);
+            updateThinkStatus();
+            if (thinkBody.style.display !== "none") thinkBody.textContent = thinking + "▌";
+          }
+        }, 26);                                  // 帧间隔 ≈ 每帧约 26ms
+      }
+    };
+    const stopThinking = () => {
+      if (thinkTimer !== null) { clearInterval(thinkTimer); thinkTimer = null; }
+      if (thinkPending) { thinking += thinkPending; thinkPending = ""; }
+    };
     const addToolChip = (name) => {
       const chip = document.createElement("span");
       chip.className = "tool-chip";
@@ -364,6 +426,7 @@
       messagesEl.scrollTop = messagesEl.scrollHeight;
     };
     const finishThinking = () => {
+      stopThinking();                            // 结束播放，一次性补齐剩余思考
       thinkStatus.textContent = thinking
         ? "🧠 思考过程（" + thinking.length + " 字）"
         : "🧠 未输出思考";
@@ -397,9 +460,7 @@
           if (obj.error) throw new Error(obj.error);
           if (obj.message) {
             if (obj.message.thinking) {
-              thinking += obj.message.thinking;
-              updateThinkStatus();                 // 折叠状态下也能看到实时进度
-              if (thinkBody.style.display !== "none") thinkBody.textContent = thinking + "▌";
+              pushThinking(obj.message.thinking);  // 进入平滑播放器，逐字实时渲染
             }
             if (obj.message.content) { answer += obj.message.content; answerBubble.textContent = answer + "▌"; }
           }

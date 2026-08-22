@@ -231,7 +231,15 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
   padding: 6px 10px; font-size: 13px; text-decoration: none;
 }
 .lb-close { right: -54px; }
-.lb-dl { right: 10px; top: auto; bottom: -14px; background: var(--accent); color: #fff; }
+
+.lb-tools {
+  display: flex; gap: 10px; justify-content: center; margin-top: 14px; flex-wrap: wrap;
+}
+.lb-tools button {
+  border: none; cursor: pointer; background: var(--accent); color: #fff;
+  border-radius: 8px; padding: 8px 14px; font-size: 13px;
+}
+.lb-tools button:hover { opacity: .9; }
 
 .attachments { display: flex; flex-wrap: wrap; gap: 8px; }
 .attachment {

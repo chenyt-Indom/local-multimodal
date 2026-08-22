@@ -85,7 +85,7 @@ def make_schemas() -> list:
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "读取用户本机任意文件的内容（文本/代码/图片/PDF/视频抽帧）。图片和视频会直接展示，文本返回内容。",
+                "description": "读取用户本机指定路径的文件内容（文本/代码/PDF等）。仅当用户给出本地文件路径、需要读取该文件时才调用。注意：图片/视频如果已经附在对话中（用户拖入/上传），直接用视觉能力观看即可，不要为看图调用本工具；若用户提供一个视频文件路径要分析内容，才用本工具抽帧。",
                 "parameters": {
                     "type": "object",
                     "properties": {
