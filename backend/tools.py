@@ -212,13 +212,15 @@ _WEB_SEARCH_SCHEMA = {
                     "description": (
                         "搜索关键词。**务必精炼**：用 2~4 个核心词，不要写成完整句子，"
                         "也不要塞入具体年月日（加了反而容易被搜索引擎带偏，返回日历类无关结果）。"
-                        "示例（好）：「人工智能 最新进展」「英伟达 股价」「世界杯 赛程」；"
+                        "**中文提问请优先用中文关键词搜索**（中文资料的召回明显更好），"
+                        "只有查国外产品/英文资料时才用英文。"
+                        "示例（好）：「人工智能 最新进展」「英伟达 股价」「广州民航职业技术学院」；"
                         "示例（差）：「2026年9月人工智能领域有哪些重要进展」（太长且含日期）"
                     ),
                 },
                 "top_k": {
                     "type": "integer",
-                    "description": "返回结果条数，默认 5",
+                    "description": "返回结果条数，默认 8（多引擎聚合，可适当调大）",
                 },
             },
             "required": ["query"],
@@ -275,14 +277,42 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
 
 
 # ---------- 联网搜索 ----------
+# 查询里常见的"干扰词"：搜索引擎对这类限定词很敏感，会大幅降低召回质量
+_NOISE_PATTERNS = [
+    r"是公办还是民办", r"公办还是民办", r"公办\s*民办", r"是公办的吗", r"是民办的吗",
+    r"是什么", r"怎么样", r"有哪些", r"是多少", r"为什么", r"怎么回事",
+    r"的参数", r"参数配置", r"规格", r"详细介绍", r"介绍一下", r"请问",
+]
+
+
 def _simplify_query(q: str) -> str:
-    """去掉年份/月日等强限定词，得到一个更通用的查询（长查询容易被引擎带偏）。"""
+    """去掉年份/月日/疑问词/限定词，得到更通用的检索词。
+
+    实测：搜索引擎对"广州民航职业技术学院 公办 民办"这类长查询召回很差，
+    而只留主体词"广州民航职业技术学院"时能正常返回官网与百科。
+    """
     import re
-    s = re.sub(r"\d{4}\s*年", " ", q)
+    s = q
+    s = re.sub(r"\d{4}\s*年", " ", s)
     s = re.sub(r"\d{1,2}\s*月", " ", s)
     s = re.sub(r"\d{1,2}\s*日", " ", s)
+    for pat in _NOISE_PATTERNS:
+        s = re.sub(pat, " ", s)
+    s = re.sub(r"[？?！!。，,、；;：:]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+def _dedupe(items: list) -> list:
+    """按标题前 18 个有效字符去重。"""
+    import re
+    seen, out = set(), []
+    for it in items:
+        key = re.sub(r"\W+", "", it.get("title", ""))[:18]
+        if key and key not in seen:
+            seen.add(key)
+            out.append(it)
+    return out
 
 
 def _relevant(query: str, results: list) -> bool:
@@ -297,43 +327,70 @@ def _relevant(query: str, results: list) -> bool:
 
 
 def _do_web_search(arguments, ui_events):
-    """真正联网检索，把网页标题/链接/摘要整理成文本交回模型总结。"""
+    """联网检索：多引擎 + 多查询变体聚合 + 相关性过滤，尽量拿到可用结果。"""
+    from concurrent.futures import ThreadPoolExecutor
+
     query = (arguments.get("query") or "").strip()
     if not query:
         return "联网搜索失败：未提供 query。"
     try:
-        top_k = int(arguments.get("top_k") or 5)
+        top_k = int(arguments.get("top_k") or 8)
     except Exception:
-        top_k = 5
-    top_k = max(1, min(top_k, 10))
+        top_k = 8
+    top_k = max(1, min(top_k, 15))
 
     from . import web_tools
-    used = query
-    results = web_tools.web_search(query, n=top_k)
 
-    # 结果明显不相关时，用去掉年份/日期的简化查询再试一次
-    if not _relevant(query, results):
-        alt = _simplify_query(query)
-        if alt and alt != query:
-            alt_results = web_tools.web_search(alt, n=top_k)
-            if _relevant(alt, alt_results):
-                results, used = alt_results, alt
+    # 查询变体：原查询 + 精简后的主体词
+    variants = [query]
+    simple = _simplify_query(query)
+    if simple and simple != query and len(simple) >= 2:
+        variants.append(simple)
 
-    lines = [f"【联网搜索结果】关键词：{used}"]
+    try:
+        with ThreadPoolExecutor(max_workers=len(variants)) as pool:
+            batches = list(pool.map(lambda q: web_tools.web_search(q, n=top_k), variants))
+    except Exception as exc:
+        return f"联网搜索失败：{exc}"
+
+    # 逐变体做相关性过滤（剔除"广州市_百度百科"这类泛化无关结果）
+    filtered = [web_tools.filter_relevant(v, b) for v, b in zip(variants, batches)]
+
+    # 优先原查询的相关结果；不足半数时用精简查询补齐
+    results = _dedupe(filtered[0])
+    if len(results) < max(3, top_k // 2):
+        for extra in filtered[1:]:
+            results = _dedupe(results + extra)
+    if not results:
+        # 过滤后为空：退回未过滤结果（至少有标题线索，也好过全空）
+        results = _dedupe([x for b in batches for x in b])
+    results = results[:max(top_k, 8)]
+
+    used = query if len(variants) == 1 else f"{query}（含精简检索：{simple}）"
+
+    # 输出格式刻意紧凑：长 URL 和超长摘要会挤占模型上下文、降低其理解质量，
+    # 因此来源只给域名，摘要截断到 140 字。
+    lines = [f"【联网搜索结果】检索词：{used}"]
     useful = 0
-    for i, r in enumerate(results[:top_k], 1):
+    for i, r in enumerate(results, 1):
         title = (r.get("title") or "").strip()
         url = (r.get("url") or "").strip()
         desc = (r.get("desc") or "").strip()
-        if title and title not in ("搜索失败", "（未解析到搜索结果）") and url:
+        if title and title not in ("搜索失败",) and "未获取到搜索结果" not in title and url:
             useful += 1
-        lines.append(f"{i}. {title}")
-        if url:
-            lines.append(f"   来源：{url}")
+        try:
+            dom = urllib.parse.urlparse(url).netloc
+        except Exception:
+            dom = ""
+        head = f"{i}. {title}"
         if desc:
-            lines.append(f"   摘要：{desc}")
+            head += f" —— {desc[:140]}"
+        if dom:
+            head += f"（来源：{dom}）"
+        lines.append(head)
     if useful == 0:
-        lines.append("（未获取到有效搜索结果。请如实告诉用户本次联网检索失败，不要编造内容。）")
+        lines.append("（未获取到有效搜索结果。请如实告诉用户本次联网检索失败，不要编造内容；"
+                     "可以建议用户换个更具体的说法再试。）")
     else:
         lines.append("请基于以上检索结果用中文总结回答，关键结论注明来源；"
                      "若结果不足以回答，请说明局限，不要凭空补充。"
