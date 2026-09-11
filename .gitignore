@@ -14,7 +14,9 @@ build/exe/
 build/warn-*.txt
 build/*.pyc
 build/本地多模态助手/
+build-lite/
 dist/
+dist-lite/
 *.spec.bak
 
 # 运行时数据（记忆/会话/知识库/保存图片，随各机器独立，不入版本库）
