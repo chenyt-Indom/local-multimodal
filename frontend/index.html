@@ -75,9 +75,13 @@
     <div class="composer">
       <div class="attachments" id="attachments"></div>
       <div class="drop-hint" id="dropHint">松开鼠标导入图片/文件</div>
+      <div class="voice-hint" id="voiceHint">
+        <span class="v-dot"></span><span id="voiceText">语音未开启 · 点 🎤 后说「西派西派」唤醒</span>
+      </div>
       <div class="input-row">
         <button class="icon-btn" id="attachBtn" title="上传图片">🖼</button>
         <button class="icon-btn" id="videoBtn" title="上传视频">🎬</button>
+        <button class="icon-btn" id="voiceBtn" title="语音输入：说「西派西派」唤醒，停顿 2 秒自动发送">🎤</button>
         <input type="file" id="fileInput" accept="image/*" multiple hidden />
         <input type="file" id="videoInput" accept="video/*" hidden />
         <textarea id="input" rows="1" placeholder="描述需求：画一只机器人 · 读取报告.txt 并改错别字 · 记住我喜欢中文交流 · （拖图可微改）"></textarea>

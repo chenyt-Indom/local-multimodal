@@ -22,7 +22,8 @@ def _collect(pkg):
 
 # —— 收集文生图 / GUI 相关的大型第三方依赖 ——
 _pkgs = ['torch', 'diffusers', 'transformers', 'accelerate', 'safetensors',
-         'torchvision', 'tokenizers', 'huggingface_hub', 'webview']
+         'torchvision', 'tokenizers', 'huggingface_hub', 'webview',
+         'sherpa_onnx', 'sounddevice']
 
 all_datas, all_binaries, all_hidden = [], [], []
 for _p in _pkgs:
@@ -64,11 +65,17 @@ _SD_ROOT = r"D:\local-multimodal-models\sd-turbo"
 all_datas += _dir_datas(os.path.join(root, "frontend"), "frontend")
 all_datas += _dir_datas(_SD_ROOT, "sd_model", skip_suffixes=(".incomplete",))
 
+# —— 语音识别模型（离线唤醒词 + 流式识别，约 78MB）——
+_ASR_ROOT = r"D:\local-multimodal-models\sherpa-asr"
+if os.path.isdir(_ASR_ROOT):
+    all_datas += _dir_datas(_ASR_ROOT, "asr_model")
+
 # —— 后端模块的显式收集 ——
 all_hidden += [
     "backend.main", "backend.config", "backend.ollama_client", "backend.tools",
     "backend.t2i", "backend.memory", "backend.kb", "backend.file_tools",
-    "backend.video", "backend.web_tools",
+    "backend.video", "backend.web_tools", "backend.voice",
+    "sounddevice", "sherpa_onnx",
     "uvicorn", "uvicorn.logging", "uvicorn.loops.auto", "uvicorn.protocols.http.auto",
     "uvicorn.protocols.websockets.auto", "uvicorn.lifespan.on", "uvicorn.lifespan.off",
     "fastapi", "pydantic", "websockets", "multipart", "python_multipart",

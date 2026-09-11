@@ -313,3 +313,26 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 }
 .drop-hint.show { display: block; }
 .composer { position: relative; }
+
+/* ---------- 语音输入状态条 ---------- */
+.voice-hint {
+  display: none; align-items: center; gap: 8px;
+  margin-bottom: 8px; padding: 6px 12px;
+  font-size: 13px; color: var(--muted);
+  background: var(--panel2); border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.voice-hint.on, .voice-hint.awake { display: flex; }
+.voice-hint.on { color: #7fdcac; border-color: #2f6f4f; }
+.voice-hint.awake { color: #f0b95c; border-color: #8a6120; background: rgba(240, 185, 92, .08); }
+.v-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #5b6478; flex: 0 0 auto;
+}
+.voice-hint.on .v-dot { background: var(--green); animation: vpulse 1.4s ease-in-out infinite; }
+.voice-hint.awake .v-dot { background: #f0a83c; animation: vpulse .9s ease-in-out infinite; }
+@keyframes vpulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .4; transform: scale(.78); }
+}
+.icon-btn.active { border-color: var(--green); color: var(--green); }

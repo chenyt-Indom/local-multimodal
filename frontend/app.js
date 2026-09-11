@@ -487,6 +487,91 @@
   function autoGrow() { inputEl.style.height = "auto"; inputEl.style.height = inputEl.scrollHeight + "px"; }
   inputEl.addEventListener("input", autoGrow);
 
+  // ---------- 语音输入（唤醒词「西派西派」+ 静音自动发送）----------
+  const voiceHintEl = $("#voiceHint");
+  const voiceTextEl = $("#voiceText");
+  const voiceBtn = $("#voiceBtn");
+  let voiceWs = null;
+  let voiceOn = false;
+
+  function voiceUI(state, text) {
+    if (!voiceHintEl || !voiceTextEl) return;
+    voiceHintEl.classList.toggle("on", state === "listening");
+    voiceHintEl.classList.toggle("awake", state === "awake");
+    if (voiceBtn) voiceBtn.classList.toggle("active", state !== "idle");
+    if (text) {
+      voiceTextEl.textContent = text;
+    } else if (state === "awake") {
+      voiceTextEl.textContent = "🎙 已唤醒 · 请说内容（停顿 2 秒自动发送）";
+    } else if (state === "listening") {
+      voiceTextEl.textContent = "👂 监听中 · 说「西派西派」唤醒";
+    } else {
+      voiceTextEl.textContent = "语音未开启 · 点 🎤 后说「西派西派」唤醒";
+    }
+  }
+
+  function voiceConnect() {
+    if (voiceWs && voiceWs.readyState <= 1) return voiceWs;
+    const proto = location.protocol === "https:" ? "wss://" : "ws://";
+    voiceWs = new WebSocket(proto + location.host + "/ws/voice");
+    voiceWs.onopen = () => voiceUI("idle", "语音就绪 · 点 🎤 开始监听");
+    voiceWs.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (msg.type === "state") {
+        voiceUI(msg.state);
+      } else if (msg.type === "wake") {
+        voiceUI("awake");
+      } else if (msg.type === "partial") {
+        voiceUI("awake", "🎙 " + (msg.text || "…"));
+        inputEl.value = msg.text || "";
+        autoGrow();
+      } else if (msg.type === "final") {
+        inputEl.value = msg.text || "";
+        autoGrow();
+        voiceUI("listening", "✅ 已识别，自动发送…");
+        if (msg.auto && inputEl.value.trim()) setTimeout(() => send(), 120);
+      } else if (msg.type === "status") {
+        voiceUI(msg.state || "idle");
+        if (msg.model_ready === false) voiceTextEl.textContent = "⚠ 未找到语音模型（asr_model 目录）";
+      } else if (msg.type === "error") {
+        voiceUI("idle", "⚠ " + (msg.message || "语音出错"));
+        voiceOn = false;
+      } else if (msg.type === "ack") {
+        const r = msg.result || {};
+        if (r.ok === false && r.error) {
+          voiceUI("idle", "⚠ " + r.error);
+          voiceOn = false;
+        } else if (r.already) {
+          voiceOn = true;
+        }
+      }
+    };
+    voiceWs.onclose = () => { voiceOn = false; voiceUI("idle", "语音连接已断开"); };
+    voiceWs.onerror = () => { };
+    return voiceWs;
+  }
+
+  if (voiceBtn) {
+    voiceBtn.onclick = () => {
+      const ws = voiceConnect();
+      const toggle = () => {
+        if (!voiceOn) {
+          ws.send(JSON.stringify({ action: "start" }));
+          voiceOn = true;
+          voiceUI("listening");
+        } else {
+          ws.send(JSON.stringify({ action: "stop" }));
+          voiceOn = false;
+          voiceUI("idle");
+        }
+      };
+      if (ws.readyState === 1) toggle();
+      else ws.addEventListener("open", toggle, { once: true });
+    };
+    voiceUI("idle");
+  }
+
   // ---------- 初始化 ----------
   refreshHealth();
   loadToggles();

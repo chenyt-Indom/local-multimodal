@@ -4,6 +4,11 @@ uvicorn[standard]>=0.29
 requests>=2.31
 pillow>=10.0
 
+# 语音输入（离线唤醒词「西派西派」+ 流式识别，无需联网）
+numpy>=1.24
+sounddevice>=0.4
+sherpa-onnx>=1.10
+
 # 文生图 / 图片微改（Stable Diffusion，diffusers）
 diffusers>=0.30
 accelerate>=0.30

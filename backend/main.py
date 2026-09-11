@@ -5,7 +5,7 @@
 或直接:
     py -3 run.py
 """
-from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse, FileResponse
@@ -17,7 +17,7 @@ import io
 import json
 import asyncio
 import datetime
-from . import config, ollama_client, memory, kb, file_tools, video, web_tools, t2i, tools
+from . import config, ollama_client, memory, kb, file_tools, video, web_tools, t2i, tools, voice
 
 app = FastAPI(title="本地多模态助手", version="1.0.0")
 client = ollama_client.OllamaClient()
@@ -459,6 +459,76 @@ def t2i_generate(body: T2IBody):
 def t2i_unload():
     t2i.unload()
     return {"ok": True}
+
+
+# ---------- 语音输入（唤醒词「西派西派」+ 离线流式识别）----------
+_voice_clients: set = set()
+_voice_loop = None
+
+
+def _broadcast_voice(event: dict) -> None:
+    """把语音事件推给所有已连接的前端（从后台线程安全投递）。"""
+    loop = _voice_loop
+    if loop is None or loop.is_closed():
+        return
+    data = json.dumps(event, ensure_ascii=False)
+    for ws in list(_voice_clients):
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send_text(data), loop)
+        except Exception:
+            pass
+
+
+_voice = voice.get_listener(_broadcast_voice)
+
+
+@app.websocket("/ws/voice")
+async def ws_voice(ws: WebSocket):
+    """前端语音通道：下发 start/stop/status，上游推送识别事件。"""
+    global _voice_loop
+    await ws.accept()
+    _voice_loop = asyncio.get_running_loop()
+    _voice_clients.add(ws)
+    try:
+        welcome = {"type": "status"}
+        welcome.update(_voice.status())
+        await ws.send_text(json.dumps(welcome, ensure_ascii=False))
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            action = msg.get("action")
+            if action == "start":
+                result = _voice.start()
+            elif action == "stop":
+                result = _voice.stop()
+            else:
+                result = _voice.status()
+            await ws.send_text(json.dumps({"type": "ack", "result": result},
+                                          ensure_ascii=False))
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        _voice_clients.discard(ws)
+
+
+@app.get("/api/voice/status")
+def voice_status():
+    return _voice.status()
+
+
+@app.post("/api/voice/start")
+def voice_start():
+    return _voice.start()
+
+
+@app.post("/api/voice/stop")
+def voice_stop():
+    return _voice.stop()
 
 
 # ---------- 前端 ----------
