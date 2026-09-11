@@ -24,8 +24,13 @@ from . import memory as memory_mod
 # =====================================================================
 #  工具 Schema（发给模型）
 # =====================================================================
-def make_schemas() -> list:
-    return [
+def make_schemas(web_enabled: bool = False) -> list:
+    """返回工具 schema 列表。
+
+    web_enabled=True 时才暴露联网搜索工具——保证"开关不开不联网"的约定：
+    关着的时候模型连工具都看不到，自然不会去联网。
+    """
+    schemas = [
         {
             "type": "function",
             "function": {
@@ -182,6 +187,44 @@ def make_schemas() -> list:
             },
         },
     ]
+    if web_enabled:
+        schemas.append(_WEB_SEARCH_SCHEMA)
+    return schemas
+
+
+# 联网搜索工具（仅当用户在前端打开"联网"开关时才注入给模型）
+_WEB_SEARCH_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "联网搜索互联网上的最新信息。凡是涉及**实时或最新信息**的问题都应主动调用，例如："
+            "最新新闻、时事热点、近期发生的事件、实时数据（股价/天气/汇率/比分）、"
+            "你不确定或知识可能过时的内容、需要查证的事实、某个新产品/新版本的现状等。"
+            "调用时会真的联网检索并把网页摘要返回给你，你再据此总结成答案。"
+            "注意：日常闲聊、写作、翻译、代码等不需要联网的任务不要调用。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "搜索关键词。**务必精炼**：用 2~4 个核心词，不要写成完整句子，"
+                        "也不要塞入具体年月日（加了反而容易被搜索引擎带偏，返回日历类无关结果）。"
+                        "示例（好）：「人工智能 最新进展」「英伟达 股价」「世界杯 赛程」；"
+                        "示例（差）：「2026年9月人工智能领域有哪些重要进展」（太长且含日期）"
+                    ),
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "返回结果条数，默认 5",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
 
 
 # =====================================================================
@@ -226,7 +269,76 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
         return _do_search_memory(arguments)
     if name == "get_time":
         return time.strftime("%Y-%m-%d %H:%M:%S (%A)")
+    if name == "web_search":
+        return _do_web_search(arguments, ui_events)
     return f"[未知工具] {name}"
+
+
+# ---------- 联网搜索 ----------
+def _simplify_query(q: str) -> str:
+    """去掉年份/月日等强限定词，得到一个更通用的查询（长查询容易被引擎带偏）。"""
+    import re
+    s = re.sub(r"\d{4}\s*年", " ", q)
+    s = re.sub(r"\d{1,2}\s*月", " ", s)
+    s = re.sub(r"\d{1,2}\s*日", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _relevant(query: str, results: list) -> bool:
+    """粗略判断检索结果是否与查询相关（看实词命中比例）。"""
+    import re
+    words = [w for w in re.split(r"[\s,，、/]+", query) if len(w) >= 2]
+    if not words:
+        return True
+    text = " ".join((r.get("title", "") + " " + r.get("desc", "")) for r in results)
+    hits = sum(1 for w in words if w in text)
+    return hits >= max(1, len(words) // 3)
+
+
+def _do_web_search(arguments, ui_events):
+    """真正联网检索，把网页标题/链接/摘要整理成文本交回模型总结。"""
+    query = (arguments.get("query") or "").strip()
+    if not query:
+        return "联网搜索失败：未提供 query。"
+    try:
+        top_k = int(arguments.get("top_k") or 5)
+    except Exception:
+        top_k = 5
+    top_k = max(1, min(top_k, 10))
+
+    from . import web_tools
+    used = query
+    results = web_tools.web_search(query, n=top_k)
+
+    # 结果明显不相关时，用去掉年份/日期的简化查询再试一次
+    if not _relevant(query, results):
+        alt = _simplify_query(query)
+        if alt and alt != query:
+            alt_results = web_tools.web_search(alt, n=top_k)
+            if _relevant(alt, alt_results):
+                results, used = alt_results, alt
+
+    lines = [f"【联网搜索结果】关键词：{used}"]
+    useful = 0
+    for i, r in enumerate(results[:top_k], 1):
+        title = (r.get("title") or "").strip()
+        url = (r.get("url") or "").strip()
+        desc = (r.get("desc") or "").strip()
+        if title and title not in ("搜索失败", "（未解析到搜索结果）") and url:
+            useful += 1
+        lines.append(f"{i}. {title}")
+        if url:
+            lines.append(f"   来源：{url}")
+        if desc:
+            lines.append(f"   摘要：{desc}")
+    if useful == 0:
+        lines.append("（未获取到有效搜索结果。请如实告诉用户本次联网检索失败，不要编造内容。）")
+    else:
+        lines.append("请基于以上检索结果用中文总结回答，关键结论注明来源；"
+                     "若结果不足以回答，请说明局限，不要凭空补充。"
+                     "注意：当前时间以系统提示中的时间为准。")
+    return "\n".join(lines)
 
 
 # ---------- 文生图 ----------

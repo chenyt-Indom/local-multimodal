@@ -178,7 +178,22 @@ class _SystemPrompt:
             "- 记忆：记忆按【分区文段】整体维护（工作背景/个人背景/当前关注/近期动态…）。遇到值得长期记住的用户稳定信息、偏好、关键事实时，主动调用 remember 把对应分区的**整段文段**重写成合并新旧信息后的最新版（**自主判断，只记重要的，不要把所有问答都写入**）；"
             "当用户问「你还记得吗/我们之前说过」或需要历史信息时调用 search_memory。\n"
             "- 时间：需要当前日期时间时调用 get_time。\n"
-            "调用工具后，根据工具返回结果继续作答。能直接完成的就动手，不要只建议。",
+            + (
+                (
+                    "- 联网搜索：用户已开启「联网」开关，你有 web_search 工具可主动联网检索。\n"
+                    "  凡是涉及**最新/实时/近期**信息的问题（新闻时事、股价行情、天气、软件新版本、"
+                    "赛事比分，或你不确定、知识可能已过时的内容），**绝不要回答「我无法联网」"
+                    "或凭记忆猜测**，而应主动调用 web_search 获取真实网页结果，再据此用中文总结回答"
+                    "并注明来源。日常闲聊、写作、翻译、代码等不需要联网的任务不要调用。\n"
+                )
+                if cfg.get("web_enabled")
+                else (
+                    "- 本机当前处于**离线模式**（用户未开启「联网」开关），无法访问互联网。"
+                    "若用户需要最新信息，请提示其打开界面顶部的「联网」开关，"
+                    "不要编造实时数据。\n"
+                )
+            )
+            + "调用工具后，根据工具返回结果继续作答。能直接完成的就动手，不要只建议。",
         ]
         # 长期记忆（WorkBuddy 画像 + 检索到的记忆，精简注入）
         if cfg.get("memory_enabled", True):
@@ -217,7 +232,7 @@ async def chat(req: ChatRequest):
         final_text = ""
         final_thinking = ""
         session = req.session_id or ""
-        tool_schemas = tools.make_schemas()
+        tool_schemas = tools.make_schemas(cfg.get("web_enabled", False))
 
         for _round in range(MAX_TOOL_ROUNDS):
             # 工具调用中间轮不再重复附图片
@@ -281,8 +296,9 @@ async def chat(req: ChatRequest):
                         args = {}
                 yield json.dumps({"tool_start": {"name": name, "args": args}}) + "\n"
                 result = await asyncio.to_thread(tools.dispatch, name, args, ui_events, ctx)
-                working.append({"role": "tool", "content": result,
-                                "tool_calls": [tc]})
+                # 注意：Ollama 的 tool 消息用 tool_name 关联调用，不是 tool_calls/tool_call_id，
+                # 否则模型读不到工具返回内容（会误答"没查到/无法联网"）。
+                working.append({"role": "tool", "content": result, "tool_name": name})
             # 3) 把前端副作用事件透出
             for ui in ui_events:
                 yield json.dumps({"ui": ui}) + "\n"

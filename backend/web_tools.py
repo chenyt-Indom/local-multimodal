@@ -30,24 +30,39 @@ def web_search(query: str, n: int = 5) -> list:
 
 
 def _parse_bing(query: str, html: str, n: int):
-    """解析 Bing 结果页 HTML（尽量稳健，抓不到就返回简单列表）。"""
-    results = []
-    # 简单按 <li class="b_algo"> 分段
+    """解析 Bing 结果页 HTML。
+
+    现行页面结构（2026 版）：
+        <h2 class=""><a href="URL" ...>TITLE</a></h2>
+        <div class="b_caption"><p ...>DESC</p></div>
+    注意 h2 是带属性的（早期版本是无属性的 <h2>），因此正则必须允许属性。
+    """
+    import html as _html
     import re
-    blocks = re.split(r'<li class="b_algo"', html)[1:]
-    for blk in blocks[:n]:
-        title_m = re.search(r'<h2><a[^>]*href="([^"]+)"[^>]*>(.*?)</a></h2>', blk, re.S)
-        if not title_m:
+
+    results = []
+    pattern = re.compile(
+        r"<h2[^>]*>\s*<a[^>]*href=\"(https?://[^\"]+)\"[^>]*>(.*?)</a>\s*</h2>(.*?)(?=<h2|\Z)",
+        re.S,
+    )
+    for m in pattern.finditer(html):
+        if len(results) >= n:
+            break
+        url = m.group(1).strip()
+        title = _html.unescape(re.sub(r"<[^>]+>", "", m.group(2))).strip()
+        rest = m.group(3)
+        dm = re.search(r"<p[^>]*>(.*?)</p>", rest, re.S)
+        desc = _html.unescape(re.sub(r"<[^>]+>", "", dm.group(1))).strip() if dm else ""
+        desc = re.sub(r"\s+", " ", desc)
+        if not title:
             continue
-        url = title_m.group(1).strip()
-        title = re.sub(r"<[^>]+>", "", title_m.group(2)).strip()
-        desc_m = re.search(r'<p[^>]*>(.*?)</p>', blk, re.S)
-        desc = re.sub(r"<[^>]+>", "", desc_m.group(1)).strip() if desc_m else ""
         results.append({"title": title, "url": url, "desc": desc[:300]})
-    # 兜底：若正则没抓到，至少返回关键词相关提示
+
+    # 兜底：若正则没抓到，至少给出可点击的搜索地址
     if not results:
-        results = [{"title": "（链接解析失败，可复制下面地址在浏览器打开）",
-                    "url": "https://www.bing.com/search?q=" + urllib.parse.quote(query), "desc": ""}]
+        results = [{"title": "（未解析到搜索结果）",
+                    "url": "https://www.bing.com/search?q=" + urllib.parse.quote(query),
+                    "desc": ""}]
     return results
 
 

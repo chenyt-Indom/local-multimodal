@@ -60,10 +60,13 @@ def _dir_datas(src_root, dst_root, skip_suffixes=()):
 
 all_datas += _dir_datas(os.path.join(root, "frontend"), "frontend")
 
-# —— 语音识别模型（离线唤醒词 + 流式识别，约 78MB）——
-_ASR_ROOT = r"D:\local-multimodal-models\sherpa-asr"
-if os.path.isdir(_ASR_ROOT):
-    all_datas += _dir_datas(_ASR_ROOT, "asr_model")
+# —— 语音识别模型（离线唤醒词 + 流式识别）——
+# 模型体积较大（int8 版约 24MB、fp32 版约 53MB），为把主包控制在 GitHub
+# 单文件 100MB 限制内，模型不随主包分发，而是作为独立的 asr-model 发布包提供。
+# 运行时若 _internal/asr_model 不存在，会自动回退到本机模型目录。
+# _ASR_ROOT = r"D:\local-multimodal-models\sherpa-asr"
+# if os.path.isdir(_ASR_ROOT):
+#     all_datas += _dir_datas(_ASR_ROOT, "asr_model")
 
 # —— 后端模块的显式收集 ——
 all_hidden += [

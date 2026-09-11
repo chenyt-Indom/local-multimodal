@@ -21,6 +21,7 @@
     remember: "🧠 更新记忆",
     search_memory: "💭 检索记忆",
     get_time: "🕐 获取时间",
+    web_search: "🌐 联网搜索",
   };
 
   const messagesEl = $("#messages");
@@ -408,6 +409,7 @@
       if (name === "generate_image") thinkStatus.textContent = "🎨 正在生成图片…";
       else if (name === "edit_image") thinkStatus.textContent = "🖼 正在微改图片…";
       else if (name === "remember" || name === "search_memory") thinkStatus.textContent = "🧠 正在读写记忆…";
+      else if (name === "web_search") thinkStatus.textContent = "🌐 正在联网检索…";
       else thinkStatus.textContent = "🔧 正在调用工具：" + (TOOL_LABELS[name] || name);
     };
     const addMedia = (ui) => {
