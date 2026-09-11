@@ -45,10 +45,24 @@ for _p in _meta_pkgs:
         pass
 
 # —— 前端与自带 SD 模型（只读打包资源）——
-all_datas += [
-    (os.path.join(root, "frontend"), "frontend"),
-    (r"D:\local-multimodal-models\sd-turbo", "sd_model"),
-]
+def _dir_datas(src_root, dst_root, skip_suffixes=()):
+    """把目录展开为 (文件, 目标目录) 列表；可跳过指定后缀的残余文件。"""
+    out = []
+    for dirpath, _dirnames, filenames in os.walk(src_root):
+        for fn in filenames:
+            if any(fn.endswith(s) for s in skip_suffixes):
+                continue
+            src = os.path.join(dirpath, fn)
+            rel = os.path.relpath(dirpath, src_root)
+            dst = dst_root if rel == "." else os.path.join(dst_root, rel)
+            out.append((src, dst))
+    return out
+
+
+# 跳过 sd_turbo.safetensors.incomplete（未下载完的残片，约 693MB）
+_SD_ROOT = r"D:\local-multimodal-models\sd-turbo"
+all_datas += _dir_datas(os.path.join(root, "frontend"), "frontend")
+all_datas += _dir_datas(_SD_ROOT, "sd_model", skip_suffixes=(".incomplete",))
 
 # —— 后端模块的显式收集 ——
 all_hidden += [
@@ -88,7 +102,7 @@ exe = EXE(
     upx=False,                 # 大体积 torch/CUDA 库不适合 upx 压缩，易损坏且极慢
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,              # 保留控制台便于排错；正式版可改为 False
+    console=False,             # 桌面应用：不弹黑框控制台（失败时由 run.py 弹窗提示）
     icon=None,
 )
 

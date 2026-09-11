@@ -42,6 +42,15 @@ def _wait_until_up(timeout: float = 60.0) -> bool:
     return False
 
 
+def _alert(msg: str, title: str = "本地多模态助手") -> None:
+    """无控制台时用系统弹窗提示失败原因，避免"闪退"且没有任何反馈。"""
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, msg, title, 0x40)
+    except Exception:
+        print(msg)
+
+
 def main() -> None:
     config.load_config()
     server = uvicorn.Server(uvicorn.Config(app, host=HOST, port=PORT,
@@ -52,9 +61,18 @@ def main() -> None:
     if not _wait_until_up():
         # 服务起不来就退，避免白弹一个空白窗口
         server.should_exit = True
+        _alert("本地服务启动失败。\n\n请依次检查：\n"
+               "1) Ollama 是否已安装并正在运行\n"
+               "2) 端口 8000 是否被其他程序占用\n"
+               "3) 是否已拉取模型 qwen3-vl:8b")
         raise SystemExit("本地服务启动失败")
 
-    import webview  # 延迟导入，避免源码环境未安装时阻塞后端
+    try:
+        import webview  # 延迟导入，避免源码环境未安装时阻塞后端
+    except ImportError as exc:
+        _alert("缺少桌面窗口组件 pywebview：\n" + str(exc))
+        raise
+
     window = webview.create_window(
         "本地多模态助手",
         URL,
