@@ -32,6 +32,26 @@
   function esc(s) {
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   }
+
+  // 轻提示：顶部居中出现，2.6 秒后自动淡出
+  function showToast(msg, kind = "") {
+    let wrap = document.getElementById("toastWrap");
+    if (!wrap) {
+      wrap = document.createElement("div");
+      wrap.id = "toastWrap";
+      wrap.className = "toast-wrap";
+      document.body.appendChild(wrap);
+    }
+    const el = document.createElement("div");
+    el.className = "toast" + (kind ? " " + kind : "");
+    el.textContent = msg;
+    wrap.appendChild(el);
+    setTimeout(() => {
+      el.style.transition = "opacity .25s";
+      el.style.opacity = "0";
+      setTimeout(() => el.remove(), 280);
+    }, 2600);
+  }
   function showThinking(text) {
     const el = document.createElement("div");
     el.className = "msg bot";
@@ -84,6 +104,11 @@
         const on = key === "memory_enabled" ? c.memory_enabled !== false : !!c[key];
         p.classList.toggle("on", on);
       });
+      // 若联网模式已开启，顺带校验当前网络（断网时给出提示）
+      if (c.web_enabled) {
+        const net = await checkNetwork();
+        if (!net.online) showToast("电脑未连接网络，联网搜索将不可用", "warn");
+      }
     } catch {}
   }
   async function saveToggles() {
@@ -95,10 +120,38 @@
     };
     await api("/api/config", { method: "POST", body: JSON.stringify(body) });
   }
+  // 检测本机是否已连接互联网（开启「联网」前的前置校验）
+  async function checkNetwork() {
+    try {
+      const r = await fetch("/api/net/check");
+      return await r.json();
+    } catch (e) {
+      return { online: false, error: String(e) };
+    }
+  }
+
   document.querySelectorAll(".pill").forEach((p) => {
     p.onclick = async () => {
+      const key = p.dataset.cfg;
+      const turningOn = !p.classList.contains("on");
+
+      // 开启「联网」前先校验电脑是否联网：未联网则提示，且开关保持原状不变亮
+      if (key === "web_enabled" && turningOn) {
+        p.classList.add("checking");
+        const net = await checkNetwork();
+        p.classList.remove("checking");
+        if (!net.online) {
+          showToast("电脑未连接网络", "warn");
+          return;
+        }
+      }
+
       p.classList.toggle("on");
       await saveToggles();
+      if (key === "web_enabled") {
+        showToast(p.classList.contains("on") ? "已开启联网模式" : "已关闭联网模式",
+                  p.classList.contains("on") ? "ok" : "");
+      }
     };
   });
 

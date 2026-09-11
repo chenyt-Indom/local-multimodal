@@ -136,6 +136,39 @@ def update_config(body: dict):
     return {"ok": True, "config": merged}
 
 
+@app.get("/api/net/check")
+def net_check():
+    """检测本机是否已连接互联网。
+
+    供前端「联网」开关做前置校验：未联网时不允许点亮开关。
+    用 TCP 连通性判断（比 HTTP 更快、不受代理/重定向干扰），
+    多目标**并行**探测，任意一个通即视为已联网——断网时也能快速返回。
+    """
+    import socket
+    from concurrent.futures import ThreadPoolExecutor
+
+    targets = [
+        ("223.5.5.5", 53),        # 阿里公共 DNS
+        ("www.bing.com", 443),
+        ("www.baidu.com", 443),
+    ]
+
+    def _probe(host_port):
+        host, port = host_port
+        try:
+            conn = socket.create_connection((host, port), timeout=2.0)
+            conn.close()
+            return host_port
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=len(targets)) as pool:
+        for hit in pool.map(_probe, targets):
+            if hit:
+                return {"online": True, "via": f"{hit[0]}:{hit[1]}"}
+    return {"online": False, "error": "无法连接互联网"}
+
+
 # ---------- 模型管理 ----------
 @app.get("/api/models")
 def list_models():
