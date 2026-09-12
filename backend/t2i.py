@@ -35,42 +35,77 @@ _edit_pipe = None       # 图生图（img2img 微改）流水线
 _lock = threading.Lock()
 
 
+def _log_exc(where: str, exc: Exception) -> None:
+    """把异常完整堆栈写入日志文件（界面只显示简短信息，详情查日志）。"""
+    import datetime
+    import traceback
+    try:
+        path = config.data("logs", "t2i_error.log")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"\n{'=' * 60}\n{datetime.datetime.now():%Y-%m-%d %H:%M:%S} [{where}]\n")
+            f.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+    except Exception:
+        pass
+
+
+def _load_pipe():
+    """实际加载流水线（拆出来便于失败后重试）。"""
+    import torch
+    from diffusers import AutoPipelineForText2Image
+
+    # 本机有无 CUDA：RTX 5070 Ti 应可用
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # 优先从本地目录加载（离线，无需联网）。
+    # 注意：ModelScope 下载的 SD 模型只含 fp16 权重，必须传 variant="fp16"，
+    # 否则 diffusers 会去找不存在的 diffusion_pytorch_model.safetensors 而报错。
+    if os.path.isdir(LOCAL_MODEL_DIR) and os.path.exists(
+            os.path.join(LOCAL_MODEL_DIR, "model_index.json")):
+        try:
+            pipe = AutoPipelineForText2Image.from_pretrained(
+                LOCAL_MODEL_DIR, torch_dtype=torch.float16, variant="fp16",
+                local_files_only=True)
+        except Exception:
+            # 个别组件可能没有 fp16 文件，退化为默认 variant 再试一次
+            pipe = AutoPipelineForText2Image.from_pretrained(
+                LOCAL_MODEL_DIR, torch_dtype=torch.float16,
+                local_files_only=True)
+    else:
+        dtype = torch.float16 if device == "cuda" else torch.float32
+        pipe = AutoPipelineForText2Image.from_pretrained(
+            MODEL_REPO, torch_dtype=dtype, variant="fp16"
+            if device == "cuda" else None)
+    pipe.to(device)
+    return pipe, device
+
+
 def _get_pipe():
+    """获取（必要时加载）文生图流水线。
+
+    长时间运行的服务进程偶尔会在加载阶段抛出 `[Errno 22] Invalid argument`，
+    重启即可恢复。这里加入**失败自动重试 + 清理显存缓存**，并把完整堆栈写日志，
+    避免用户必须重启程序。
+    """
     global _pipe, _device
     with _lock:
         if _pipe is not None:
             return _pipe, _device
-        import torch
-        from diffusers import AutoPipelineForText2Image
-
-        # 本机有无 CUDA：RTX 5070 Ti 应可用
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        # 优先从本地目录加载（离线，无需联网）。
-        # 注意：ModelScope 下载的 SD 模型只含 fp16 权重，必须传 variant="fp16"，
-        # 否则 diffusers 会去找不存在的 diffusion_pytorch_model.safetensors 而报错。
-        if os.path.isdir(LOCAL_MODEL_DIR) and os.path.exists(
-                os.path.join(LOCAL_MODEL_DIR, "model_index.json")):
+        last_exc = None
+        for attempt in (1, 2):
             try:
-                pipe = AutoPipelineForText2Image.from_pretrained(
-                    LOCAL_MODEL_DIR, torch_dtype=torch.float16, variant="fp16",
-                    local_files_only=True)
-            except Exception as e:
-                # 个别组件可能没有 fp16 文件，退化为默认 variant 再试一次
-                pipe = AutoPipelineForText2Image.from_pretrained(
-                    LOCAL_MODEL_DIR, torch_dtype=torch.float16,
-                    local_files_only=True)
-            _model_src = LOCAL_MODEL_DIR
-        else:
-            dtype = torch.float16 if device == "cuda" else torch.float32
-            pipe = AutoPipelineForText2Image.from_pretrained(
-                MODEL_REPO, torch_dtype=dtype, variant="fp16"
-                if device == "cuda" else None)
-            _model_src = MODEL_REPO
-        pipe.to(device)
-        # sd-turbo 建议 1~4 步，这里设合理默认
-        _pipe, _device = pipe, device
-        return pipe, device
+                _pipe, _device = _load_pipe()
+                return _pipe, _device
+            except Exception as exc:
+                last_exc = exc
+                _log_exc(f"文生图引擎加载（第 {attempt} 次尝试）", exc)
+                # 清一次显存缓存再重试（引擎加载失败常与显存/句柄状态有关）
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+        raise last_exc
 
 
 def _pipe_loaded():
@@ -85,6 +120,14 @@ def generate(prompt: str, negative_prompt: str = "", steps: int = 4,
     except Exception as e:
         return {"ok": False, "error": f"文生图引擎加载失败: {e}"}
     try:
+        # 每次生成前把整条流水线统一到目标设备。
+        # 否则多次调用后个别组件会漂回 CPU，报
+        # "Expected all tensors to be on the same device ... index is on cuda:0,
+        #  different from other tensors on cpu"。to() 在同一设备上开销极小。
+        try:
+            pipe.to(device)
+        except Exception:
+            pass
         result = pipe(
             prompt=prompt,
             negative_prompt=negative_prompt or "low quality, blurry, watermark",
@@ -100,36 +143,57 @@ def generate(prompt: str, negative_prompt: str = "", steps: int = 4,
         return {"ok": False, "error": f"文生图生成失败: {e}"}
 
 
+def _load_edit_pipe():
+    """实际加载 img2img 流水线。"""
+    import torch
+    from diffusers import AutoPipelineForImage2Image
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # 复用生成管线已加载的设备，避免重复统计
+    if _pipe is not None and _device:
+        device = _device
+    if os.path.isdir(LOCAL_MODEL_DIR) and os.path.exists(
+            os.path.join(LOCAL_MODEL_DIR, "model_index.json")):
+        try:
+            pipe = AutoPipelineForImage2Image.from_pretrained(
+                LOCAL_MODEL_DIR, torch_dtype=torch.float16, variant="fp16",
+                local_files_only=True)
+        except Exception:
+            pipe = AutoPipelineForImage2Image.from_pretrained(
+                LOCAL_MODEL_DIR, torch_dtype=torch.float16,
+                local_files_only=True)
+    else:
+        dtype = torch.float16 if device == "cuda" else torch.float32
+        pipe = AutoPipelineForImage2Image.from_pretrained(
+            MODEL_REPO, torch_dtype=dtype,
+            variant="fp16" if device == "cuda" else None)
+    pipe.to(device)
+    return pipe, device
+
+
 def _get_edit_pipe():
-    """图生图（img2img）流水线，用于"给一张图做微改"。懒惰加载，用完释放。"""
+    """图生图（img2img）流水线，用于"给一张图做微改"。懒惰加载，用完释放。
+
+    与文生图一样加入失败重试与日志（原因见 _get_pipe 说明）。
+    """
     global _edit_pipe
     with _lock:
         if _edit_pipe is not None:
             return _edit_pipe, _device
-        import torch
-        from diffusers import AutoPipelineForImage2Image, AutoPipelineForText2Image
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        # 复用生成管线已加载的设备，避免重复统计
-        if _pipe is not None and _device:
-            device = _device
-        if os.path.isdir(LOCAL_MODEL_DIR) and os.path.exists(
-                os.path.join(LOCAL_MODEL_DIR, "model_index.json")):
+        last_exc = None
+        for attempt in (1, 2):
             try:
-                pipe = AutoPipelineForImage2Image.from_pretrained(
-                    LOCAL_MODEL_DIR, torch_dtype=torch.float16, variant="fp16",
-                    local_files_only=True)
-            except Exception:
-                pipe = AutoPipelineForImage2Image.from_pretrained(
-                    LOCAL_MODEL_DIR, torch_dtype=torch.float16,
-                    local_files_only=True)
-        else:
-            dtype = torch.float16 if device == "cuda" else torch.float32
-            pipe = AutoPipelineForImage2Image.from_pretrained(
-                MODEL_REPO, torch_dtype=dtype,
-                variant="fp16" if device == "cuda" else None)
-        pipe.to(device)
-        _edit_pipe, _device = pipe, device
-        return pipe, device
+                _edit_pipe, _device = _load_edit_pipe()
+                return _edit_pipe, _device
+            except Exception as exc:
+                last_exc = exc
+                _log_exc(f"图片微改引擎加载（第 {attempt} 次尝试）", exc)
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+        raise last_exc
 
 
 def edit_image(init_image, prompt: str, negative_prompt: str = "",
@@ -151,6 +215,10 @@ def edit_image(init_image, prompt: str, negative_prompt: str = "",
     except Exception as e:
         return {"ok": False, "error": f"图生图引擎加载失败: {e}"}
     try:
+        try:
+            pipe.to(device)      # 统一设备，避免多次调用后组件漂回 CPU
+        except Exception:
+            pass
         result = pipe(
             prompt=prompt,
             negative_prompt=negative_prompt or "low quality, blurry, watermark",
