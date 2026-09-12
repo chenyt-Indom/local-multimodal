@@ -357,3 +357,32 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
   from { opacity: 0; transform: translateY(-6px); }
   to { opacity: 1; transform: none; }
 }
+
+/* ---------- 多会话列表 ---------- */
+.sec-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; margin-bottom: 8px;
+}
+.sec-head h2 { margin: 0; }
+.sessions-list { max-height: 230px; overflow-y: auto; }
+.session-item {
+  display: flex; align-items: center; gap: 6px;
+  padding: 7px 10px; margin-bottom: 4px;
+  border: 1px solid transparent; border-radius: 8px;
+  font-size: 13px; color: var(--muted); cursor: pointer;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.session-item:hover { background: var(--panel2); color: var(--text); }
+.session-item.active {
+  background: rgba(79, 139, 249, .12);
+  border-color: var(--accent); color: var(--text);
+}
+.session-title {
+  flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.session-del {
+  flex: 0 0 auto; width: 18px; height: 18px; line-height: 1;
+  border: none; border-radius: 50%; cursor: pointer;
+  background: transparent; color: var(--muted); font-size: 15px;
+}
+.session-del:hover { background: rgba(229, 83, 75, .18); color: var(--danger); }

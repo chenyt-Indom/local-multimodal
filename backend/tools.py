@@ -42,6 +42,7 @@ def make_schemas(web_enabled: bool = False) -> list:
                         "prompt": {"type": "string", "description": "详细的英文图片描述（SDXL 风格 prompt，英文）"},
                         "negative_prompt": {"type": "string", "description": "英文负面描述，可选，例如 'low quality, blurry, watermark'"},
                         "size": {"type": "integer", "enum": [512, 768], "description": "图片边长，默认512"},
+                        "hd": {"type": "boolean", "description": "是否高清放大（默认 false）。当用户要求「高清/高分辨率/4K/画质好点/放大」时设为 true：会额外做 4 倍超分（512→2048），耗时约多 5 秒"},
                     },
                     "required": ["prompt"],
                 },
@@ -411,20 +412,24 @@ def _do_generate_image(arguments, ui_events):
         return "错误：未提供图片描述（prompt）。"
     negative = (arguments.get("negative_prompt") or "").strip() or "low quality, blurry, watermark, text, deformed"
     size = int(arguments.get("size") or 512)
+    hd = bool(arguments.get("hd"))
     # 提升 SD 对 prompt 的遵循度：追加质量词
     boosted = prompt + ", " + _IMAGE_PROMPT_BOOST
     t2i.unload()  # 确保显存空闲
     start = time.time()
     result = t2i.generate(boosted, negative_prompt=negative, steps=4,
-                          width=size, height=size)
+                          width=size, height=size, hd=hd)
     cost = time.time() - start
     if not result.get("ok"):
         return f"图片生成失败：{result.get('error')}"
     # 把图片作为副作用发给前端展示；只把简短文本回给模型，避免占用上下文
     _ui(ui_events, {"type": "image", "mime": "image/png", "b64": result["b64"],
                     "prompt": prompt, "device": result.get("device"),
-                    "model": result.get("model"), "cost_s": round(cost, 1)})
-    return (f"已生成图片（{size}x{size}，{result.get('device')}，用 {round(cost,1)} 秒）。"
+                    "model": result.get("model"), "cost_s": round(cost, 1),
+                    "size": result.get("size")})
+    real_size = result.get("size") or f"{size}x{size}"
+    extra = f"（{result['hd_note']}）" if (hd and result.get("hd_note")) else ""
+    return (f"已生成图片（{real_size}，{result.get('device')}，用 {round(cost,1)} 秒）{extra}。"
             f"生成的图片已经展示给用户。若用户想调整，可再次明确修改描述。")
 
 

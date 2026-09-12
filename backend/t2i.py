@@ -29,9 +29,27 @@ def _resolve_model_dir() -> str:
     return candidates[0]
 
 LOCAL_MODEL_DIR = _resolve_model_dir()
+
+
+def _resolve_esrgan_path() -> str | None:
+    """定位超分模型（RealESRGAN 4x）。找不到就返回 None，功能自动降级。"""
+    env = os.environ.get("ESRGAN_MODEL")
+    candidates = [env] if env else []
+    candidates += [
+        r"D:\training_data\RealESRGAN_x4plus.pth",
+        config.res("esrgan", "RealESRGAN_x4plus.pth"),
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+ESRGAN_PATH = _resolve_esrgan_path()
 _device = None
 _pipe = None            # 文生图（txt2img）流水线
 _edit_pipe = None       # 图生图（img2img 微改）流水线
+_upscaler = None        # 超分网络（RealESRGAN）
 _lock = threading.Lock()
 
 
@@ -113,8 +131,8 @@ def _pipe_loaded():
 
 
 def generate(prompt: str, negative_prompt: str = "", steps: int = 4,
-             width: int = 512, height: int = 512) -> dict:
-    """文生图，返回 base64 PNG。失败时返回错误信息。"""
+             width: int = 512, height: int = 512, hd: bool = False) -> dict:
+    """文生图，返回 base64 PNG。hd=True 时再用 RealESRGAN 放大到高分辨率。"""
     try:
         pipe, device = _get_pipe()
     except Exception as e:
@@ -135,12 +153,73 @@ def generate(prompt: str, negative_prompt: str = "", steps: int = 4,
             guidance_scale=0.0 if MODEL_REPO.endswith("sd-turbo") else 7.5,
             width=width, height=height,
         ).images[0]
+        note = ""
+        if hd:
+            result, note = upscale_image(result)
         buf = io.BytesIO()
         result.save(buf, format="PNG")
         return {"ok": True, "b64": base64.b64encode(buf.getvalue()).decode("utf-8"),
-                "device": device, "model": MODEL_REPO}
+                "device": device, "model": MODEL_REPO,
+                "size": f"{result.size[0]}x{result.size[1]}", "hd_note": note}
     except Exception as e:
         return {"ok": False, "error": f"文生图生成失败: {e}"}
+
+
+def available_upscale() -> bool:
+    """本机是否具备超分能力（模型文件存在）。"""
+    return ESRGAN_PATH is not None
+
+
+def _get_upscaler():
+    """懒加载超分网络（spandrel 加载 RealESRGAN 权重，避免 basicsr 依赖问题）。"""
+    global _upscaler
+    with _lock:
+        if _upscaler is not None:
+            return _upscaler
+        if not ESRGAN_PATH:
+            return None
+        try:
+            import spandrel
+            import torch
+            desc = spandrel.ModelLoader().load_from_file(ESRGAN_PATH)
+            net = desc.model.eval()
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            net = net.to(device)
+            _upscaler = (net, device)
+            return _upscaler
+        except Exception as exc:
+            _log_exc("超分模型加载", exc)
+            return None
+
+
+def upscale_image(image, target_w: int | None = None, target_h: int | None = None):
+    """把 PIL 图片用 RealESRGAN 放大（4x），必要时再插值到目标尺寸。
+
+    返回 (新图, 说明文本)；不具备超分能力时原样返回。
+    """
+    got = _get_upscaler()
+    if got is None:
+        return image, "未找到超分模型，跳过放大"
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    net, device = got
+    src = image.convert("RGB")
+    w, h = src.size
+    t = torch.from_numpy(np.array(src)).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+    t = t.to(device)
+    with torch.inference_mode():
+        out = net(t)
+    arr = out.clamp(0, 1).squeeze(0).permute(1, 2, 0).cpu().numpy()
+    arr = (arr * 255).round().astype(np.uint8)
+    big = Image.fromarray(arr)
+
+    note = f"{w}x{h} → {big.size[0]}x{big.size[1]}（4x 超分）"
+    if target_w and target_h and (big.size[0] < target_w or big.size[1] < target_h):
+        big = big.resize((target_w, target_h), Image.LANCZOS)
+        note += f" → {target_w}x{target_h}（插值补足）"
+    return big, note
 
 
 def _load_edit_pipe():

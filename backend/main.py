@@ -15,12 +15,32 @@ import os
 import base64
 import io
 import json
+import time
 import asyncio
 import datetime
-from . import config, ollama_client, memory, kb, file_tools, video, web_tools, t2i, tools, voice
+from . import config, ollama_client, memory, kb, file_tools, video, web_tools, t2i, tools, voice, sessions
 
 app = FastAPI(title="本地多模态助手", version="1.0.0")
 client = ollama_client.OllamaClient()
+
+# 最近一次出现过的图片（base64），供后续「把这张图改成…」直接微改，免去重新导入。
+# 单用户桌面应用，保存最近一张即可；换新图时自动覆盖。
+_LAST_IMAGE: dict = {"b64": None, "ts": 0.0, "ttl": 3600.0}
+
+
+def _remember_image(images: list) -> None:
+    """记住本轮图片，供下一轮引用。"""
+    if images:
+        _LAST_IMAGE["b64"] = images[-1]
+        _LAST_IMAGE["ts"] = time.time()
+
+
+def _recent_image() -> list:
+    """取回最近一张仍在有效期内的图片（列表形式，未过期才返回）。"""
+    b64 = _LAST_IMAGE.get("b64")
+    if b64 and (time.time() - _LAST_IMAGE.get("ts", 0)) < _LAST_IMAGE.get("ttl", 3600):
+        return [b64]
+    return []
 
 
 def _now_str() -> str:
@@ -28,6 +48,37 @@ def _now_str() -> str:
     now = datetime.datetime.now()
     wd = "一二三四五六日"[now.weekday()]
     return f"{now.year}年{now.month}月{now.day}日（星期{wd}），{now.strftime('%H:%M:%S')}"
+
+
+# 简单问题识别：命中则收紧生成长度，避免模型对"你好"这类问题长篇思考。
+# qwen3-vl 的 thinking 无法通过 API 关闭（think=false /no_think 均实测无效，
+# 提示词引导反而让它想更多），**限制 num_predict 是唯一有效手段**：
+# 实测「你好」从 24.3s 降到 3.9s。
+_COMPLEX_HINTS = (
+    "写", "画", "生成", "做一份", "方案", "报告", "代码", "脚本", "文件", "搜索",
+    "查一下", "查查", "总结", "翻译", "分析", "对比", "设计", "规划", "计划",
+    "记住", "帮我", "为什么", "怎么", "如何", "详细", "解释", "列出", "整理",
+    # 图片相关一律走完整模式：微改需要输出工具调用，收紧长度会被思考吃光
+    "图", "照片", "图片", "这张", "那张", "刚才", "上面", "改成", "换成", "修改",
+)
+
+
+def _is_simple_question(text: str) -> bool:
+    """判断是否属于可快速作答的简单问题。
+
+    注意：只做**文本**层面的判断；调用方还需确认本轮没有图片上下文
+    （见 chat()），否则模型可能来不及输出工具调用。
+    """
+    t = (text or "").strip()
+    if not t or len(t) > 30:
+        return False
+    return not any(k in t for k in _COMPLEX_HINTS)
+
+
+# 简单问题的生成长度上限（思考+回答总量）。512 足以覆盖问候/常识问答，
+# 又能把"先想很久"压到 3~5 秒；复杂问题仍用配置里的完整配额。
+SIMPLE_MAX_TOKENS = 512
+
 
 # 允许本地界面跨域访问（浏览器 debug 时用）
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
@@ -247,9 +298,16 @@ async def chat(req: ChatRequest):
     model = req.model or config.load_config()["default_model"]
     cfg = config.load_config()
     images = list(req.images_b64 or [])
+    _remember_image(images)          # 记住本轮图片，供后续「把这张图改成…」直接引用
     messages = list(req.messages)
 
     last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+
+    # 简单问题收紧生成长度：把"先思考很久"压到几秒（qwen3-vl 无法真正关闭思考）。
+    # 但有图片上下文时不收紧——用户可能在要求微改，需要模型完整输出工具调用。
+    simple_q = _is_simple_question(last_user) and not images and not _recent_image()
+    if simple_q:
+        cfg["max_tokens"] = min(int(cfg.get("max_tokens") or 2048), SIMPLE_MAX_TOKENS)
 
     # 联网搜索（仅当开启且用户明确想搜索）
     if cfg.get("web_enabled") and _wants_search(last_user):
@@ -317,7 +375,7 @@ async def chat(req: ChatRequest):
                             "tool_calls": tool_calls})
             # 2) 逐个执行
             ui_events = []
-            ctx = {"images": images}  # 本轮对话拖入/附带的图片，供 edit_image 等工具使用
+            ctx = {"images": images or _recent_image()}  # 本轮图片优先，否则复用最近一张
             for tc in tool_calls:
                 fn = (tc.get("function") or {})
                 name = fn.get("name", "")
@@ -336,9 +394,14 @@ async def chat(req: ChatRequest):
             for ui in ui_events:
                 yield json.dumps({"ui": ui}) + "\n"
 
-        # 对话结束：归档历史会话（长期记忆由 AI 用 remember 工具自主更新文段）
+        # 对话结束：归档历史会话（供记忆检索）+ 保存会话文件（供重启后恢复）
+        full = messages + [{"role": "assistant", "content": final_text}]
         try:
-            memory.save_transcript(session, messages + [{"role": "assistant", "content": final_text}])
+            memory.save_transcript(session, full)
+        except Exception:
+            pass
+        try:
+            sessions.save_messages(session, full)
         except Exception:
             pass
         yield json.dumps({"done": True, "text": final_text, "thinking": final_thinking}) + "\n"
@@ -495,18 +558,65 @@ class T2IBody(BaseModel):
     steps: int = 4
     width: int = 512
     height: int = 512
+    hd: bool = False          # 是否做 4 倍超分放大（512→2048）
 
 
 @app.post("/api/t2i/generate")
 def t2i_generate(body: T2IBody):
     result = t2i.generate(body.prompt, body.negative_prompt, body.steps,
-                          body.width, body.height)
+                          body.width, body.height, hd=body.hd)
     return result
+
+
+@app.get("/api/t2i/capability")
+def t2i_capability():
+    """文生图能力探测：是否可用、是否支持高清放大。"""
+    return {"ok": True, "hd_available": t2i.available_upscale()}
 
 
 @app.post("/api/t2i/unload")
 def t2i_unload():
     t2i.unload()
+    return {"ok": True}
+
+
+# ---------- 多会话管理 ----------
+@app.get("/api/sessions")
+def session_list():
+    """列出所有会话（按最近更新倒序）。首次调用会自动创建一个默认会话。"""
+    sessions.ensure_default()
+    return {"ok": True, "sessions": sessions.list_sessions()}
+
+
+@app.post("/api/sessions")
+def session_create(body: dict | None = None):
+    """新建会话。"""
+    item = sessions.create((body or {}).get("title"))
+    return {"ok": True, "session": item}
+
+
+@app.get("/api/sessions/{sid}")
+def session_get(sid: str):
+    """读取某个会话的完整消息（前端切换会话时用于恢复）。"""
+    return {"ok": True, "id": sid, "messages": sessions.get_messages(sid)}
+
+
+@app.put("/api/sessions/{sid}")
+def session_save(sid: str, body: dict):
+    """保存会话消息（前端每次对话后调用，保证重启后能恢复）。"""
+    msgs = body.get("messages") or []
+    info = sessions.save_messages(sid, msgs)
+    return {"ok": True, "session": info}
+
+
+@app.post("/api/sessions/{sid}/rename")
+def session_rename(sid: str, body: dict):
+    return {"ok": sessions.rename(sid, (body or {}).get("title") or "")}
+
+
+@app.delete("/api/sessions/{sid}")
+def session_delete(sid: str):
+    sessions.delete(sid)
     return {"ok": True}
 
 

@@ -6,8 +6,11 @@
   let streaming = false;
   const history = [];       // 会话消息（用于多轮上下文）
   // 会话标识（后端据此把历史会话落盘，供记忆检索）
-  let sessionId = localStorage.getItem("ai_session_id") || (Date.now().toString(36) + Math.random().toString(36).slice(2, 10));
-  localStorage.setItem("ai_session_id", sessionId);
+  let sessionId = localStorage.getItem("ai_session_id") || "";
+  const setSessionId = (sid) => {
+    sessionId = sid || "";
+    if (sessionId) localStorage.setItem("ai_session_id", sessionId);
+  };
 
   // 工具名 → 中文展示
   const TOOL_LABELS = {
@@ -186,6 +189,128 @@
   mainEl.addEventListener("drop", (e) => {
     onDropFiles(e.dataTransfer && e.dataTransfer.files);
   });
+
+  // ---------- 多会话管理 ----------
+  // 每个会话互相独立（各自的消息与上下文），全部持久化在后端，
+  // 程序重启后自动恢复上次使用的会话。
+  const sessionsListEl = $("#sessionsList");
+
+  async function loadSessions() {
+    let data;
+    try {
+      data = await api("/api/sessions");
+    } catch (e) {
+      return [];
+    }
+    const list = (data && data.sessions) || [];
+    if (!sessionId || !list.some((s) => s.id === sessionId)) {
+      setSessionId(list.length ? list[0].id : "");
+    }
+    renderSessions(list);
+    return list;
+  }
+
+  function renderSessions(list) {
+    if (!sessionsListEl) return;
+    sessionsListEl.innerHTML = "";
+    if (!list.length) {
+      sessionsListEl.innerHTML = '<p class="hint">暂无对话，点「＋ 新建」开始。</p>';
+      return;
+    }
+    list.forEach((s) => {
+      const row = document.createElement("div");
+      row.className = "session-item" + (s.id === sessionId ? " active" : "");
+      const title = document.createElement("span");
+      title.className = "session-title";
+      title.textContent = s.title || "新对话";
+      title.title = `${s.title || "新对话"}（${s.count || 0} 条）`;
+      const del = document.createElement("button");
+      del.className = "session-del";
+      del.textContent = "×";
+      del.title = "删除这个对话";
+      del.onclick = async (ev) => {
+        ev.stopPropagation();
+        if (!confirm(`删除对话「${s.title || "新对话"}」？`)) return;
+        await api("/api/sessions/" + s.id, { method: "DELETE" });
+        const rest = await loadSessions();
+        if (s.id === sessionId && rest.length) await switchSession(rest[0].id);
+      };
+      row.appendChild(title);
+      row.appendChild(del);
+      row.onclick = () => switchSession(s.id);
+      sessionsListEl.appendChild(row);
+    });
+  }
+
+  async function switchSession(sid) {
+    if (!sid || sid === sessionId) return;
+    if (streaming) { showToast("正在回答中，请稍候再切换", "warn"); return; }
+    setSessionId(sid);
+    history.length = 0;
+    let msgs = [];
+    try {
+      const d = await api("/api/sessions/" + sid);
+      msgs = d.messages || [];
+    } catch (e) { /* 读取失败则当作空会话 */ }
+    // 恢复消息到界面 + 上下文
+    messagesEl.innerHTML = "";
+    msgs.forEach((m) => {
+      if (m.role === "user" || m.role === "assistant") {
+        if (m.content) { addMsg(m.role, m.content); history.push({ role: m.role, content: m.content }); }
+      }
+    });
+    if (!msgs.length) {
+      addMsg("bot", "这是一段新对话，直接说需求即可。");
+    }
+    await loadSessions();
+    showToast(`已切换到「${(await currentTitle(sid))}」`);
+  }
+
+  async function currentTitle(sid) {
+    try {
+      const d = await api("/api/sessions");
+      const hit = (d.sessions || []).find((s) => s.id === sid);
+      return (hit && hit.title) || "新对话";
+    } catch (e) { return "新对话"; }
+  }
+
+  async function newSession() {
+    if (streaming) { showToast("正在回答中，请稍候再新建", "warn"); return; }
+    try {
+      const d = await api("/api/sessions", { method: "POST", body: JSON.stringify({}) });
+      const sid = d.session && d.session.id;
+      if (!sid) return;
+      setSessionId(sid);
+      history.length = 0;
+      messagesEl.innerHTML = "";
+      addMsg("bot", "新对话已开始，这段对话与之前互不影响。");
+      await loadSessions();
+      showToast("已新建对话", "ok");
+    } catch (e) {
+      showToast("新建失败：" + e.message, "warn");
+    }
+  }
+
+  async function persistSession() {
+    if (!sessionId) return;
+    try {
+      const d = await api("/api/sessions/" + sessionId, {
+        method: "PUT",
+        body: JSON.stringify({ messages: history }),
+      });
+      if (d && d.session) renderSessions(await loadSessions_noSwitch());
+    } catch (e) { /* 保存失败不打断对话 */ }
+  }
+
+  async function loadSessions_noSwitch() {
+    try {
+      const d = await api("/api/sessions");
+      return (d && d.sessions) || [];
+    } catch (e) { return []; }
+  }
+
+  const newSessionBtn = $("#newSessionBtn");
+  if (newSessionBtn) newSessionBtn.onclick = newSession;
 
   // ---------- 记忆库 · 文段式 ----------
   async function loadMemory() {
@@ -529,6 +654,7 @@
       answerBubble.textContent = answer;
       if (!answer) { answerWrap.style.display = "none"; answer = "（模型未给出文字回答）"; }
       if (answer) history.push({ role: "assistant", content: answer });
+      persistSession();   // 落盘，保证程序重启后能恢复这段对话
     } catch (err) {
       finishThinking();
       answerBubble.textContent = "❌ " + err.message + "（可能内存/模型未就绪，请查看状态）";
@@ -628,6 +754,28 @@
   }
 
   // ---------- 初始化 ----------
+  // 先恢复会话（含上次的历史消息），再跑其它轮询
+  (async () => {
+    const list = await loadSessions();
+    if (sessionId) {
+      try {
+        const d = await api("/api/sessions/" + sessionId);
+        const msgs = d.messages || [];
+        if (msgs.length) {
+          messagesEl.innerHTML = "";
+          msgs.forEach((m) => {
+            if ((m.role === "user" || m.role === "assistant") && m.content) {
+              addMsg(m.role, m.content);
+              history.push({ role: m.role, content: m.content });
+            }
+          });
+          showToast("已恢复上次的对话记录", "ok");
+        }
+      } catch (e) { /* 恢复失败则用空白会话 */ }
+    }
+    renderSessions(list);
+  })();
+
   refreshHealth();
   loadToggles();
   loadMemory();

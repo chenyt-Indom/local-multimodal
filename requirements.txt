@@ -14,5 +14,9 @@ diffusers>=0.30
 accelerate>=0.30
 torch>=2.2
 
+# 图片高清放大（RealESRGAN 超分）。用 spandrel 加载权重，
+# 避免 basicsr/realesrgan 在 Python 3.13+ 上构建失败的问题。
+spandrel>=0.4
+
 # 打包应用
 pyinstaller>=6.0
