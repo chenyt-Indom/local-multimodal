@@ -135,3 +135,75 @@ def ensure_default() -> dict:
     if items:
         return items[0]
     return create("新对话")
+
+
+# =====================================================================
+#  容量控制与清理
+#  - 单个会话过长 → 裁剪（只留最近若干条，更早的丢弃）
+#  - 太久未用且内容很少的会话 → 直接删除
+#  重要信息由长期记忆（memory_doc.json）承载，不依赖聊天记录堆积。
+# =====================================================================
+MAX_KEEP = 120          # 单会话超过这么多条就触发裁剪
+KEEP_RECENT = 60        # 裁剪后保留最近多少条
+SESSION_TTL_DAYS = 45   # 超过这么多天未更新、且内容很少的会话会被清理
+
+
+def _parse_ts(s: str) -> float:
+    try:
+        return time.mktime(time.strptime(s, "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        return time.time()
+
+
+def prune(sid: str, max_keep: int = MAX_KEEP, keep_recent: int = KEEP_RECENT) -> int:
+    """裁剪过长会话，返回被丢弃的条数（0 表示无需裁剪）。"""
+    msgs = get_messages(sid)
+    if len(msgs) <= max_keep:
+        return 0
+    dropped = len(msgs) - keep_recent
+    _write(_path(sid), msgs[-keep_recent:])
+
+    idx = _read(INDEX, [])
+    if isinstance(idx, list):
+        for s in idx:
+            if s.get("id") == sid:
+                s["count"] = keep_recent
+                s["trimmed"] = int(s.get("trimmed") or 0) + dropped
+                s["updated"] = _now()
+                break
+        _write(INDEX, idx)
+    return dropped
+
+
+def cleanup_old(days: int = SESSION_TTL_DAYS, max_count: int = 4) -> int:
+    """清理"太久未用 + 内容很少"的会话，返回清理数量。
+
+    只清理真正"不必要"的（基本没聊过的僵尸会话），
+    有实际内容的会话一律保留，避免误删用户数据。
+    """
+    now = time.time()
+    idx = _read(INDEX, [])
+    if not isinstance(idx, list):
+        return 0
+    kept, removed = [], 0
+    for s in idx:
+        age_days = (now - _parse_ts(s.get("updated", ""))) / 86400
+        if age_days > days and (s.get("count") or 0) <= max_count:
+            try:
+                os.remove(_path(s["id"]))
+            except Exception:
+                pass
+            removed += 1
+        else:
+            kept.append(s)
+    if removed:
+        _write(INDEX, kept)
+    return removed
+
+
+def stats() -> dict:
+    """会话总体占用情况（供界面展示）。"""
+    items = list_sessions()
+    total = sum(int(s.get("count") or 0) for s in items)
+    return {"sessions": len(items), "messages": total,
+            "max_keep": MAX_KEEP, "ttl_days": SESSION_TTL_DAYS}

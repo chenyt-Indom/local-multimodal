@@ -195,6 +195,32 @@
   // 程序重启后自动恢复上次使用的会话。
   const sessionsListEl = $("#sessionsList");
 
+  // 界面只渲染最近这么多条消息，更早的折叠（要点由长期记忆承载）；
+  // 上下文同样只带最近这些，避免越聊越慢。
+  const RECENT_SHOW = 20;
+
+  /** 把历史消息渲染到界面，并同步为上下文。返回实际渲染条数。 */
+  function renderHistory(msgs) {
+    messagesEl.innerHTML = "";
+    history.length = 0;
+    const shown = (msgs || []).slice(-RECENT_SHOW);
+    const hidden = (msgs || []).length - shown.length;
+    if (hidden > 0) {
+      const tip = document.createElement("div");
+      tip.className = "msg bot";
+      tip.innerHTML = `<div class="bubble fold-tip">📁 更早的 ${hidden} 条记录已折叠（要点已存入长期记忆）</div>`;
+      messagesEl.appendChild(tip);
+    }
+    shown.forEach((m) => {
+      if ((m.role === "user" || m.role === "assistant") && m.content) {
+        addMsg(m.role, m.content);
+        history.push({ role: m.role, content: m.content });
+      }
+    });
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return shown.length;
+  }
+
   async function loadSessions() {
     let data;
     try {
@@ -246,24 +272,16 @@
     if (!sid || sid === sessionId) return;
     if (streaming) { showToast("正在回答中，请稍候再切换", "warn"); return; }
     setSessionId(sid);
-    history.length = 0;
     let msgs = [];
     try {
       const d = await api("/api/sessions/" + sid);
       msgs = d.messages || [];
     } catch (e) { /* 读取失败则当作空会话 */ }
-    // 恢复消息到界面 + 上下文
-    messagesEl.innerHTML = "";
-    msgs.forEach((m) => {
-      if (m.role === "user" || m.role === "assistant") {
-        if (m.content) { addMsg(m.role, m.content); history.push({ role: m.role, content: m.content }); }
-      }
-    });
-    if (!msgs.length) {
+    if (renderHistory(msgs) === 0) {
       addMsg("bot", "这是一段新对话，直接说需求即可。");
     }
     await loadSessions();
-    showToast(`已切换到「${(await currentTitle(sid))}」`);
+    showToast(`已切换到「${await currentTitle(sid)}」`);
   }
 
   async function currentTitle(sid) {
@@ -761,14 +779,7 @@
       try {
         const d = await api("/api/sessions/" + sessionId);
         const msgs = d.messages || [];
-        if (msgs.length) {
-          messagesEl.innerHTML = "";
-          msgs.forEach((m) => {
-            if ((m.role === "user" || m.role === "assistant") && m.content) {
-              addMsg(m.role, m.content);
-              history.push({ role: m.role, content: m.content });
-            }
-          });
+        if (msgs.length && renderHistory(msgs) > 0) {
           showToast("已恢复上次的对话记录", "ok");
         }
       } catch (e) { /* 恢复失败则用空白会话 */ }

@@ -18,6 +18,7 @@ import json
 import time
 import asyncio
 import datetime
+import threading
 from . import config, ollama_client, memory, kb, file_tools, video, web_tools, t2i, tools, voice, sessions
 
 app = FastAPI(title="本地多模态助手", version="1.0.0")
@@ -41,6 +42,14 @@ def _recent_image() -> list:
     if b64 and (time.time() - _LAST_IMAGE.get("ts", 0)) < _LAST_IMAGE.get("ttl", 3600):
         return [b64]
     return []
+
+
+# 启动时做一次轻量清理：移除「太久未用 + 几乎没内容」的僵尸会话。
+# 有实际内容的会话一律保留；真正重要的信息由长期记忆承载，不靠聊天记录堆积。
+try:
+    _cleaned_sessions = sessions.cleanup_old()
+except Exception:
+    _cleaned_sessions = 0
 
 
 def _now_str() -> str:
@@ -78,6 +87,48 @@ def _is_simple_question(text: str) -> bool:
 # 简单问题的生成长度上限（思考+回答总量）。512 足以覆盖问候/常识问答，
 # 又能把"先想很久"压到 3~5 秒；复杂问题仍用配置里的完整配额。
 SIMPLE_MAX_TOKENS = 512
+
+# 送入模型的历史消息上限（约 20 轮）。更早的内容已保存在会话文件与长期记忆中，
+# 无需全部塞进上下文——否则推理越来越慢，且容易撑爆窗口。
+MAX_CONTEXT_MESSAGES = 40
+
+# 触发自动记忆的信号词：出现这些词说明用户可能透露了值得长期记住的信息。
+# 只在命中时才做后台提炼，避免每轮都多跑一次模型。
+_MEMORY_SIGNALS = (
+    "记住", "我叫", "我是", "我的", "我喜欢", "我习惯", "我在", "我们公司",
+    "以后", "下次", "偏好", "别忘", "提醒我", "我的名字", "叫我",
+)
+
+
+def _looks_memorable(text: str) -> bool:
+    return any(k in (text or "") for k in _MEMORY_SIGNALS)
+
+
+def _auto_extract_memory(last_user: str, answer: str, model: str, cfg: dict) -> None:
+    """把本轮要点提炼进长期记忆（后台线程，不阻塞回复）。
+
+    长期记忆是"久远对话可被清理"的前提——要点沉淀下来后，
+    老的聊天记录就可以安全裁剪或清除。
+    """
+    try:
+        prompt = (
+            "从下面这轮对话里提取值得【长期记住】的用户信息（身份、背景、偏好、约定）。\n"
+            "若有，只输出一段中文要点（不超过 30 字，不要任何前后缀）；\n"
+            "若没有值得长期记住的内容，只输出两个字：无\n\n"
+            f"用户：{last_user}\n助手：{(answer or '')[:300]}"
+        )
+        resp = client.chat([{"role": "user", "content": prompt}], model=model,
+                           stream=False,
+                           params={"temperature": 0.2, "num_ctx": 4096, "max_tokens": 120})
+        data = resp.json() if hasattr(resp, "json") else resp
+        text = ((data.get("message") or {}).get("content") or "").strip()
+        text = text.split("\n")[0].strip()
+        if not text or text.startswith("无") or len(text) > 60:
+            return
+        # 并入「当前关注」分区（文段式整体维护）
+        memory.upsert("当前关注", text)
+    except Exception:
+        pass
 
 
 # 允许本地界面跨域访问（浏览器 debug 时用）
@@ -300,6 +351,9 @@ async def chat(req: ChatRequest):
     images = list(req.images_b64 or [])
     _remember_image(images)          # 记住本轮图片，供后续「把这张图改成…」直接引用
     messages = list(req.messages)
+    # 上下文只保留最近若干条（会话文件仍保存完整记录，前端也照常显示）
+    if len(messages) > MAX_CONTEXT_MESSAGES:
+        messages = messages[-MAX_CONTEXT_MESSAGES:]
 
     last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
 
@@ -402,8 +456,19 @@ async def chat(req: ChatRequest):
             pass
         try:
             sessions.save_messages(session, full)
+            sessions.prune(session)       # 过长则自动裁剪，避免记录无限膨胀
         except Exception:
             pass
+
+        # 自动记忆：命中信号词时后台提炼要点写入长期记忆（不阻塞回复）。
+        # 有了长期记忆兜底，久远的聊天记录才能安全清理。
+        if cfg.get("auto_memorize", True) and _looks_memorable(last_user):
+            try:
+                threading.Thread(target=_auto_extract_memory,
+                                 args=(last_user, final_text, model, cfg),
+                                 daemon=True).start()
+            except Exception:
+                pass
         yield json.dumps({"done": True, "text": final_text, "thinking": final_thinking}) + "\n"
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
