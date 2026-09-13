@@ -78,6 +78,28 @@
     }
   }
 
+  // 统一请求「打开文件夹」：
+  //   成功            → 提示已打开
+  //   容器内无小助手  → 把宿主机真实路径复制到剪贴板
+  // capEl 给了就写到它里面，否则弹 toast。
+  async function openFolderRequest(url, options, capEl) {
+    const say = (msg) => { if (capEl) capEl.textContent = msg; else showToast(msg, "ok"); };
+    try {
+      const r = await fetch(url, options);
+      const d = await r.json().catch(() => ({ ok: false, detail: `服务端返回 ${r.status}（非 JSON）` }));
+      if (!d.ok) { say("❌ " + (d.detail || "打开失败")); return; }
+      if (d.opened === false) {
+        const host = d.host_path || d.path;
+        const copied = await copyText(host);
+        say("📂 " + host + (copied ? "（已复制）" : ""));
+        return;
+      }
+      say(d.via === "host-agent" ? "📂 正在打开所在文件夹…" : "📂 已打开：" + d.path);
+    } catch (err) {
+      say("❌ " + err);
+    }
+  }
+
   function showThinking(text) {
     const el = document.createElement("div");
     el.className = "msg bot";
@@ -262,6 +284,13 @@
 
   const libRefreshBtn = $("#libRefresh");
   if (libRefreshBtn) libRefreshBtn.onclick = loadLibrary;
+
+  // 打开图片库所在的文件夹（就是图片实际保存的位置）
+  const libOpenFolderBtn = $("#libOpenFolder");
+  if (libOpenFolderBtn) {
+    libOpenFolderBtn.onclick = () =>
+      openFolderRequest("/api/library/open_folder", { method: "POST" });
+  }
 
   // ---------- 多会话管理 ----------
   // 每个会话互相独立（各自的消息与上下文），全部持久化在后端，
@@ -549,29 +578,13 @@
         cap.textContent = "❌ 保存失败：" + err;
       }
     };
-    ov.querySelector(".lb-open").onclick = async (e) => {
+    ov.querySelector(".lb-open").onclick = (e) => {
       e.stopPropagation();
-      try {
-        const r = await fetch("/api/open_folder", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ path: lastPath }),
-        });
-        const d = await r.json().catch(() => ({ ok: false, detail: `服务端返回 ${r.status}（非 JSON）` }));
-        if (!d.ok) { cap.textContent = "❌ " + (d.detail || "打开失败"); return; }
-        if (d.opened === false) {
-          // 容器环境打不开宿主机的文件管理器：把宿主机路径显示出来并复制，
-          // 用户直接粘到资源管理器地址栏即可。
-          const host = d.host_path || d.path;
-          const ok = await copyText(host);
-          cap.textContent = "📂 文件位置：" + host
-            + (ok ? "（已复制，粘贴到资源管理器即可打开）" : "");
-          return;
-        }
-        cap.textContent = "📂 已打开：" + d.path;
-      } catch (err) {
-        cap.textContent = "❌ " + err;
-      }
+      openFolderRequest("/api/open_folder", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: lastPath }),
+      }, cap);
     };
     document.body.appendChild(ov);
   }

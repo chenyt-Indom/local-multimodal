@@ -29,7 +29,10 @@
     <section class="panel library" id="libraryPanel">
       <div class="sec-head">
         <h2>🖼️ 图片库</h2>
-        <button class="btn sm ghost" id="libRefresh">刷新</button>
+        <span class="head-acts">
+          <button class="btn sm ghost" id="libOpenFolder" title="打开图片库所在的文件夹（即图片实际保存的位置）">📂 文件夹</button>
+          <button class="btn sm ghost" id="libRefresh">刷新</button>
+        </span>
       </div>
       <p class="hint" id="libHint">搜到的图、生成的图都可保存到这里，随时调用。</p>
       <div class="lib-grid" id="libGrid"></div>

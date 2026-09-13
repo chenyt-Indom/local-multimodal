@@ -18,14 +18,17 @@ if /i not "%ANS%"=="YES" (
 )
 
 echo.
-echo [1/3] Í£Ö¹²¢É¾³ýÈÝÆ÷...
+echo [1/4] Í£Ö¹¡¸´ò¿ªÎÄ¼þ¼Ð¡¹Ð¡ÖúÊÖ...
+call :stop_folder_agent
+
+echo [2/4] Í£Ö¹²¢É¾³ýÈÝÆ÷...
 docker compose -f compose.yml --profile bundled down -v 2>nul
 
-echo [2/3] É¾³ý¾µÏñ...
+echo [3/4] É¾³ý¾µÏñ...
 docker image rm local-multimodal-app:latest 2>nul
 docker image rm local-multimodal-ollama:latest 2>nul
 
-echo [3/3] É¾³ý±¾µØÊý¾ÝÄ¿Â¼...
+echo [4/4] É¾³ý±¾µØÊý¾ÝÄ¿Â¼...
 if exist "data" rd /s /q "data"
 
 echo.
@@ -34,3 +37,15 @@ echo.
 pause
 popd
 endlocal
+goto :eof
+
+:stop_folder_agent
+if exist "data\.open_folder_agent" (
+    for /f "tokens=2 delims==" %%p in ('findstr "pid=" "data\.open_folder_agent" 2^>nul') do (
+        taskkill /F /PID %%p >nul 2>&1
+    )
+)
+powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -match '-File\s+.*open-folder-agent\.ps1' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+del /q "data\.open_folder_agent"   2>nul
+del /q "data\.open_folder_request" 2>nul
+exit /b 0

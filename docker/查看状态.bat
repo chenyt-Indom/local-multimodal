@@ -23,6 +23,16 @@ curl -fsS -m 5 http://127.0.0.1:11434/api/version
 if errorlevel 1 (echo [未运行] 直连模式下需要本机 Ollama 正在运行) else (echo.)
 echo.
 
+echo ---------- 「打开文件夹」小助手 ----------
+if exist "data\.open_folder_agent" (
+    type "data\.open_folder_agent"
+    echo [OK] 小助手在运行（界面里点「打开所在文件夹」会真的弹出窗口）
+) else (
+    echo [未运行] 界面里点「打开所在文件夹」只会复制路径，不会弹窗
+    echo          重新运行「一键部署.bat」即可启用
+)
+echo.
+
 echo ---------- 应用日志（30 行）----------
 docker logs --tail 30 mm-app 2>&1
 echo.

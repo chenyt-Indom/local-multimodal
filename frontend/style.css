@@ -364,6 +364,8 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
   gap: 8px; margin-bottom: 8px;
 }
 .sec-head h2 { margin: 0; }
+/* 面板标题右侧的按钮组，避免被 space-between 拆散 */
+.head-acts { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; }
 .sessions-list { max-height: 230px; overflow-y: auto; }
 .session-item {
   display: flex; align-items: center; gap: 6px;

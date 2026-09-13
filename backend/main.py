@@ -231,15 +231,60 @@ def _host_path(container_path: str) -> str:
     return os.path.join(base, rel) if rel else base
 
 
+# 宿主机上的「打开文件夹」小助手（open-folder-agent.ps1）会使用这两个文件：
+#   .open_folder_agent    心跳，用于判断它是否在运行
+#   .open_folder_request  请求，容器把路径写进去，由它真正弹出文件夹
+_AGENT_BEAT = ".open_folder_agent"
+_AGENT_REQ = ".open_folder_request"
+
+
+def _host_agent_alive(max_age: float = 20.0) -> bool:
+    """宿主机上的小助手是否在运行（靠心跳文件的更新时间判断）。"""
+    try:
+        beat = os.path.join(config.data_root(), _AGENT_BEAT)
+        return (time.time() - os.path.getmtime(beat)) < max_age
+    except Exception:
+        return False
+
+
+def _request_host_open(target: str) -> bool:
+    """把「打开这个目录」的请求写进挂载目录，交给宿主机的小助手执行。"""
+    try:
+        req = os.path.join(config.data_root(), _AGENT_REQ)
+        with open(req, "w", encoding="utf-8") as f:
+            f.write(target)
+        return True
+    except Exception:
+        return False
+
+
+@app.post("/api/open_folder")
 @app.post("/api/open_folder")
 def open_folder(req: OpenFolderRequest = None):
-    """在系统文件管理器中打开指定路径（默认打开 saved_images 目录）。
+    """在系统文件管理器中打开指定路径（默认打开 saved_images 目录）。"""
+    return _open_folder_impl((req.path if req and req.path else None)
+                             or config.data("saved_images"))
 
-    - 源码/桌面方式运行：调用系统文件管理器（Windows explorer / macOS open / Linux xdg-open）
-    - 容器方式运行：容器打不开宿主机的文件管理器，改为返回宿主机对应的路径，
-      由界面提示用户（并把路径复制到剪贴板），而不是抛一个看不懂的报错。
+
+@app.post("/api/library/open_folder")
+def library_open_folder():
+    """打开「图片库」所在的文件夹。
+
+    打开的目录就是图片实际保存的目录（image_library.DIR），
+    保证「看到的」和「存进去的」是同一个地方。
     """
-    target = (req.path if req and req.path else None) or config.data("saved_images")
+    return _open_folder_impl(image_library.DIR)
+
+
+def _open_folder_impl(target: str) -> dict:
+    """在系统文件管理器中打开一个目录（容器内交由宿主机小助手代劳）。
+
+    - 源码/桌面方式运行：直接调用系统文件管理器
+      （Windows explorer / macOS open / Linux xdg-open）
+    - 容器方式运行：容器内调不起宿主机的文件管理器，改为把请求写进挂载的数据目录，
+      由宿主机上的小助手代为弹出文件夹；若小助手没在运行，
+      则退化成「把宿主机真实路径给用户复制」。
+    """
     # 注意顺序：必须先判断是不是文件再 makedirs。
     # 若先对"文件路径"调 os.makedirs(exist_ok=True)，路径存在但不是目录时
     # 仍会抛 FileExistsError → 接口 500（前端表现为 r.json() 解析失败）。
@@ -248,6 +293,9 @@ def open_folder(req: OpenFolderRequest = None):
     os.makedirs(target, exist_ok=True)
 
     if _is_container():
+        if _host_agent_alive() and _request_host_open(target):
+            return {"ok": True, "opened": True, "path": target,
+                    "host_path": _host_path(target), "via": "host-agent"}
         return {"ok": True, "opened": False, "path": target,
                 "host_path": _host_path(target),
                 "detail": "运行在容器里，无法直接打开宿主机的文件夹"}
