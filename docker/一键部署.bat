@@ -55,7 +55,7 @@ if /i "%MODE%"=="direct" (
     >>".env" echo MM_OLLAMA_URL=http://host.docker.internal:11434
     >>".env" echo MM_MODEL=qwen3-vl:8b
 ) else (
-    echo [3/6] Ollama 模式：容器自带（需已有 Ollama 镜像）
+    echo [3/6] Ollama 模式：容器自带
     set "PROFILE=--profile bundled"
     > ".env" echo # 由一键部署脚本自动生成
     >>".env" echo APP_PORT=8000
@@ -83,22 +83,12 @@ if errorlevel 1 (
 if /i "%MODE%"=="bundled" (
     docker image inspect local-multimodal-ollama:latest >nul 2>&1
     if errorlevel 1 (
-        if exist "images\local-multimodal-ollama.tar" (
-            echo       正在导入 Ollama 镜像...
-            docker load -i "images\local-multimodal-ollama.tar"
-        ) else (
-            echo       本地无 Ollama 镜像，尝试从镜像仓库拉取...
-            docker pull ollama/ollama:latest
-            if errorlevel 1 (
-                echo.
-                echo [提示] 拉取失败。国内网络可改用镜像源重试：
-                echo        docker pull docker.1ms.run/ollama/ollama:latest
-                echo        docker tag  docker.1ms.run/ollama/ollama:latest local-multimodal-ollama:latest
-                echo.
-                echo        或改用直连模式（用本机已装的 Ollama）：一键部署.bat direct
-                pause & exit /b 1
-            )
-            docker tag ollama/ollama:latest local-multimodal-ollama:latest
+        call :ensure_ollama
+        if errorlevel 1 (
+            echo.
+            echo [错误] 无法获取 Ollama 镜像。
+            echo        可改用直连模式（用本机已装的 Ollama）：一键部署.bat direct
+            pause & exit /b 1
         )
     )
 )
@@ -140,3 +130,35 @@ echo.
 pause
 popd
 endlocal
+goto :eof
+
+REM ============================================================
+REM  子过程：确保 local-multimodal-ollama 镜像就绪
+REM  顺序：离线包 tar → 国内镜像源 → 官方源
+REM ============================================================
+:ensure_ollama
+if not exist "images\local-multimodal-ollama.tar" goto :eo_pull
+echo       正在导入离线 Ollama 镜像...
+docker load -i "images\local-multimodal-ollama.tar"
+if errorlevel 1 goto :eo_pull
+exit /b 0
+
+:eo_pull
+echo       未找到离线镜像，正在从镜像源拉取（约 5GB，请耐心等待）...
+for %%M in (docker.1ms.run docker.1panel.live docker.xuanyuan.me) do call :try_mirror %%M
+docker image inspect local-multimodal-ollama:latest >nul 2>&1
+if not errorlevel 1 exit /b 0
+echo       镜像源均未成功，尝试官方源（国内可能非常慢）...
+docker pull ollama/ollama:latest
+if errorlevel 1 exit /b 1
+docker tag ollama/ollama:latest local-multimodal-ollama:latest
+exit /b 0
+
+:try_mirror
+docker image inspect local-multimodal-ollama:latest >nul 2>&1
+if not errorlevel 1 exit /b 0
+echo       尝试镜像源 %1 ...
+docker pull %1/ollama/ollama:latest
+if errorlevel 1 exit /b 1
+docker tag %1/ollama/ollama:latest local-multimodal-ollama:latest
+exit /b 0
