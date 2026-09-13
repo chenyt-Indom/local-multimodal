@@ -57,6 +57,27 @@
       setTimeout(() => el.remove(), 280);
     }, 2600);
   }
+  // 复制文本到剪贴板。127.0.0.1 属于安全上下文，clipboard API 可直接用；
+  // 另留一层 execCommand 兜底，兼容个别浏览器。
+  async function copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (e) {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+        return true;
+      } catch (e2) { return false; }
+    }
+  }
+
   function showThinking(text) {
     const el = document.createElement("div");
     el.className = "msg bot";
@@ -537,7 +558,17 @@
           body: JSON.stringify({ path: lastPath }),
         });
         const d = await r.json().catch(() => ({ ok: false, detail: `服务端返回 ${r.status}（非 JSON）` }));
-        cap.textContent = d.ok ? "📂 已打开：" + d.path : ("❌ " + (d.detail || ""));
+        if (!d.ok) { cap.textContent = "❌ " + (d.detail || "打开失败"); return; }
+        if (d.opened === false) {
+          // 容器环境打不开宿主机的文件管理器：把宿主机路径显示出来并复制，
+          // 用户直接粘到资源管理器地址栏即可。
+          const host = d.host_path || d.path;
+          const ok = await copyText(host);
+          cap.textContent = "📂 文件位置：" + host
+            + (ok ? "（已复制，粘贴到资源管理器即可打开）" : "");
+          return;
+        }
+        cap.textContent = "📂 已打开：" + d.path;
       } catch (err) {
         cap.textContent = "❌ " + err;
       }

@@ -23,6 +23,67 @@ def _now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+# ---------- 会话标题提炼 ----------
+# 列表里一屏要放很多条对话，标题太长会挤在一起，太短又看不出在聊什么。
+# 目标：约 10 个字，去掉客套话，尽量在标点处收尾。
+TITLE_MAX = 12
+
+# 句首的客套/指令词：当标题时不含信息，去掉
+_TITLE_LEAD = (
+    "帮我", "帮忙", "请你", "请帮", "麻烦你", "麻烦", "我想", "我要", "我需要",
+    "能不能", "可不可以", "能否", "可以帮我", "可以", "你给我", "给我", "是的",
+    "你好，", "你好", "那个", "现在", "然后", "接着", "再帮我", "再", "另外",
+    "请", "喂", "嗯",
+)
+# 句尾的语气词
+_TITLE_TAIL = ("谢谢", "多谢", "好吗", "行吧", "可以吗", "行吗", "吧", "呢", "吗", "啊", "呀", "哦")
+# 截断时优先在这些字符处收尾
+_TITLE_BREAKS = "，。！？；：、,.!?;: \t（(【[「\"'“”"
+
+
+def derive_title(text: str, limit: int = TITLE_MAX) -> str:
+    """把用户的一句话提炼成约 10 个字的会话标题。
+
+    例：「帮我看看这个报错是什么原因」→「看看这个报错是什么原…」
+        「我想画一只戴宇航员头盔的柯基」→「画一只戴宇航员头盔的柯基」
+    """
+    s = " ".join(str(text or "").split())        # 折叠换行与连续空格
+    s = s.strip(" \t，,。.！!？?；;：:")
+    if not s:
+        return ""
+
+    # 剥掉句首客套词（最多三层，覆盖「请帮我」这类叠加写法）
+    for _ in range(3):
+        stripped = False
+        for w in _TITLE_LEAD:
+            if s.startswith(w) and len(s) > len(w) + 1:
+                s = s[len(w):].lstrip("，,、 ：:　")
+                stripped = True
+                break
+        if not stripped:
+            break
+
+    # 去掉句尾语气词
+    for w in _TITLE_TAIL:
+        if s.endswith(w) and len(s) > len(w) + 2:
+            s = s[: -len(w)].rstrip("，,、 ：:　")
+            break
+
+    s = s.strip()
+    if not s:
+        return ""
+
+    # 超长：优先在标点处收尾，找不到标点就硬截断加省略号
+    if len(s) > limit:
+        cut = -1
+        for i in range(4, min(len(s), limit + 3)):
+            if s[i] in _TITLE_BREAKS:
+                cut = i
+                break
+        s = s[:cut] if cut > 0 else s[:limit] + "…"
+    return s.strip()
+
+
 def _read(path: str, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -75,7 +136,7 @@ def get_messages(sid: str) -> list:
 
 
 def save_messages(sid: str, messages: list) -> dict | None:
-    """保存完整消息，并更新索引（时间、条数、首条用户消息作标题）。"""
+    """保存完整消息，并更新索引（时间、条数、标题）。"""
     if not sid:
         return None
     _write(_path(sid), messages)
@@ -93,11 +154,18 @@ def save_messages(sid: str, messages: list) -> dict | None:
         idx.append(hit)
     hit["updated"] = _now()
     hit["count"] = len(messages)
-    if hit.get("title") in (None, "", "新对话"):
-        for m in messages:
+
+    # 标题：按「最后一条用户消息」重新提炼，这样列表里看到的就是最近在聊什么。
+    # 用户手动改过名的（title_locked=True）不再自动覆盖。
+    if not hit.get("title_locked"):
+        last_user = ""
+        for m in reversed(messages):
             if m.get("role") == "user" and m.get("content"):
-                hit["title"] = str(m["content"]).strip().replace("\n", " ")[:24]
+                last_user = str(m["content"])
                 break
+        derived = derive_title(last_user)
+        if derived:
+            hit["title"] = derived
     _write(INDEX, idx)
     return hit
 
@@ -109,6 +177,7 @@ def rename(sid: str, title: str) -> bool:
     for s in idx:
         if s.get("id") == sid:
             s["title"] = (title or "").strip()[:40] or s.get("title")
+            s["title_locked"] = True   # 手动改过名，之后不再被自动标题覆盖
             s["updated"] = _now()
             _write(INDEX, idx)
             return True

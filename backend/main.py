@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 
 import os
+import sys
 import base64
 import io
 import json
@@ -207,9 +208,37 @@ class OpenFolderRequest(BaseModel):
     path: str | None = None
 
 
+def _is_container() -> bool:
+    """是否运行在容器里（Docker 会创建 /.dockerenv）。"""
+    if os.environ.get("MM_IN_CONTAINER"):
+        return True
+    return os.path.exists("/.dockerenv")
+
+
+def _host_path(container_path: str) -> str:
+    """把容器内路径映射回宿主机的实际路径。
+
+    容器里没法打开宿主机的文件管理器，但可以把「宿主机上对应哪个目录」
+    告诉用户（部署脚本会把该目录写进 MM_HOST_DATA_DIR）。
+    """
+    base = (os.environ.get("MM_HOST_DATA_DIR") or "").rstrip("/\\")
+    if not base:
+        return container_path
+    root = config.data_root().rstrip("/\\")
+    if not container_path.startswith(root):
+        return container_path
+    rel = container_path[len(root):].replace("/", os.sep).lstrip("/\\")
+    return os.path.join(base, rel) if rel else base
+
+
 @app.post("/api/open_folder")
 def open_folder(req: OpenFolderRequest = None):
-    """在系统文件管理器中打开指定路径（默认打开 saved_images 目录）。"""
+    """在系统文件管理器中打开指定路径（默认打开 saved_images 目录）。
+
+    - 源码/桌面方式运行：调用系统文件管理器（Windows explorer / macOS open / Linux xdg-open）
+    - 容器方式运行：容器打不开宿主机的文件管理器，改为返回宿主机对应的路径，
+      由界面提示用户（并把路径复制到剪贴板），而不是抛一个看不懂的报错。
+    """
     target = (req.path if req and req.path else None) or config.data("saved_images")
     # 注意顺序：必须先判断是不是文件再 makedirs。
     # 若先对"文件路径"调 os.makedirs(exist_ok=True)，路径存在但不是目录时
@@ -217,10 +246,24 @@ def open_folder(req: OpenFolderRequest = None):
     if os.path.isfile(target):
         target = os.path.dirname(target)
     os.makedirs(target, exist_ok=True)
+
+    if _is_container():
+        return {"ok": True, "opened": False, "path": target,
+                "host_path": _host_path(target),
+                "detail": "运行在容器里，无法直接打开宿主机的文件夹"}
+
     try:
         import subprocess
-        subprocess.Popen(["explorer", target.replace("/", "\\")])
-        return {"ok": True, "path": target}
+        if os.name == "nt":
+            subprocess.Popen(["explorer", target.replace("/", "\\")])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", target])
+        else:
+            subprocess.Popen(["xdg-open", target])
+        return {"ok": True, "opened": True, "path": target}
+    except FileNotFoundError:
+        return {"ok": True, "opened": False, "path": target,
+                "detail": "当前系统没找到文件管理器，请手动打开上面的路径"}
     except Exception as e:
         raise HTTPException(500, f"打开文件夹失败: {e}")
 

@@ -30,6 +30,9 @@ services:
       MM_OLLAMA_URL: ${MM_OLLAMA_URL:-http://host.docker.internal:11434}
       MM_MODEL: ${MM_MODEL:-qwen3-vl:8b}
       MM_DATA_DIR: /data
+      # 宿主机的 data 目录实际位置（由部署脚本写入 .env）。
+      # 容器里点「打开文件夹」打不开宿主机资源管理器，用这个路径提示用户。
+      MM_HOST_DATA_DIR: ${MM_HOST_DATA_DIR:-}
       TZ: Asia/Shanghai
     # 让 host.docker.internal 在 Linux 上也能解析到宿主机
     extra_hosts:
