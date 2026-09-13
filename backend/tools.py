@@ -229,8 +229,39 @@ def make_schemas(web_enabled: bool = False) -> list:
         },
     ]
     if web_enabled:
+        schemas.append(_WEATHER_SCHEMA)   # 天气走数据 API，比搜索可靠得多
         schemas.append(_WEB_SEARCH_SCHEMA)
     return schemas
+
+
+# 天气工具：走结构化数据源，不要用搜索引擎
+_WEATHER_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": (
+            "查询某地天气（实时 + 未来逐日预报）。"
+            "**凡涉及天气的一律用这个工具，不要用 web_search** —— "
+            "搜索引擎对天气查询只会返回「XX天气预报_15天」这类网站导航页，"
+            "拿不到任何真实温度数值；本工具直接返回气温、降水概率、风速等数据。"
+            "支持中文城市名（含地级市、县市）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {
+                    "type": "string",
+                    "description": "城市名，如「北京」「上海」「深圳」「乌鲁木齐」。可带省份消歧：「广东 深圳」。",
+                },
+                "days": {
+                    "type": "integer",
+                    "description": "预报天数，默认 3（含今天）。最多 16 天。",
+                },
+            },
+            "required": ["city"],
+        },
+    },
+}
 
 
 # 联网搜索工具（仅当用户在前端打开"联网"开关时才注入给模型）
@@ -240,9 +271,13 @@ _WEB_SEARCH_SCHEMA = {
         "name": "web_search",
         "description": (
             "联网搜索互联网上的最新信息。凡是涉及**实时或最新信息**的问题都应主动调用，例如："
-            "最新新闻、时事热点、近期发生的事件、实时数据（股价/天气/汇率/比分）、"
+            "最新新闻、时事热点、近期发生的事件、实时数据（股价/汇率/比分）、"
             "你不确定或知识可能过时的内容、需要查证的事实、某个新产品/新版本的现状等。"
             "调用时会真的联网检索并把网页摘要返回给你，你再据此总结成答案。"
+            "**注意：查天气请改用 get_weather 工具**（搜索引擎给不出真实温度数值）。"
+            "查某单位/机构的公开信息（性质、地址、招生、公开招聘、年报等）可配合下面两种写法："
+            "在关键词里带上机构**全称**效果最好（如「广州民航职业技术学院 招生章程」）；"
+            "想限定官方来源时可用 site: 语法（如「深圳大学 site:edu.cn」）。"
             "注意：日常闲聊、写作、翻译、代码等不需要联网的任务不要调用。"
         ),
         "parameters": {
@@ -294,6 +329,8 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
     """执行一个工具调用，返回给模型的文本。ui_events 收集前端副作用。"""
     if name == "web_image_search":
         return _do_web_image_search(arguments, ui_events)
+    if name == "get_weather":
+        return _do_get_weather(arguments)
     if name == "save_image_to_library":
         return _do_save_image_to_library(arguments, context)
     if name == "generate_image":
@@ -386,32 +423,59 @@ def _do_web_search(arguments, ui_events):
 
     from . import web_tools
 
-    # 查询变体：原查询 + 精简后的主体词
+    # 查询变体：原查询 + 精简主体词（+ 机构类查询追加"官方站定向"）
     variants = [query]
     simple = _simplify_query(query)
     if simple and simple != query and len(simple) >= 2:
         variants.append(simple)
 
+    # 查"某单位对外公开情况"时，普通检索会被百科/聚合站/同名地名淹没。
+    # 这里额外跑一次 `主体词 site:gov.cn`（或 edu.cn / org.cn）定向检索，
+    # 结果基本就是官网本身。实测对机构类查询的提升最明显。
+    body = simple or query
+    official_hint = web_tools.official_site_hint(body)
+
+    jobs = [(v, "web") for v in variants]
+    if official_hint:
+        jobs.append((body, "official"))
+
+    def _run(job):
+        q, kind = job
+        if kind == "official":
+            return web_tools.search_official(q, top_k)
+        return web_tools.web_search(q, n=top_k)
+
     try:
-        with ThreadPoolExecutor(max_workers=len(variants)) as pool:
-            batches = list(pool.map(lambda q: web_tools.web_search(q, n=top_k), variants))
+        with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+            batches = list(pool.map(_run, jobs))
     except Exception as exc:
         return f"联网搜索失败：{exc}"
 
     # 逐变体做相关性过滤（剔除"广州市_百度百科"这类泛化无关结果）
-    filtered = [web_tools.filter_relevant(v, b) for v, b in zip(variants, batches)]
+    filtered = []
+    for (q, kind), b in zip(jobs, batches):
+        filtered.append(web_tools.filter_relevant(
+            q, b, keep_min=2 if kind == "official" else 3))
 
-    # 优先原查询的相关结果；不足半数时用精简查询补齐
-    results = _dedupe(filtered[0])
-    if len(results) < max(3, top_k // 2):
-        for extra in filtered[1:]:
-            results = _dedupe(results + extra)
-    if not results:
-        # 过滤后为空：退回未过滤结果（至少有标题线索，也好过全空）
-        results = _dedupe([x for b in batches for x in b])
+    # 组装优先级：原查询 → 官方站定向 → 精简查询
+    order = [0] + [i for i, (_, k) in enumerate(jobs) if k == "official"] \
+        + [i for i in range(1, len(jobs)) if jobs[i][1] != "official"]
+    results, seen_idx = [], set()
+    for i in order:
+        if i in seen_idx or i >= len(filtered):
+            continue
+        seen_idx.add(i)
+        results = _dedupe(results + filtered[i])
+        if len(results) >= max(top_k, 8):
+            break
     results = results[:max(top_k, 8)]
 
-    used = query if len(variants) == 1 else f"{query}（含精简检索：{simple}）"
+    # 相关度偏低时，明确告诉模型"这次检索不可靠"，避免它硬编内容
+    confidence = web_tools.best_relevance(query, results)
+
+    used = f"{query}（含精简检索：{simple}）" if len(variants) > 1 else query
+    if official_hint:
+        used += f"；已定向官方站 site:{official_hint}"
 
     # 输出格式刻意紧凑：长 URL 和超长摘要会挤占模型上下文、降低其理解质量，
     # 因此来源只给域名，摘要截断到 140 字。
@@ -433,6 +497,10 @@ def _do_web_search(arguments, ui_events):
         lines.append("（未获取到有效搜索结果。请如实告诉用户本次联网检索失败，不要编造内容；"
                      "可以建议用户换个更具体的说法再试。）")
     else:
+        if confidence < 0.3:
+            lines.append("（注意：本次检索结果与问题的匹配度较低，可能没有命中要点。"
+                         "请如实说明「未检索到直接相关信息」，并建议用户换个关键词或提供更具体的名称，"
+                         "不要用这些弱相关结果硬凑答案。）")
         lines.append(
             "请基于以上检索结果用中文总结回答，并严格遵守：\n"
             "1. 关键结论后用 [序号] 标注来源，例如「……[2]」；\n"
@@ -452,6 +520,19 @@ _IMAGE_PROMPT_BOOST = (
 
 
 # ---------- 联网搜图（找现成的真实图片，区别于文生图）----------
+def _do_get_weather(arguments):
+    """查天气：走结构化数据 API，不经过搜索引擎。"""
+    from . import web_tools
+    city = (arguments.get("city") or "").strip()
+    if not city:
+        return "请提供要查询的城市名。"
+    try:
+        days = int(arguments.get("days") or 3)
+    except Exception:
+        days = 3
+    return web_tools.format_weather(web_tools.weather(city, days))
+
+
 def _do_web_image_search(arguments, ui_events):
     """联网搜索真实图片，下载原图后展示给前端。"""
     import base64 as _b64
