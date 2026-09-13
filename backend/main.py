@@ -211,9 +211,12 @@ class OpenFolderRequest(BaseModel):
 def open_folder(req: OpenFolderRequest = None):
     """在系统文件管理器中打开指定路径（默认打开 saved_images 目录）。"""
     target = (req.path if req and req.path else None) or config.data("saved_images")
-    os.makedirs(target, exist_ok=True)
+    # 注意顺序：必须先判断是不是文件再 makedirs。
+    # 若先对"文件路径"调 os.makedirs(exist_ok=True)，路径存在但不是目录时
+    # 仍会抛 FileExistsError → 接口 500（前端表现为 r.json() 解析失败）。
     if os.path.isfile(target):
         target = os.path.dirname(target)
+    os.makedirs(target, exist_ok=True)
     try:
         import subprocess
         subprocess.Popen(["explorer", target.replace("/", "\\")])

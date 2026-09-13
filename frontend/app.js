@@ -521,7 +521,7 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
-        const d = await r.json();
+        const d = await r.json().catch(() => ({ ok: false, detail: `服务端返回 ${r.status}（非 JSON）` }));
         if (d.ok) { lastPath = d.path; cap.textContent = "✅ 已保存：" + d.path; }
         else cap.textContent = "❌ 保存失败：" + (d.detail || "");
       } catch (err) {
@@ -536,7 +536,7 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ path: lastPath }),
         });
-        const d = await r.json();
+        const d = await r.json().catch(() => ({ ok: false, detail: `服务端返回 ${r.status}（非 JSON）` }));
         cap.textContent = d.ok ? "📂 已打开：" + d.path : ("❌ " + (d.detail || ""));
       } catch (err) {
         cap.textContent = "❌ " + err;

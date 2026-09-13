@@ -23,6 +23,10 @@ HOST = "127.0.0.1"
 PORT = 8000
 URL = f"http://{HOST}:{PORT}/"
 
+# 由外部启动器（桌面快捷方式用的「启动窗口.pyw」）拉起时置 1：
+# 此时本进程只负责后端服务，窗口交给启动器显示，避免弹出两个窗口。
+NO_WINDOW = os.environ.get("MM_NO_WINDOW") == "1"
+
 
 def _serve(server: uvicorn.Server) -> None:
     """在后台线程运行 uvicorn 服务。"""
@@ -66,6 +70,19 @@ def main() -> None:
                "2) 端口 8000 是否被其他程序占用\n"
                "3) 是否已拉取模型 qwen3-vl:8b")
         raise SystemExit("本地服务启动失败")
+
+    if NO_WINDOW:
+        # 被外部启动器拉起：这里只保持后端服务存活，窗口由启动器负责，
+        # 否则会和启动器各开一个窗口（用户看到两个）。
+        try:
+            while not server.should_exit:
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.should_exit = True
+            t.join(timeout=5)
+        return
 
     try:
         import webview  # 延迟导入，避免源码环境未安装时阻塞后端
