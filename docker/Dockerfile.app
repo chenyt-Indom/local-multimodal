@@ -36,9 +36,12 @@ COPY docker/requirements-app.txt ./
 RUN pip install --index-url "${PIP_INDEX}" -r requirements-app.txt
 
 # ---------- 绘图依赖 ----------
-# torch 单独装：--index-url 能确保拿到 +cpu / +cu124 版本；
-# 若混用 --extra-index-url，pip 可能选到 PyPI 的 CUDA 版，镜像会暴涨数 GB。
-RUN pip install --index-url ${TORCH_INDEX} torch
+# torch 与 torchvision 必须从**同一个源**安装：
+#   PyPI 上的 torchvision 是针对 CUDA 版 torch 编译的，与 CPU 版 torch 混装会报
+#   "operator torchvision::nms does not exist"，进而让 transformers / diffusers
+#   在 import 阶段就崩 —— 表现为「图片微改 / 文生图 引擎加载失败」。
+# 把这一对先装好，后面 pip 会认为依赖已满足，不会再把它们换掉。
+RUN pip install --index-url ${TORCH_INDEX} torch torchvision
 COPY docker/requirements-image.txt ./
 RUN pip install --index-url "${PIP_INDEX}" -r requirements-image.txt
 

@@ -552,7 +552,8 @@ def _do_generate_image(arguments, ui_events):
                           width=size, height=size, hd=hd)
     cost = time.time() - start
     if not result.get("ok"):
-        return f"图片生成失败：{result.get('error')}"
+        return (f"图片生成失败：{result.get('error')}。"
+                f"请把冒号后的具体原因**原样**转告用户，不要改写成笼统说法。")
     # 把图片作为副作用发给前端展示；只把简短文本回给模型，避免占用上下文
     _ui(ui_events, {"type": "image", "mime": "image/png", "b64": result["b64"],
                     "prompt": prompt, "device": result.get("device"),
@@ -605,7 +606,9 @@ def _do_edit_image(arguments, ui_events, context):
                             steps=steps, strength=strength)
     cost = time.time() - start
     if not result.get("ok"):
-        return f"图片微改失败：{result.get('error')}"
+        return (f"图片微改失败：{result.get('error')}。"
+                f"请把冒号后的具体原因**原样**转告用户，不要改写成「暂时无法使用」这类"
+                f"笼统说法 —— 用户需要看到真实原因才能判断问题在哪。")
     _ui(ui_events, {"type": "image", "mime": "image/png", "b64": result["b64"],
                     "prompt": "微改：" + prompt, "device": result.get("device"),
                     "model": result.get("model"), "cost_s": round(cost, 1)})

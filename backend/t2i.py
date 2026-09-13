@@ -8,6 +8,7 @@
 """
 import base64
 import io
+import math
 import os
 import threading
 from . import config
@@ -73,26 +74,31 @@ def _load_pipe():
 
     # 本机有无 CUDA：RTX 5070 Ti 应可用
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    # 精度必须跟着设备走：CPU 上用 float16 无法推理（diffusers 会直接警告并失败）。
+    # 而本机模型目录（ModelScope 下载）常常只含 fp16 权重（unet 尤其），
+    # 必须传 variant="fp16" 才能取到文件 —— 所以通用组合是
+    # 「fp16 变体取文件 + 按设备精度加载」。
+    dtype = torch.float16 if device == "cuda" else torch.float32
 
-    # 优先从本地目录加载（离线，无需联网）。
-    # 注意：ModelScope 下载的 SD 模型只含 fp16 权重，必须传 variant="fp16"，
-    # 否则 diffusers 会去找不存在的 diffusion_pytorch_model.safetensors 而报错。
+    # 优先从本地目录加载（离线，无需联网）
     if os.path.isdir(LOCAL_MODEL_DIR) and os.path.exists(
             os.path.join(LOCAL_MODEL_DIR, "model_index.json")):
-        try:
-            pipe = AutoPipelineForText2Image.from_pretrained(
-                LOCAL_MODEL_DIR, torch_dtype=torch.float16, variant="fp16",
-                local_files_only=True)
-        except Exception:
-            # 个别组件可能没有 fp16 文件，退化为默认 variant 再试一次
-            pipe = AutoPipelineForText2Image.from_pretrained(
-                LOCAL_MODEL_DIR, torch_dtype=torch.float16,
-                local_files_only=True)
+        pipe, last_err = None, None
+        for variant in ("fp16", None):
+            try:
+                kw = {"torch_dtype": dtype, "local_files_only": True}
+                if variant:
+                    kw["variant"] = variant
+                pipe = AutoPipelineForText2Image.from_pretrained(LOCAL_MODEL_DIR, **kw)
+                break
+            except Exception as e:
+                last_err = e
+        if pipe is None:
+            raise last_err or RuntimeError("本地模型加载失败")
     else:
-        dtype = torch.float16 if device == "cuda" else torch.float32
         pipe = AutoPipelineForText2Image.from_pretrained(
-            MODEL_REPO, torch_dtype=dtype, variant="fp16"
-            if device == "cuda" else None)
+            MODEL_REPO, torch_dtype=dtype,
+            variant="fp16" if device == "cuda" else None)
     pipe.to(device)
     return pipe, device
 
@@ -230,18 +236,24 @@ def _load_edit_pipe():
     # 复用生成管线已加载的设备，避免重复统计
     if _pipe is not None and _device:
         device = _device
+    # 与 _load_pipe 同理：精度跟着设备走（CPU 不能用 float16），
+    # 同时用 fp16 变体取文件（本机目录往往只有 fp16 权重）。
+    dtype = torch.float16 if device == "cuda" else torch.float32
     if os.path.isdir(LOCAL_MODEL_DIR) and os.path.exists(
             os.path.join(LOCAL_MODEL_DIR, "model_index.json")):
-        try:
-            pipe = AutoPipelineForImage2Image.from_pretrained(
-                LOCAL_MODEL_DIR, torch_dtype=torch.float16, variant="fp16",
-                local_files_only=True)
-        except Exception:
-            pipe = AutoPipelineForImage2Image.from_pretrained(
-                LOCAL_MODEL_DIR, torch_dtype=torch.float16,
-                local_files_only=True)
+        pipe, last_err = None, None
+        for variant in ("fp16", None):
+            try:
+                kw = {"torch_dtype": dtype, "local_files_only": True}
+                if variant:
+                    kw["variant"] = variant
+                pipe = AutoPipelineForImage2Image.from_pretrained(LOCAL_MODEL_DIR, **kw)
+                break
+            except Exception as e:
+                last_err = e
+        if pipe is None:
+            raise last_err or RuntimeError("本地模型加载失败")
     else:
-        dtype = torch.float16 if device == "cuda" else torch.float32
         pipe = AutoPipelineForImage2Image.from_pretrained(
             MODEL_REPO, torch_dtype=dtype,
             variant="fp16" if device == "cuda" else None)
@@ -282,7 +294,16 @@ def edit_image(init_image, prompt: str, negative_prompt: str = "",
     try:
         from PIL import Image
         if isinstance(init_image, str):
-            init_image = Image.open(init_image)
+            s = init_image.strip()
+            if os.path.isfile(s):
+                init_image = Image.open(s)
+            else:
+                # 兼容另外两种常见传法：data URL 与裸 base64
+                # （只当路径处理的话，会报 "No such file or directory: 'iVBORw0...'"
+                #   这种看不出所以然的错误）
+                if s.startswith("data:") and "," in s:
+                    s = s.split(",", 1)[1]
+                init_image = Image.open(io.BytesIO(base64.b64decode(s, validate=False)))
         elif isinstance(init_image, (bytes, bytearray)):
             init_image = Image.open(io.BytesIO(init_image))
         if init_image.mode != "RGB":
@@ -298,11 +319,17 @@ def edit_image(init_image, prompt: str, negative_prompt: str = "",
             pipe.to(device)      # 统一设备，避免多次调用后组件漂回 CPU
         except Exception:
             pass
+        # strength 会按比例截掉时间轴前面的步数：真正执行的步数 ≈ 总步数 × strength。
+        # SD-Turbo 是少步模型，若总步数直接传 steps(4)，strength 0.6 只剩 2 步，
+        # 结果几乎和原图一样（看起来像"没生效"）。所以先把总步数补回来，
+        # 确保「实际生效的步数」不低于 steps。
+        ratio = max(0.05, min(1.0, float(strength)))
+        total_steps = max(1, math.ceil(max(1, steps) / ratio))
         result = pipe(
             prompt=prompt,
             negative_prompt=negative_prompt or "low quality, blurry, watermark",
             image=init_image,
-            num_inference_steps=max(1, steps),
+            num_inference_steps=total_steps,
             strength=float(strength),
             guidance_scale=0.0 if MODEL_REPO.endswith("sd-turbo") else 7.5,
         ).images[0]
