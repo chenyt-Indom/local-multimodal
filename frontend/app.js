@@ -14,6 +14,8 @@
 
   // 工具名 → 中文展示
   const TOOL_LABELS = {
+    web_image_search: "🌐 联网搜图",
+    save_image_to_library: "⭐ 保存图片",
     generate_image: "🎨 文生图",
     edit_image: "🖼 图片微改",
     list_directory: "📁 浏览目录",
@@ -189,6 +191,56 @@
   mainEl.addEventListener("drop", (e) => {
     onDropFiles(e.dataTransfer && e.dataTransfer.files);
   });
+
+  // ---------- 图片库 ----------
+  // 搜到的图 / 生成的图保存后集中在这里，可随时查看、放大、删除。
+  const libGrid = $("#libGrid");
+  const libHint = $("#libHint");
+
+  async function loadLibrary() {
+    if (!libGrid) return;
+    let data;
+    try {
+      data = await api("/api/library/images");
+    } catch (e) {
+      return;
+    }
+    const items = (data && data.images) || [];
+    if (libHint) {
+      const st = (data && data.stats) || {};
+      const mb = ((st.total_bytes || 0) / 1048576).toFixed(1);
+      libHint.textContent = items.length
+        ? `共 ${items.length} 张 · 占用 ${mb} MB · 点图可放大`
+        : "还没有保存的图片。搜图或生成图片后，点「⭐ 保存到图库」即可留存。";
+    }
+    libGrid.innerHTML = "";
+    items.forEach((m) => {
+      const cell = document.createElement("div");
+      cell.className = "lib-item";
+      const tag = m.origin === "web" ? "🌐" : (m.origin === "gen" ? "🎨" : "🖼️");
+      cell.innerHTML = `
+        <img src="/api/library/images/${m.id}/raw" alt="${m.name}" loading="lazy">
+        <div class="lib-name" title="${m.name}">${tag} ${m.name}</div>
+        <button class="lib-del" title="删除这张图">×</button>`;
+      cell.querySelector("img").onclick = async () => {
+        try {
+          const d = await api("/api/library/images/" + m.id);
+          if (d && d.b64) showLightbox("image/png", d.b64, tag + " " + m.name);
+        } catch (e) { /* 忽略 */ }
+      };
+      cell.querySelector(".lib-del").onclick = async (e) => {
+        e.stopPropagation();
+        if (!confirm(`删除图片「${m.name}」？`)) return;
+        await api("/api/library/images/" + m.id, { method: "DELETE" });
+        loadLibrary();
+        showToast("已删除", "ok");
+      };
+      libGrid.appendChild(cell);
+    });
+  }
+
+  const libRefreshBtn = $("#libRefresh");
+  if (libRefreshBtn) libRefreshBtn.onclick = loadLibrary;
 
   // ---------- 多会话管理 ----------
   // 每个会话互相独立（各自的消息与上下文），全部持久化在后端，
@@ -609,16 +661,55 @@
       else thinkStatus.textContent = "🔧 正在调用工具：" + (TOOL_LABELS[name] || name);
     };
     const addMedia = (ui) => {
+      const isWeb = ui.origin === "web";
       const card = document.createElement("div");
-      card.className = "media-card" + (ui.prompt ? " gen" : "");
+      card.className = "media-card";
       const mime = ui.mime || "image/png";
-      const caption = ui.prompt ? ("🎨 " + ui.prompt) : "🖼 已读取";
-      card.innerHTML = `<div class="media-cap gen-label">${caption}</div>
-        <img src="data:${mime};base64,${ui.b64}"><div class="media-meta">${
-          ui.device ? "🖥 " + ui.device : ""} ${ui.cost_s ? "⏱ " + ui.cost_s + "s" : ""} · 点击可放大</div>`;
+      const b64 = ui.b64 || "";
+      // 明确区分「网上搜到的」与「AI 生成的」，避免混淆
+      const badge = isWeb ? "🌐 网上搜到的" : (ui.origin === "gen" ? "🎨 AI 生成" : "🖼️ 图片");
+      const caption = (ui.prompt || "").slice(0, 60);
+      card.innerHTML = `
+        <div class="media-cap"><span class="badge ${isWeb ? "web" : "gen"}">${badge}</span>${
+          caption ? " " + caption : ""}</div>
+        <img src="data:${mime};base64,${b64}">
+        <div class="media-meta">${
+          ui.source ? `<a href="${ui.source}" target="_blank" rel="noopener">来源页</a> · ` : ""}${
+          ui.device ? "🖥 " + ui.device + " " : ""}${ui.cost_s ? "⏱ " + ui.cost_s + "s" : ""}${
+          ui.size ? " · " + ui.size : ""}</div>
+        <div class="media-actions"><button class="btn sm ghost lib-save">⭐ 保存到图库</button></div>`;
       card.querySelector("img").onclick = (e) => {
         e.stopPropagation();
-        showLightbox(mime, ui.b64, caption);
+        showLightbox(mime, b64, badge + (caption ? "：" + caption : ""));
+      };
+      const btn = card.querySelector(".lib-save");
+      btn.onclick = async (e) => {
+        e.stopPropagation();
+        btn.disabled = true;
+        btn.textContent = "保存中…";
+        try {
+          const r = await api("/api/library/images", {
+            method: "POST",
+            body: JSON.stringify({
+              b64, name: caption.slice(0, 30),
+              source: ui.source || ui.url || "",
+              origin: ui.origin || "web",
+            }),
+          });
+          if (r && r.ok) {
+            btn.textContent = "✅ 已保存";
+            loadLibrary();
+            showToast("已保存到图片库", "ok");
+          } else {
+            btn.textContent = "⭐ 保存到图库";
+            btn.disabled = false;
+            showToast("保存失败：" + ((r && r.error) || "未知错误"), "warn");
+          }
+        } catch (err) {
+          btn.textContent = "⭐ 保存到图库";
+          btn.disabled = false;
+          showToast("保存失败：" + err.message, "warn");
+        }
       };
       mediaWrap.appendChild(card);
       messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -790,5 +881,6 @@
   refreshHealth();
   loadToggles();
   loadMemory();
+  loadLibrary();
   setInterval(refreshHealth, 5000);
 })();

@@ -25,6 +25,16 @@
       </div>
     </div>
 
+    <!-- 图片库：搜到的图 / 生成的图统一留存，可随时调用与删除 -->
+    <section class="panel library" id="libraryPanel">
+      <div class="sec-head">
+        <h2>🖼️ 图片库</h2>
+        <button class="btn sm ghost" id="libRefresh">刷新</button>
+      </div>
+      <p class="hint" id="libHint">搜到的图、生成的图都可保存到这里，随时调用。</p>
+      <div class="lib-grid" id="libGrid"></div>
+    </section>
+
     <!-- 会话列表：新建 / 切换 / 删除（每个会话互相独立） -->
     <section class="panel sessions" id="sessionsPanel">
       <div class="sec-head">

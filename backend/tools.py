@@ -34,6 +34,46 @@ def make_schemas(web_enabled: bool = False) -> list:
         {
             "type": "function",
             "function": {
+                "name": "web_image_search",
+                "description": (
+                    "【联网搜图】到网上找**已经存在**的真实图片，并把原图展示给用户。\n"
+                    "★ 什么时候用它：用户说「找张……的图」「搜一下……图片」「……长什么样」"
+                    "「来点……壁纸/照片」「有没有……的图片」——即用户想要看真实存在的图片。\n"
+                    "★ 与 generate_image 的区别（务必分清）：\n"
+                    "  · web_image_search = 搜索互联网上已有的真实照片/图片，不绘制（找现成的）\n"
+                    "  · generate_image   = AI 从零画一张不存在的图（造新的）\n"
+                    "  例：「找一张埃菲尔铁塔的照片」→ 本工具；"
+                    "「画一只穿宇航服的柯基」→ generate_image。\n"
+                    "若用户说的是「画/生成/绘制」，用 generate_image，不要用本工具。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "搜索关键词，用中文或英文的名词短语，如「埃菲尔铁塔 照片」「橘猫 壁纸」"},
+                        "n": {"type": "integer", "description": "返回图片数量，默认 4，最多 6"},
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "save_image_to_library",
+                "description": "把刚刚搜到/生成的一张图片保存进本地图片库，供以后随时调用。一般在用户说「保存这张」「存起来」「收进图库」时调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "index": {"type": "integer", "description": "要保存的是本轮展示的第几张图（从 1 开始），默认 1"},
+                        "name": {"type": "string", "description": "保存后的名称，可选，留空自动命名"},
+                    },
+                    "required": [],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "generate_image",
                 "description": "根据描述生成一张图片（文生图）。prompt 必须写成详细、具体的英文（例如 a cute corgi wearing astronaut helmet, futuristic city background），不要用中文。生成后会直接在界面展示给用户。",
                 "parameters": {
@@ -252,6 +292,10 @@ def json_dumps(o) -> str:
 
 def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
     """执行一个工具调用，返回给模型的文本。ui_events 收集前端副作用。"""
+    if name == "web_image_search":
+        return _do_web_image_search(arguments, ui_events)
+    if name == "save_image_to_library":
+        return _do_save_image_to_library(arguments, context)
     if name == "generate_image":
         return _do_generate_image(arguments, ui_events)
     if name == "edit_image":
@@ -407,6 +451,92 @@ _IMAGE_PROMPT_BOOST = (
 )
 
 
+# ---------- 联网搜图（找现成的真实图片，区别于文生图）----------
+def _do_web_image_search(arguments, ui_events):
+    """联网搜索真实图片，下载原图后展示给前端。"""
+    import base64 as _b64
+    from . import web_tools
+
+    query = (arguments.get("query") or "").strip()
+    if not query:
+        return "联网搜图失败：未提供搜索关键词（query）。"
+    try:
+        n = int(arguments.get("n") or 4)
+    except Exception:
+        n = 4
+    n = max(1, min(n, 6))
+
+    try:
+        results = web_tools.image_search(query, n=n)
+    except Exception as exc:
+        return f"联网搜图失败：{exc}"
+    if not results:
+        return "联网搜图没有找到相关图片。可以换个更通用的关键词再试。"
+
+    shown, lines = 0, [f"【联网搜图】关键词：{query}"]
+    for r in results:
+        if shown >= n:
+            break
+        raw = web_tools.download_image(r["url"])
+        if not raw:
+            continue
+        shown += 1
+        mime = "image/png"
+        if raw[:3] == b"\xff\xd8\xff":
+            mime = "image/jpeg"
+        elif raw[:4] == b"RIFF":
+            mime = "image/webp"
+        elif raw[:3] == b"GIF":
+            mime = "image/gif"
+        _ui(ui_events, {
+            "type": "image", "mime": mime,
+            "b64": _b64.b64encode(raw).decode("utf-8"),
+            "prompt": r.get("title") or query,
+            "url": r.get("url") or "",
+            "source": r.get("source") or "",
+            "origin": "web",              # ← 前端据此标注「网上搜到的」
+        })
+        lines.append(f"[{shown}] {r.get('title') or '(无标题)'}")
+        if r.get("source"):
+            lines.append(f"    来源页：{r['source']}")
+        lines.append(f"    图片直链：{r['url']}")
+
+    if shown == 0:
+        return "联网搜图失败：找到了结果但图片下载不下来（可能被目标站点防盗链拦截）。"
+
+    lines.append(
+        f"已把 {shown} 张**网上搜索到的真实原图**展示给用户（这是搜索结果，不是你画的）。"
+        "请用中文简要说明找到了什么内容，并提示：可点图片下方「保存到图库」留存。")
+    return "\n".join(lines)
+
+
+def _do_save_image_to_library(arguments, context):
+    """把本轮展示过的某张图片存入本地图片库。"""
+    from . import image_library
+
+    try:
+        idx = max(1, int(arguments.get("index") or 1))
+    except Exception:
+        idx = 1
+
+    pool = (context or {}).get("shown_images") or []
+    if not pool:
+        return "保存失败：本轮还没有展示过任何图片。请先搜图或生成图片再来保存。"
+    if idx > len(pool):
+        return f"保存失败：本轮只展示了 {len(pool)} 张图，不存在第 {idx} 张。"
+
+    item = pool[idx - 1]
+    meta = image_library.save_image(
+        item.get("b64") or item.get("url") or "",
+        name=arguments.get("name") or "",
+        source=item.get("source") or item.get("prompt") or "",
+        origin=item.get("origin") or "web")
+    if not meta.get("ok", True):
+        return f"保存失败：{meta.get('error')}"
+    return (f"已保存第 {idx} 张图到图片库，名称为「{meta['name']}」（id={meta['id']}）。"
+            "用户可在左侧「图片库」面板随时查看、调用或删除。")
+
+
 def _do_generate_image(arguments, ui_events):
     prompt = (arguments.get("prompt") or "").strip()
     if not prompt:
@@ -427,7 +557,8 @@ def _do_generate_image(arguments, ui_events):
     _ui(ui_events, {"type": "image", "mime": "image/png", "b64": result["b64"],
                     "prompt": prompt, "device": result.get("device"),
                     "model": result.get("model"), "cost_s": round(cost, 1),
-                    "size": result.get("size")})
+                    "size": result.get("size"),
+                    "origin": "gen"})     # ← 前端据此标注「AI 生成」
     real_size = result.get("size") or f"{size}x{size}"
     extra = f"（{result['hd_note']}）" if (hd and result.get("hd_note")) else ""
     return (f"已生成图片（{real_size}，{result.get('device')}，用 {round(cost,1)} 秒）{extra}。"

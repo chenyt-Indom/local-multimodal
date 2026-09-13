@@ -190,6 +190,96 @@ def web_search(query: str, n: int = 8) -> list:
              "engine": "fallback"}]
 
 
+# ---------- 图片搜索（找现成的图，不是生成图）----------
+IMG_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "Referer": "https://cn.bing.com/",       # 绕开多数站点的防盗链
+}
+
+
+def _clean_img_query(q: str) -> str:
+    """去掉「照片/图片/壁纸」等冗余词。
+
+    实测：Bing 图片搜索对这类后缀很敏感——搜「埃菲尔铁塔」结果准确，
+    搜「埃菲尔铁塔 照片」却返回完全无关的内容。因此搜索前先剥离这些词。
+    """
+    import re
+    s = re.sub(r"(照片|图片|图像|壁纸|高清|大图|素材|头像|png|jpg|jpeg)",
+               " ", q or "", flags=re.I)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def image_search(query: str, n: int = 4) -> list:
+    """联网搜图：返回 [{title, url, thumb, source}]。
+
+    **与 generate_image 的区别**：这里找的是网上已存在的图片（原图直出），
+    不做任何绘制；用户要求「找张图/搜张图/给我看看 xx 长什么样」时用它。
+    """
+    import html as _html
+    import re
+
+    def _run(q: str) -> list:
+        url = ("https://cn.bing.com/images/search?q=" + urllib.parse.quote(q)
+               + f"&count={max(n * 4, 24)}")
+        try:
+            page = _fetch(url)
+        except Exception:
+            return []
+        out = []
+        for m in re.finditer(r'class="iusc"[^>]*m="([^"]+)"', page):
+            try:
+                data = json.loads(_html.unescape(m.group(1)))
+            except Exception:
+                continue
+            murl = (data.get("murl") or "").strip()
+            if not murl.startswith("http"):
+                continue
+            out.append({
+                "title": _clean(data.get("t") or ""),
+                "url": murl,
+                "thumb": (data.get("turl") or "").strip(),
+                "source": (data.get("purl") or "").strip(),
+            })
+        return out
+
+    # 先用清洗后的关键词（更准），数量不足再用原始词补充
+    cleaned = _clean_img_query(query)
+    results = []
+    if cleaned and cleaned != query:
+        results = _run(cleaned)
+    if len(results) < n:
+        results += _run(query)
+
+    # 去重并按原图 URL 收敛
+    seen, final = set(), []
+    for r in results:
+        if r["url"] in seen:
+            continue
+        seen.add(r["url"])
+        final.append(r)
+        if len(final) >= n:
+            break
+    return final
+
+
+def download_image(url: str, max_bytes: int = 8 * 1024 * 1024,
+                   timeout: int = 25) -> bytes | None:
+    """下载图片原始字节（限制体积，避免大图拖垮前端）。"""
+    try:
+        req = urllib.request.Request(url, headers=IMG_HEADERS)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if ctype and not ctype.startswith("image/"):
+                return None
+            raw = resp.read(max_bytes + 1)
+        return None if len(raw) > max_bytes else raw
+    except Exception:
+        return None
+
+
 # ---------- 调用外部 API ----------
 def call_external_api(config: dict, tool: str, params: dict) -> dict:
     """根据已配置的 API 工具执行调用。

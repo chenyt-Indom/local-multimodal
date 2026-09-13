@@ -5,7 +5,7 @@
 或直接:
     py -3 run.py
 """
-from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse, FileResponse
@@ -19,7 +19,8 @@ import time
 import asyncio
 import datetime
 import threading
-from . import config, ollama_client, memory, kb, file_tools, video, web_tools, t2i, tools, voice, sessions
+from . import (config, ollama_client, memory, kb, file_tools, video, web_tools,
+               t2i, tools, voice, sessions, image_library)
 
 app = FastAPI(title="本地多模态助手", version="1.0.0")
 client = ollama_client.OllamaClient()
@@ -309,10 +310,14 @@ class _SystemPrompt:
             "当前时间：" + _now_str(),
             "你是本地多模态助手，像一位能干的项目助理。你的所有处理都在用户本机完成，注意保护隐私。",
             "你可以调用以下工具来完成具体任务，而不仅是空谈：\n"
-            "- 视觉识别（直接看，不要调用工具）：当图片/视频已经附在当前对话中（用户拖入/上传），直接用你自身的多模态视觉能力识别、描述或分析其内容即可，绝对不要为「看图」调用任何工具。只有以下三种情况才需要调用工具：\n"
-            "  ① 用户明确要求「画图/生成图片/制作配图/AI绘画/画一只××」→ 调用 generate_image 工具真实生成（prompt 用英文描述），绝不能只口头描述，只有调用工具才算完成；\n"
-            "  ② 用户明确要求对某张图做局部修改（如「把这张图的背景改成夜晚」「给猫戴帽子」「换个颜色」）→ 调用 edit_image；用户拖入本轮的图片优先，或填 source 为本地图片路径；\n"
-            "  ③ 用户给的是一个本地文件路径、要你读取该文件 → 调用 read_file。\n"
+            "- 视觉识别（直接看，不要调用工具）：当图片/视频已经附在当前对话中（用户拖入/上传），直接用你自身的多模态视觉能力识别、描述或分析其内容即可，绝对不要为「看图」调用任何工具。只有以下四种情况才需要调用工具：\n"
+            "  ① 用户想要**真实存在**的图片，如「找张 xx 的图」「搜一下 xx 图片」「xx 长什么样」「来点 xx 壁纸」→ 调用 web_image_search（到网上搜索现成的真实图片）；\n"
+            "  ② 用户要求「画图/生成图片/AI 绘画/画一只 xx」这类**从零创作**→ 调用 generate_image（prompt 用英文描述），绝不能只口头描述，只有调用工具才算完成；\n"
+            "  ③ 用户要求对某张图做局部修改（如「把这张图的背景改成夜晚」「给猫戴帽子」）→ 调用 edit_image；用户拖入本轮的图片优先，或填 source 为本地图片路径；\n"
+            "  ④ 用户给的是一个本地文件路径、要你读取该文件 → 调用 read_file。\n"
+            "- ★ 务必分清「搜图」与「生成图」：用户说「找/搜/看看」→ web_image_search（搜真实图片，不绘制）；"
+            "用户说「画/生成/制作」→ generate_image（AI 创作）。两者结果来源完全不同，绝不能混淆。\n"
+            "- 图片库：用户说「保存这张/存起来/收进图库」时调用 save_image_to_library（index 填本轮第几张）。\n"
             "- 文件系统：浏览用户目录、读取任意本地文件、按关键词搜索、写入或修改文件。\n"
             "- 记忆：记忆按【分区文段】整体维护（工作背景/个人背景/当前关注/近期动态…）。遇到值得长期记住的用户稳定信息、偏好、关键事实时，主动调用 remember 把对应分区的**整段文段**重写成合并新旧信息后的最新版（**自主判断，只记重要的，不要把所有问答都写入**）；"
             "当用户问「你还记得吗/我们之前说过」或需要历史信息时调用 search_memory。\n"
@@ -440,7 +445,9 @@ async def chat(req: ChatRequest):
                             "tool_calls": tool_calls})
             # 2) 逐个执行
             ui_events = []
-            ctx = {"images": images or _recent_image()}  # 本轮图片优先，否则复用最近一张
+            # images：本轮拖入的图（否则复用最近一张）
+            # shown_images：本轮已展示给用户的图，供「保存到图库」工具按序号引用
+            ctx = {"images": images or _recent_image(), "shown_images": []}
             for tc in tool_calls:
                 fn = (tc.get("function") or {})
                 name = fn.get("name", "")
@@ -451,7 +458,12 @@ async def chat(req: ChatRequest):
                     except Exception:
                         args = {}
                 yield json.dumps({"tool_start": {"name": name, "args": args}}) + "\n"
+                mark = len(ui_events)
                 result = await asyncio.to_thread(tools.dispatch, name, args, ui_events, ctx)
+                # 把本次新产生的图片登记下来，后续工具（如保存到图库）可按序号引用
+                for e in ui_events[mark:]:
+                    if e.get("type") == "image":
+                        ctx["shown_images"].append(e)
                 # 注意：Ollama 的 tool 消息用 tool_name 关联调用，不是 tool_calls/tool_call_id，
                 # 否则模型读不到工具返回内容（会误答"没查到/无法联网"）。
                 working.append({"role": "tool", "content": result, "tool_name": name})
@@ -693,6 +705,65 @@ def session_rename(sid: str, body: dict):
 @app.delete("/api/sessions/{sid}")
 def session_delete(sid: str):
     sessions.delete(sid)
+    return {"ok": True}
+
+
+# ---------- 图片库（搜到的图 / 生成的图统一留存）----------
+@app.get("/api/library/images")
+def library_list():
+    return {"ok": True, "images": image_library.list_images(),
+            "stats": image_library.stats()}
+
+
+@app.post("/api/library/images")
+def library_save(body: dict):
+    """保存图片到图库（前端「保存到图库」按钮 / 模型 save_image_to_library 工具）。"""
+    data = body.get("b64") or body.get("url") or ""
+    if not data:
+        return {"ok": False, "error": "缺少图片数据"}
+    # 只给了远程 URL 时由后端下载，避免前端跨域
+    if data.startswith("http"):
+        raw = web_tools.download_image(data)
+        if not raw:
+            return {"ok": False, "error": "图片下载失败（可能被防盗链拦截）"}
+        data = raw
+    meta = image_library.save_image(data, name=body.get("name") or "",
+                                    source=body.get("source") or "",
+                                    origin=body.get("origin") or "web")
+    if not meta.get("ok", True):
+        return meta
+    return {"ok": True, "image": meta}
+
+
+@app.get("/api/library/images/{iid}/raw")
+def library_raw(iid: str):
+    """直接返回图片字节流（供前端 <img> 标签加载，避免 base64 膨胀）。"""
+    p = image_library.get_path(iid)
+    if not p:
+        return Response(status_code=404)
+    ext = os.path.splitext(p)[1].lower()
+    mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".webp": "image/webp", ".gif": "image/gif"}.get(ext, "image/png")
+    with open(p, "rb") as f:
+        return Response(content=f.read(), media_type=mime)
+
+
+@app.get("/api/library/images/{iid}")
+def library_get(iid: str):
+    b64 = image_library.get_b64(iid)
+    if not b64:
+        return {"ok": False, "error": "图片不存在"}
+    return {"ok": True, "id": iid, "b64": b64}
+
+
+@app.post("/api/library/images/{iid}/rename")
+def library_rename(iid: str, body: dict):
+    return {"ok": image_library.rename(iid, (body or {}).get("name") or "")}
+
+
+@app.delete("/api/library/images/{iid}")
+def library_delete(iid: str):
+    image_library.delete(iid)
     return {"ok": True}
 
 
