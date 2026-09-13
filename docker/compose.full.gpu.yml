@@ -1,0 +1,24 @@
+# ============================================================
+#  完整版 · GPU 加速覆盖文件
+#  给单容器（同时跑 Ollama 与绘图）透传显卡。
+#  前置条件：
+#    · Linux  ：已安装 NVIDIA 驱动 + nvidia-container-toolkit
+#    · Windows：WSL2 后端 + 已安装 NVIDIA 驱动（Docker Desktop 自带透传）
+#  自检命令： docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
+#
+#  注意：绘图（Stable Diffusion）走显卡还需要镜像内的 torch 是 CUDA 版。
+#  默认镜像是 CPU 版 torch（通用性优先）。想让它也吃显卡，需用 CUDA torch 重建：
+#    docker build -f docker/Dockerfile.full \
+#      --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu124 \
+#      -t local-multimodal-full:latest ./build
+#  对话模型（Ollama）不受此影响，加了本覆盖文件即可用显卡。
+# ============================================================
+services:
+  app:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

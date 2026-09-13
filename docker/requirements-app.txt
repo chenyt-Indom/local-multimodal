@@ -1,0 +1,9 @@
+# 应用核心依赖（镜像内安装）——不含 torch，保证镜像精简
+fastapi>=0.110
+uvicorn[standard]>=0.29
+requests>=2.31
+pillow>=10.0
+numpy>=1.24
+python-multipart>=0.0.9
+# video.py 顶层导入 cv2（视频抽帧）。headless 版不依赖 GUI 库，体积更小
+opencv-python-headless>=4.9

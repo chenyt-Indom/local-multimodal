@@ -23,8 +23,16 @@ def res_root() -> str:
 
 
 def data_root() -> str:
-    """可写运行数据根（打包后为 exe 同级目录，可随 U 盘拷贝；源码运行为项目根）。
-    config.json、data/ 记忆与会话等运行时数据放这里。"""
+    """可写运行数据根。
+
+    优先级：环境变量 MM_DATA_DIR > 打包后 exe 同级目录 > 源码项目根。
+    config.json、data/ 记忆与会话等运行时数据放这里。
+    Docker 部署时设置 MM_DATA_DIR=/data，即可只挂载一个卷实现全部数据持久化。
+    """
+    env = os.environ.get("MM_DATA_DIR")
+    if env:
+        os.makedirs(env, exist_ok=True)
+        return env
     return os.path.dirname(sys.executable) if is_frozen() else PROJECT_ROOT
 
 
@@ -71,7 +79,12 @@ DEFAULT_CONFIG = {
 
 
 def load_config() -> dict:
-    """读取配置文件；不存在则写入默认配置。"""
+    """读取配置文件；不存在则写入默认配置。
+
+    环境变量可覆盖个别关键项（容器化部署用，未设置时行为不变）：
+      MM_OLLAMA_URL  → ollama_url（精简版镜像里 Ollama 是独立容器，需指向服务名）
+      MM_MODEL       → default_model
+    """
     cfg = dict(DEFAULT_CONFIG)
     if os.path.exists(CONFIG_FILE):
         try:
@@ -80,6 +93,10 @@ def load_config() -> dict:
             cfg.update(user)
         except Exception:
             pass
+    if os.environ.get("MM_OLLAMA_URL"):
+        cfg["ollama_url"] = os.environ["MM_OLLAMA_URL"]
+    if os.environ.get("MM_MODEL"):
+        cfg["default_model"] = os.environ["MM_MODEL"]
     return cfg
 
 

@@ -1,18 +1,44 @@
-# PyInstaller 构建产物
+# ---------- 版本控制与文档 ----------
+.git/
+.gitignore
+README.md
+*.md
+
+# ---------- PyInstaller 构建产物 ----------
 build/
 dist/
-# Python
+build-lite/
+dist-lite/
+releases/
+
+# ---------- Python ----------
 __pycache__/
 *.pyc
-# 运行时配置
-config.json
-# 环境与 IDE
+*.pyo
 .venv/
 venv/
+
+# ---------- 运行时可写数据（绝对不能进镜像）----------
+data/
+sessions/
+image_library/
+saved_images/
+logs/
+config.json
+docker/data/
+
+# ---------- 残留 / 临时文件 ----------
+*.incomplete
+*.tmp
+*.log
+
+# ---------- 模型权重 ----------
+# 模型体积达 12GB，作为独立构建上下文（--build-context models=./models）单独传入，
+# 不放进主上下文，避免精简版构建也白白传输 GB 级数据。
+models/
+
+# ---------- 环境与 IDE ----------
 .vscode/
 .idea/
-# 系统
 Thumbs.db
 .DS_Store
-# 会话/日志数据（不入构建上下文）
-docker/data/data/

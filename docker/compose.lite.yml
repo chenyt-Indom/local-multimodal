@@ -1,0 +1,53 @@
+# ============================================================
+#  本地多模态助手 · 精简版编排
+#  两个容器：ollama（对话模型服务，首次启动自动下载）+ app（界面与后端）
+#  体积小、部署快；目标机器首次运行需联网下载模型（约 6GB），之后离线可用。
+#
+#  用法（在本文件所在目录执行）：
+#    docker compose -f compose.lite.yml up -d
+#  有 NVIDIA 显卡想加速：
+#    docker compose -f compose.lite.yml -f compose.lite.gpu.yml up -d
+# ============================================================
+name: local-multimodal-lite
+
+services:
+  # ---------- 对话模型服务 ----------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: mm-ollama
+    restart: unless-stopped
+    environment:
+      OLLAMA_KEEP_ALIVE: 30m          # 模型常驻显存 30 分钟，避免反复加载
+      OLLAMA_MODEL: qwen3-vl:8b
+    volumes:
+      - ./ollama-models:/root/.ollama # 模型缓存持久化，重启不必重下
+      - ./ollama-init.sh:/ollama-init.sh:ro
+    entrypoint: ["/bin/bash", "/ollama-init.sh"]
+    healthcheck:
+      # 模型就绪才算健康；首次下载 6GB 需要时间，所以给足重试次数
+      test: ["CMD-SHELL", "ollama list | grep -q qwen3-vl"]
+      interval: 20s
+      timeout: 15s
+      retries: 120
+      start_period: 30s
+
+  # ---------- 界面与后端 ----------
+  app:
+    image: local-multimodal-lite:latest
+    build:
+      context: ./build
+      dockerfile: docker/Dockerfile.lite
+    container_name: mm-app
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy   # 模型下载完再开界面，避免"模型未就绪"困惑
+    environment:
+      MM_OLLAMA_URL: http://ollama:11434
+      MM_MODEL: qwen3-vl:8b
+      MM_DATA_DIR: /data
+      TZ: Asia/Shanghai
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data                 # 记忆库/会话/图片库/日志 全在这里

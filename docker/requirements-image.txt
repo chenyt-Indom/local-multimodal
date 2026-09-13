@@ -1,0 +1,8 @@
+# 文生图 / 图片微改 / 高清超分（仅完整版镜像安装）
+# 注意：torch 由 Dockerfile 单独从指定源安装（CPU 或 CUDA），这里不写，
+# 避免 pip 解析时混入 PyPI 上的 CUDA 版导致镜像暴涨。
+diffusers>=0.30
+accelerate>=0.30
+spandrel>=0.4
+transformers>=4.40
+safetensors>=0.4

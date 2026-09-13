@@ -3,11 +3,17 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 requests>=2.31
 pillow>=10.0
+# FastAPI 处理表单/文件上传（拖入图片、上传知识库文档）必需，
+# 缺失时接口会抛 RuntimeError: Form data requires "python-multipart"
+python-multipart>=0.0.9
 
 # 语音输入（离线唤醒词「西派西派」+ 流式识别，无需联网）
 numpy>=1.24
 sounddevice>=0.4
 sherpa-onnx>=1.10
+
+# 视频处理（video.py 顶层导入 cv2，缺了会导致后端无法启动）
+opencv-python>=4.9
 
 # 文生图 / 图片微改（Stable Diffusion，diffusers）
 diffusers>=0.30
