@@ -88,6 +88,10 @@ def _is_simple_question(text: str) -> bool:
 # 又能把"先想很久"压到 3~5 秒；复杂问题仍用配置里的完整配额。
 SIMPLE_MAX_TOKENS = 512
 
+# 联网场景的生成长度下限：要把搜索结果喂给模型 + 让它逐条列出来源链接，
+# token 消耗远高于普通问答。给少了就会出现"搜索完了但没输出回答"。
+WEB_MAX_TOKENS = 4096
+
 # 送入模型的历史消息上限（约 20 轮）。更早的内容已保存在会话文件与长期记忆中，
 # 无需全部塞进上下文——否则推理越来越慢，且容易撑爆窗口。
 MAX_CONTEXT_MESSAGES = 40
@@ -358,10 +362,17 @@ async def chat(req: ChatRequest):
     last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
 
     # 简单问题收紧生成长度：把"先思考很久"压到几秒（qwen3-vl 无法真正关闭思考）。
-    # 但有图片上下文时不收紧——用户可能在要求微改，需要模型完整输出工具调用。
-    simple_q = _is_simple_question(last_user) and not images and not _recent_image()
+    # 但以下情况**绝不能**收紧，否则模型来不及输出工具调用或总结（表现为"思考中断、没有回答"）：
+    #   - 有图片上下文（可能要微改）
+    #   - 联网模式已开启（要搜索 + 逐条引用来源，最耗 token）
+    web_on = bool(cfg.get("web_enabled"))
+    simple_q = (_is_simple_question(last_user)
+                and not images and not _recent_image() and not web_on)
     if simple_q:
         cfg["max_tokens"] = min(int(cfg.get("max_tokens") or 2048), SIMPLE_MAX_TOKENS)
+    elif web_on:
+        # 联网场景给足空间：附件搜索结果 + 逐条列出来源链接会占很多 token
+        cfg["max_tokens"] = max(int(cfg.get("max_tokens") or 2048), WEB_MAX_TOKENS)
 
     # 联网搜索（仅当开启且用户明确想搜索）
     if cfg.get("web_enabled") and _wants_search(last_user):

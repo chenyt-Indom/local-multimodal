@@ -379,23 +379,24 @@ def _do_web_search(arguments, ui_events):
         desc = (r.get("desc") or "").strip()
         if title and title not in ("搜索失败",) and "未获取到搜索结果" not in title and url:
             useful += 1
-        try:
-            dom = urllib.parse.urlparse(url).netloc
-        except Exception:
-            dom = ""
-        head = f"{i}. {title}"
+        lines.append(f"[{i}] {title}")
         if desc:
-            head += f" —— {desc[:140]}"
-        if dom:
-            head += f"（来源：{dom}）"
-        lines.append(head)
+            lines.append(f"    摘要：{desc[:140]}")
+        if url:
+            # 给**完整链接**（此前只给域名，导致模型无法提供可点击来源）
+            lines.append(f"    链接：{url}")
     if useful == 0:
         lines.append("（未获取到有效搜索结果。请如实告诉用户本次联网检索失败，不要编造内容；"
                      "可以建议用户换个更具体的说法再试。）")
     else:
-        lines.append("请基于以上检索结果用中文总结回答，关键结论注明来源；"
-                     "若结果不足以回答，请说明局限，不要凭空补充。"
-                     "注意：当前时间以系统提示中的时间为准。")
+        lines.append(
+            "请基于以上检索结果用中文总结回答，并严格遵守：\n"
+            "1. 关键结论后用 [序号] 标注来源，例如「……[2]」；\n"
+            "2. 回答最后单独起一段「信息来源」，每条一行，格式："
+            "序号. 标题 — 完整链接（链接必须原样复制上面的「链接：」内容）；\n"
+            "3. 只能引用上面真实出现过的条目，**绝不编造链接或来源**；\n"
+            "4. 若结果不足以回答，如实说明局限，不要凭空补充。\n"
+            "注意：当前时间以系统提示中的时间为准。")
     return "\n".join(lines)
 
 
