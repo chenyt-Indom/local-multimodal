@@ -1,0 +1,37 @@
+# ============================================================
+#  GPU 加速覆盖文件（有 NVIDIA 显卡时叠加使用）
+#
+#    docker compose -f compose.yml -f compose.gpu.yml up -d
+#
+#  前置条件：
+#    · Windows：Docker Desktop 使用 WSL2 后端 + 已安装 NVIDIA 驱动（自带透传）
+#    · Linux  ：已安装 NVIDIA 驱动 + nvidia-container-toolkit
+#  自检命令：
+#    docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
+#
+#  说明：
+#    · Ollama（对话/看图）走显卡无需额外条件，叠加本文件即可。
+#    · 绘图（Stable Diffusion）走显卡还要求镜像内的 torch 是 CUDA 版。
+#      默认镜像是 CPU 版 torch（通用性优先）。需要绘图也吃显卡时用 CUDA torch 重建：
+#        docker build -f docker/Dockerfile.app \
+#          --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu124 \
+#          -t local-multimodal-app:latest ./build
+# ============================================================
+services:
+  app:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

@@ -1,28 +1,37 @@
 @echo off
-chcp 65001 >nul
+chcp 936 >nul
 setlocal
 pushd "%~dp0"
-title æœ¬åœ°å¤šæ¨¡æ€åŠ©æ‰‹ Â· è¿è¡ŒçŠ¶æ€
+title ±¾µØ¶àÄ£Ì¬ÖúÊÖ ¡¤ ÔËĞĞ×´Ì¬
 
 echo ============================================================
-echo            æœ¬åœ°å¤šæ¨¡æ€åŠ©æ‰‹ Â· è¿è¡ŒçŠ¶æ€
+echo            ±¾µØ¶àÄ£Ì¬ÖúÊÖ ¡¤ ÔËĞĞ×´Ì¬
 echo ============================================================
 echo.
 
-echo ---------- å®¹å™¨çŠ¶æ€ ----------
+echo ---------- ÈİÆ÷ ----------
 docker ps -a --filter "name=mm-" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 echo.
 
-echo ---------- ç•Œé¢æœåŠ¡å¥åº·æ£€æŸ¥ ----------
-curl -fsS -m 5 http://127.0.0.1:8000/api/health && echo. && echo [OK] åç«¯å·²å°±ç»ª || echo [æœªå°±ç»ª] æœåŠ¡å°šæœªå¯åŠ¨å®Œæˆ
+echo ---------- ½çÃæ·şÎñ ----------
+curl -fsS -m 5 http://127.0.0.1:8000/api/health
+if errorlevel 1 (echo [Î´¾ÍĞ÷] ·şÎñÉĞÎ´Æô¶¯Íê³É) else (echo. & echo [OK] ºó¶ËÒÑ¾ÍĞ÷)
 echo.
 
-echo ---------- æœ€è¿‘æ—¥å¿—ï¼ˆ30 è¡Œï¼‰----------
+echo ---------- ËŞÖ÷»ú Ollama£¨Ö±Á¬Ä£Ê½ÓÃ£©----------
+curl -fsS -m 5 http://127.0.0.1:11434/api/version
+if errorlevel 1 (echo [Î´ÔËĞĞ] Ö±Á¬Ä£Ê½ÏÂĞèÒª±¾»ú Ollama ÕıÔÚÔËĞĞ) else (echo.)
+echo.
+
+echo ---------- Ó¦ÓÃÈÕÖ¾£¨30 ĞĞ£©----------
 docker logs --tail 30 mm-app 2>&1
 echo.
 
-echo ---------- ç£ç›˜å ç”¨ ----------
+echo ---------- ´ÅÅÌÕ¼ÓÃ ----------
 docker system df
+echo.
+
+echo Êı¾İÄ¿Â¼£º%~dp0data
 echo.
 pause
 popd

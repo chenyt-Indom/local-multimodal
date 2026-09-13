@@ -1,37 +1,35 @@
 @echo off
-chcp 65001 >nul
+chcp 936 >nul
 setlocal
 pushd "%~dp0"
-title æœ¬åœ°å¤šæ¨¡æ€åŠ©æ‰‹ Â· å®Œå…¨å¸è½½
+title ±¾µØ¶àÄ£Ì¬ÖúÊÖ ¡¤ ÍêÈ«Ğ¶ÔØ
 
 echo ============================================================
-echo            æœ¬åœ°å¤šæ¨¡æ€åŠ©æ‰‹ Â· å®Œå…¨å¸è½½
+echo            ±¾µØ¶àÄ£Ì¬ÖúÊÖ ¡¤ ÍêÈ«Ğ¶ÔØ
 echo ============================================================
 echo.
-echo æœ¬æ“ä½œå°†åˆ é™¤ï¼šå®¹å™¨ã€é•œåƒã€ä»¥åŠå…¨éƒ¨èŠå¤©è®°å½•/è®°å¿†åº“/å›¾ç‰‡åº“æ•°æ®ã€‚
+echo ±¾²Ù×÷½«É¾³ı£ºÈİÆ÷¡¢¾µÏñ£¬ÒÔ¼°È«²¿ÁÄÌì¼ÇÂ¼/¼ÇÒä¿â/Í¼Æ¬¿âÊı¾İ¡£
 echo.
 set "ANS="
-set /p ANS=ç¡®è®¤ç»§ç»­è¯·è¾“å…¥ YESï¼ˆå…¶å®ƒä»»æ„é”®å–æ¶ˆï¼‰:
+set /p ANS=È·ÈÏ¼ÌĞøÇëÊäÈë YES£¨ÆäËüÈÎÒâ¼üÈ¡Ïû£©:
 if /i not "%ANS%"=="YES" (
-    echo å·²å–æ¶ˆã€‚
+    echo ÒÑÈ¡Ïû¡£
     pause & exit /b 0
 )
 
 echo.
-echo [1/3] åœæ­¢å¹¶åˆ é™¤å®¹å™¨...
-docker compose -f compose.full.yml down -v 2>nul
-docker compose -f compose.lite.yml down -v 2>nul
+echo [1/3] Í£Ö¹²¢É¾³ıÈİÆ÷...
+docker compose -f compose.yml --profile bundled down -v 2>nul
 
-echo [2/3] åˆ é™¤é•œåƒ...
-docker image rm local-multimodal-full:latest 2>nul
-docker image rm local-multimodal-lite:latest 2>nul
+echo [2/3] É¾³ı¾µÏñ...
+docker image rm local-multimodal-app:latest 2>nul
+docker image rm local-multimodal-ollama:latest 2>nul
 
-echo [3/3] åˆ é™¤æœ¬åœ°æ•°æ®ç›®å½•...
+echo [3/3] É¾³ı±¾µØÊı¾İÄ¿Â¼...
 if exist "data" rd /s /q "data"
-if exist "ollama-models" rd /s /q "ollama-models"
 
 echo.
-echo å¸è½½å®Œæˆã€‚å¦‚éœ€ä¿ç•™ç¦»çº¿åŒ…ï¼Œimages ç›®å½•æœªåšåˆ é™¤ã€‚
+echo Ğ¶ÔØÍê³É¡£ÀëÏß°ü images\¡¢Ä£ĞÍ models\ Î´É¾³ı£¬¿ÉÊÖ¶¯ÇåÀí¡£
 echo.
 pause
 popd

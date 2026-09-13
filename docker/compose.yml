@@ -1,0 +1,63 @@
+# ============================================================
+#  本地多模态助手 · Docker 编排
+#
+#  两种 Ollama 模式（默认「直连」，无需下载任何东西）：
+#
+#   ① 直连模式（默认）—— 用宿主机已经装好的 Ollama
+#        docker compose up -d
+#
+#   ② 自带模式 —— 在容器里再跑一个 Ollama（需先有 Ollama 镜像）
+#        docker compose --profile bundled up -d
+#
+#  有 NVIDIA 显卡时叠加 GPU 覆盖文件：
+#        docker compose -f compose.yml -f compose.gpu.yml up -d
+#
+#  模型不放在镜像里，而是挂载包内的 models 目录 —— 不在磁盘上存两份。
+# ============================================================
+name: local-multimodal
+
+services:
+  # ---------------- 界面与后端 ----------------
+  app:
+    image: local-multimodal-app:latest
+    build:
+      context: ./build
+      dockerfile: docker/Dockerfile.app
+    container_name: mm-app
+    restart: unless-stopped
+    environment:
+      # 直连模式指向宿主机；自带模式由 .env 覆盖为 http://ollama:11434
+      MM_OLLAMA_URL: ${MM_OLLAMA_URL:-http://host.docker.internal:11434}
+      MM_MODEL: ${MM_MODEL:-qwen3-vl:8b}
+      MM_DATA_DIR: /data
+      TZ: Asia/Shanghai
+    # 让 host.docker.internal 在 Linux 上也能解析到宿主机
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    volumes:
+      - ./data:/data                                  # 记忆库/会话/图片库/日志
+      - ./models/sd-turbo:/opt/app/sd_model:ro        # 绘图模型（缺省则自动降级）
+      - ./models/esrgan:/opt/app/esrgan:ro            # 超分模型
+    shm_size: "2gb"                                   # 多模态推理需要较大共享内存
+
+  # ---------------- 自带 Ollama（可选）----------------
+  ollama:
+    profiles: ["bundled"]                             # 默认不启动
+    image: ${OLLAMA_IMAGE:-local-multimodal-ollama:latest}
+    container_name: mm-ollama
+    restart: unless-stopped
+    environment:
+      OLLAMA_HOST: 0.0.0.0
+      OLLAMA_MODELS: /root/.ollama/models
+      OLLAMA_KEEP_ALIVE: 30m                          # 模型常驻显存，避免反复加载
+    volumes:
+      # 直接挂载包内已下好的模型，零下载；Ollama 需要写权限（拉取/校验时）
+      - ./models/ollama:/root/.ollama/models
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list | grep -q qwen3-vl"]
+      interval: 20s
+      timeout: 15s
+      retries: 30
+      start_period: 30s
