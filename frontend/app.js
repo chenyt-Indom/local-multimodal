@@ -922,9 +922,25 @@
     renderSessions(list);
   })();
 
+  // 绘图设备提示：文生图与图片微改共用同一个 torch 环境，设备一致
+  async function loadDevice() {
+    const el = $("#deviceBadge");
+    if (!el) return;
+    try {
+      const d = await api("/api/t2i/capability");
+      const isGpu = d.kind === "gpu";
+      el.textContent = isGpu ? ("🖥 GPU 加速" + (d.gpu ? "（" + d.gpu + "）" : "")) : "🖥 CPU 模式";
+      el.title = isGpu
+        ? `绘图（文生图 / 图片微改）使用显卡加速\n${d.gpu || ""}\ntorch ${d.torch || ""}`
+        : `绘图（文生图 / 图片微改）使用 CPU，单张约 20 秒\n${d.note || ""}\ntorch ${d.torch || ""}`;
+      el.style.opacity = "0.75";
+    } catch (e) { el.textContent = ""; }
+  }
+
   refreshHealth();
   loadToggles();
   loadMemory();
   loadLibrary();
+  loadDevice();
   setInterval(refreshHealth, 5000);
 })();

@@ -176,6 +176,36 @@ def available_upscale() -> bool:
     return ESRGAN_PATH is not None
 
 
+def device_info() -> dict:
+    """当前绘图会用什么设备（不加载模型，仅探测）。
+
+    文生图与图片微改共用同一个 torch 环境，因此两者设备一致。
+    容器默认镜像是 CPU 版 torch → cpu；源码运行若装了 CUDA 版则 → cuda。
+    """
+    info = {"device": "cpu", "kind": "cpu", "gpu": None, "torch": None,
+            "cuda_available": False, "note": ""}
+    try:
+        import torch
+        info["torch"] = torch.__version__
+        info["cuda_available"] = bool(torch.cuda.is_available())
+        if info["cuda_available"]:
+            info["device"] = "cuda"
+            info["kind"] = "gpu"
+            try:
+                info["gpu"] = torch.cuda.get_device_name(0)
+            except Exception:
+                info["gpu"] = None
+        else:
+            # 区分「没显卡」和「装了 CPU 版 torch」——后者换镜像即可提速
+            if "+cpu" in (torch.__version__ or ""):
+                info["note"] = "当前是 CPU 版 torch，有显卡可换 CUDA 版镜像提速"
+            else:
+                info["note"] = "未检测到可用的 CUDA 设备"
+    except Exception as e:
+        info["note"] = f"torch 不可用：{e}"
+    return info
+
+
 def _get_upscaler():
     """懒加载超分网络（spandrel 加载 RealESRGAN 权重，避免 basicsr 依赖问题）。"""
     global _upscaler

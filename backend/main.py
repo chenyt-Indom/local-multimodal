@@ -752,8 +752,15 @@ def t2i_generate(body: T2IBody):
 
 @app.get("/api/t2i/capability")
 def t2i_capability():
-    """文生图能力探测：是否可用、是否支持高清放大。"""
-    return {"ok": True, "hd_available": t2i.available_upscale()}
+    """文生图能力探测：是否可用、是否支持高清放大、跑在什么设备上。
+
+    注意：文生图与图片微改共用同一个 torch 环境，设备是同一种，
+    因此这里的 device 对两者都适用。
+    """
+    dev = t2i.device_info()
+    return {"ok": True, "hd_available": t2i.available_upscale(),
+            "device": dev["device"], "kind": dev["kind"], "gpu": dev["gpu"],
+            "torch": dev["torch"], "note": dev["note"]}
 
 
 @app.post("/api/t2i/unload")
