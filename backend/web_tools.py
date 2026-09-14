@@ -154,7 +154,7 @@ _SELF_CHANNEL_TITLE = (
 
 
 def _is_useless(item: dict) -> bool:
-    """判断一条结果是否属于"搜索引擎自家的频道页"这类噪音。"""
+    """判断一条结果是否属于"搜索引擎自家的频道页 / 站点首页"这类噪音。"""
     url = (item.get("url") or "").strip()
     if not url.startswith("http"):
         return True
@@ -163,6 +163,14 @@ def _is_useless(item: dict) -> bool:
         return True
     title = (item.get("title") or "")
     if any(t in title for t in _SELF_CHANNEL_TITLE):
+        return True
+    # 站点首页：路径为空或只有 /，标题又很短（如「Bilibili」「哔哩哔哩」）。
+    # 这类条目对"查资料"毫无价值，只会占位置。
+    try:
+        path = urllib.parse.urlparse(url).path.strip("/")
+    except Exception:
+        path = ""
+    if not path and len(title.strip()) <= 14:
         return True
     return False
 
@@ -359,9 +367,11 @@ def best_relevance(query: str, items: list) -> float:
 def filter_relevant(query: str, items: list, keep_min: int = 3) -> list:
     """按相关度过滤并排序，剔除答非所问的结果。
 
-    规则：至少达到「最佳结果的 40%」且不低于 15% 的绝对命中。
-    若这样筛完不足 keep_min 条，则按分数补齐前 keep_min 条 ——
-    **保证不返回空**，避免上层退回"未过滤的原始结果"（那等于把垃圾又放回来）。
+    规则：
+    1. 先留下「至少达到最佳结果的 40%，且绝对命中不低于 15%」的；
+    2. 不足 keep_min 条时**有限度地**补位：只补相关度 ≥ 6% 的。
+       绝不为了凑数把毫不相干的（站点首页、无关政策新闻）塞进来 ——
+       那些进了来源清单只会让用户困惑，也会污染模型的材料。
     """
     if not items:
         return []
@@ -371,7 +381,12 @@ def filter_relevant(query: str, items: list, keep_min: int = 3) -> list:
     cutoff = max(best * 0.4, 0.15)
     kept = [it for r, it in scored if r >= cutoff]
     if len(kept) < keep_min:
-        kept = [it for _, it in scored[:keep_min]]
+        floor = max(cutoff * 0.3, 0.06)
+        for r, it in scored:
+            if len(kept) >= keep_min:
+                break
+            if r >= floor and it not in kept:
+                kept.append(it)
     return kept
 
 
@@ -434,6 +449,110 @@ def web_search(query: str, n: int = 8) -> list:
              "url": f"https://cn.bing.com/search?q={q}",
              "desc": f"备选：https://www.so.com/s?q={q}",
              "engine": "fallback"}]
+
+
+# ---------- 网页正文抓取（深度阅读）----------
+# 为什么需要：搜索给回来的只是 100~200 字的摘要，篇幅有限、信息密度低，
+# 模型据此只能写出很短的回答。把前几条结果的**正文**抓下来喂给模型，
+# 才有材料"总结 + 分析 + 展开"。
+#
+# 注意这是额外请求，必须：
+#   · 并发抓取（串行会拖到十几秒）
+#   · 每条设短超时 + 体积上限（有些页面几百 KB 甚至更多）
+#   · 失败就静默跳过（很多站点有反爬/需要 JS，抓不到很正常）
+
+_PAGE_SKIP_EXT = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                  ".zip", ".rar", ".7z", ".mp4", ".mp3", ".apk", ".exe")
+# 常见的正文容器（按优先级）；取不到就退回整页去标签
+_PAGE_MAIN_PATTERNS = (
+    r'<article[^>]*>(.*?)</article>',
+    r'<div[^>]+class="[^"]*(?:article|content|main|detail|post|entry|body)[^"]*"[^>]*>(.*?)</div>',
+    r'<main[^>]*>(.*?)</main>',
+)
+
+
+def fetch_page_text(url: str, limit: int = 1200, timeout: int = 8) -> str:
+    """抓取网页正文纯文本（用于深度阅读）。失败返回空字符串。"""
+    import re
+
+    low = (url or "").lower()
+    if not low.startswith("http") or any(low.split("?")[0].endswith(e) for e in _PAGE_SKIP_EXT):
+        return ""
+    try:
+        req = urllib.request.Request(url, headers={
+            **WEB_HEADERS,
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if "html" not in ctype and "text" not in ctype:
+                return ""
+            raw = resp.read(600 * 1024)            # 上限 600KB，防止超大页面
+    except Exception:
+        return ""
+
+    for enc in ("utf-8", "gbk", "gb18030"):
+        try:
+            html_txt = raw.decode(enc)
+            break
+        except Exception:
+            continue
+    else:
+        html_txt = raw.decode("utf-8", errors="ignore")
+
+    # 去掉整块噪音
+    html_txt = re.sub(r"(?is)<(script|style|noscript|svg|iframe)[^>]*>.*?</\1>", " ", html_txt)
+    html_txt = re.sub(r"(?is)<!--.*?-->", " ", html_txt)
+
+    # 优先在正文容器里取
+    best = ""
+    for pat in _PAGE_MAIN_PATTERNS:
+        for m in re.finditer(pat, html_txt, re.S):
+            seg = _clean(m.group(1))
+            if len(seg) > len(best):
+                best = seg
+
+    # 导航栏/侧边栏的链接文字往往被拼成一长串"首页 招生计划 历年分数 …"，
+    # 信息密度极低却很长，容易盖过真正的正文。这里优先用**段落**拼正文：
+    # <p> 通常是正文单位，而导航多是 <a>/<li>。
+    paras = [_clean(p) for p in re.findall(r"(?is)<p[^>]*>(.*?)</p>", html_txt)]
+    paras = [p for p in paras if len(p) >= 20]
+    if paras:
+        joined = " ".join(paras)
+        # 段落总长够用就用它（比整页干净得多）
+        if len(joined) >= 150:
+            best = joined if len(joined) > len(best) * 0.6 else best
+
+    text = best if len(best) >= 120 else _clean(html_txt)
+
+    # 合并空白并截断
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
+
+
+def fetch_pages(urls: list, limit: int = 1200, workers: int = 5,
+                timeout: int = 8) -> dict:
+    """并发抓取多个网页正文 → {url: text}。抓不到的条目直接不出现在结果里。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    urls = [u for u in dict.fromkeys(urls or []) if u]
+    if not urls:
+        return {}
+    out = {}
+    try:
+        with ThreadPoolExecutor(max_workers=min(workers, len(urls))) as pool:
+            futs = {pool.submit(fetch_page_text, u, limit, timeout): u for u in urls}
+            for f, u in futs.items():
+                try:
+                    t = f.result(timeout=timeout + 4)
+                except Exception:
+                    t = ""
+                if t:
+                    out[u] = t
+    except Exception:
+        pass
+    return out
+
 
 
 # ---------- 天气查询（结构化数据，不用搜索引擎）----------

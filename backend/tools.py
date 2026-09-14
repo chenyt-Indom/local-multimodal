@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import time
 import glob
+import urllib.parse
 
 from . import t2i
 from . import file_tools
@@ -281,7 +282,13 @@ _WEB_SEARCH_SCHEMA = {
                 },
                 "top_k": {
                     "type": "integer",
-                    "description": "返回结果条数，默认 8（多引擎聚合，可适当调大）",
+                    "description": "检索条数，默认 10（多引擎聚合）；想覆盖更广可调到 15~20",
+                },
+                "deep": {
+                    "type": "integer",
+                    "description": "对前 N 条结果抓取网页正文供精读，默认 4。"
+                                   "需要更深入的细节（条款、数字、名单）时可调大到 6~8；"
+                                   "只想快速了解概况可设 0。",
                 },
             },
             "required": ["query"],
@@ -347,19 +354,81 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
 # 查询里常见的"干扰词"：搜索引擎对这类限定词很敏感，会大幅降低召回质量
 _NOISE_PATTERNS = [
     r"是公办还是民办", r"公办还是民办", r"公办\s*民办", r"是公办的吗", r"是民办的吗",
-    r"是什么", r"怎么样", r"有哪些", r"是多少", r"为什么", r"怎么回事",
+    r"是什么", r"怎么样", r"怎样", r"怎么", r"有哪些", r"是多少", r"为什么",
+    r"怎么回事", r"如何",
     r"的参数", r"参数配置", r"规格", r"详细介绍", r"介绍一下", r"请问",
 ]
 
+# 用户口语化的"意图尾巴"：出现在句末时几乎没有检索价值，却会把引擎带偏。
+# 例如「2026年人工智能技术应用专业的就业前景如何？请详细分析」——
+# 不剥掉后半句时，引擎会去匹配"2026年…分析"，返回国务院节假日通知之类的垃圾；
+# 只留「人工智能技术应用专业的就业前景」，召回质量立刻正常。
+_TRAILING_INTENT = (
+    "请详细分析", "详细分析一下", "详细分析", "分析一下", "帮我分析",
+    "请详细说明", "详细说明一下", "详细说明", "说明一下",
+    "请详细介绍一下", "详细介绍一下", "请介绍一下", "介绍一下",
+    "解释一下", "讲讲", "说说", "谈谈", "聊一聊", "告诉我",
+    "帮我看看", "帮我看一下", "帮我查查", "帮我查一下", "我想知道", "想知道",
+    "怎么做", "怎么办", "要注意什么", "有什么建议",
+)
+
+
+# 意图从句的起始词：形如「并给出你的分析」「，请详细说明」这类尾巴要整段丢掉
+_INTENT_HEAD = (
+    "请", "帮我", "麻烦", "分析", "说明", "解释", "给出", "提供", "介绍",
+    "讲讲", "说说", "谈谈", "告诉我", "指出", "评价", "对比", "推荐",
+)
+_TRAILING_CLAUSE_SEP = r"[，,、；;。.]+|以及|并且|还有|并|和"
+
+
+def _strip_trailing_intent(s: str) -> str:
+    """反复剥掉句末的口语化意图短语 / 意图从句。
+
+    例：'深圳大学2026年招生有什么新变化？请详细说明并给出你的分析'
+        → 先按并列词切掉「并给出你的分析」→ 再剥掉「请详细说明」
+        → '深圳大学 招生有什么新变化'
+    """
+    import re
+    changed = True
+    while changed:
+        changed = False
+        t = (s or "").strip(" 　,，。.、；;：:！!？?")
+        # 1) 句末的并列意图从句（「并给出你的分析」这种）
+        parts = re.split("(" + _TRAILING_CLAUSE_SEP + ")", t)
+        while len(parts) >= 3:
+            last = parts[-1].strip()
+            if last and last.startswith(_INTENT_HEAD):
+                parts = parts[:-2]
+                changed = True
+            else:
+                break
+        t = "".join(parts).strip()
+        # 2) 句末的固定意图短语
+        for p in _TRAILING_INTENT:
+            if t.endswith(p):
+                t = t[: -len(p)].strip(" 　,，。.、；;：:！!？?")
+                changed = True
+        # 3) 句末的孤立问句助词
+        t2 = re.sub(r"[吗呢吧啊呀嘛]$", "", t).strip()
+        if t2 != t:
+            t, changed = t2, True
+        # 4) 空格分隔的孤立意图词：如「…就业前景 分析」。
+        #    要求**前面有空格**才剥，否则会误伤「数据分析」这类连写词。
+        m = re.match(r"^(.*\s)(\S{2,4})$", t)
+        if m and m.group(2) in _INTENT_HEAD:
+            t, changed = m.group(1).strip(), True
+        s = t
+    return s
+
 
 def _simplify_query(q: str) -> str:
-    """去掉年份/月日/疑问词/限定词，得到更通用的检索词。
+    """去掉年份/月日/疑问词/口语尾巴，得到更通用的检索词。
 
     实测：搜索引擎对"广州民航职业技术学院 公办 民办"这类长查询召回很差，
     而只留主体词"广州民航职业技术学院"时能正常返回官网与百科。
     """
     import re
-    s = q
+    s = _strip_trailing_intent(q)
     s = re.sub(r"\d{4}\s*年", " ", s)
     s = re.sub(r"\d{1,2}\s*月", " ", s)
     s = re.sub(r"\d{1,2}\s*日", " ", s)
@@ -394,25 +463,48 @@ def _relevant(query: str, results: list) -> bool:
 
 
 def _do_web_search(arguments, ui_events):
-    """联网检索：多引擎 + 多查询变体聚合 + 相关性过滤，尽量拿到可用结果。"""
+    """联网检索：多引擎 + 多查询变体聚合 + 相关性过滤 + 深度阅读正文。
+
+    深度阅读（deep read）是关键一步：只给模型 140 字的搜索摘要，它写不出
+    有内容的回答；把前几条结果的**正文**抓下来喂给它，才有材料"总结 + 分析 + 展开"。
+    """
     from concurrent.futures import ThreadPoolExecutor
 
     query = (arguments.get("query") or "").strip()
     if not query:
         return "联网搜索失败：未提供 query。"
     try:
-        top_k = int(arguments.get("top_k") or 8)
+        top_k = int(arguments.get("top_k") or 10)
     except Exception:
-        top_k = 8
-    top_k = max(1, min(top_k, 15))
+        top_k = 10
+    top_k = max(1, min(top_k, 20))
+
+    # 深度阅读前 N 条正文；正文字数上限
+    # 注意：这些量直接决定注入提示词的体积。单条正文每条几百 token，
+    # 抓太多会把上下文挤爆（也拖慢推理），因此克制：
+    #   4 篇 × 800 字 ≈ 2400 token，加上 8 条标题/链接/摘要 ≈ 1200 token，
+    #   合计约 3600 token —— 与主流程 _trim_history_to_budget 里的预留量对齐。
+    deep_n = max(0, min(int(arguments.get("deep") if arguments.get("deep") is not None else 4), 8))
+    deep_chars = 800
 
     from . import web_tools
 
-    # 查询变体：原查询 + 精简主体词（+ 机构类查询追加"官方站定向"）
+    # 查询变体：原查询 + 精简主体词（+ 去数字版 + 机构类查询追加"官方站定向"）
     variants = [query]
     simple = _simplify_query(query)
     if simple and simple != query and len(simple) >= 2:
         variants.append(simple)
+
+    # 变体 3：把残留的数字也去掉。
+    # 「2026 人工智能技术应用 就业前景」这类查询里的年份会把引擎引向
+    # 「2026年政府工作报告」「2026年节假日安排」等政策新闻，而"去数字"版本
+    # 往往能召回真正讲专业前景的文章。实测对结果数量提升明显。
+    import re as _re
+    if _re.search(r"\d", simple or query):
+        nodigit = _re.sub(r"\d+\s*[年月日]?", " ", simple or query)
+        nodigit = _re.sub(r"\s+", " ", nodigit).strip()
+        if len(nodigit) >= 2 and nodigit not in variants:
+            variants.append(nodigit)
 
     # 查"某单位对外公开情况"时，普通检索会被百科/聚合站/同名地名淹没。
     # 这里额外跑一次 `主体词 site:gov.cn`（或 edu.cn / org.cn）定向检索，
@@ -437,10 +529,12 @@ def _do_web_search(arguments, ui_events):
         return f"联网搜索失败：{exc}"
 
     # 逐变体做相关性过滤（剔除"广州市_百度百科"这类泛化无关结果）
+    # keep_min 给到 6：材料太少时模型写不出有内容的回答。宁可多留几条让模型自己取舍
+    # —— 它已被明确告知"材料弱就如实说明"，比只给 3 条更好。
     filtered = []
     for (q, kind), b in zip(jobs, batches):
         filtered.append(web_tools.filter_relevant(
-            q, b, keep_min=2 if kind == "official" else 3))
+            q, b, keep_min=4 if kind == "official" else 6))
 
     # 组装优先级：原查询 → 官方站定向 → 精简查询
     order = [0] + [i for i, (_, k) in enumerate(jobs) if k == "official"] \
@@ -451,9 +545,9 @@ def _do_web_search(arguments, ui_events):
             continue
         seen_idx.add(i)
         results = _dedupe(results + filtered[i])
-        if len(results) >= max(top_k, 8):
-            break
-    results = results[:max(top_k, 8)]
+    # 扩大检索范围：不再只留 8 条，多给些材料让模型有得比、有得选
+    cap = max(top_k, 12)
+    results = results[:cap]
 
     # 相关度偏低时，明确告诉模型"这次检索不可靠"，避免它硬编内容
     confidence = web_tools.best_relevance(query, results)
@@ -462,9 +556,37 @@ def _do_web_search(arguments, ui_events):
     if official_hint:
         used += f"；已定向官方站 site:{official_hint}"
 
-    # 输出格式刻意紧凑：长 URL 和超长摘要会挤占模型上下文、降低其理解质量，
-    # 因此来源只给域名，摘要截断到 140 字。
-    lines = [f"【联网搜索结果】检索词：{used}"]
+    # ---------- 深度阅读：抓前 N 条的正文 ----------
+    # 摘要只有一两百字，模型据此只能写得很短。抓正文才能"总结 + 分析 + 展开"。
+    pages = {}
+    if deep_n and results:
+        urls = [r.get("url") for r in results[:deep_n] if r.get("url")]
+        try:
+            pages = web_tools.fetch_pages(urls, limit=deep_chars, workers=5, timeout=8)
+        except Exception:
+            pages = {}
+
+    # ---------- 把来源清单作为独立事件发给前端（聊天气泡里不再重复列链接）----------
+    src_items = []
+    for i, r in enumerate(results, 1):
+        url = (r.get("url") or "").strip()
+        try:
+            site = urllib.parse.urlparse(url).netloc
+        except Exception:
+            site = ""
+        src_items.append({
+            "i": i,
+            "title": (r.get("title") or "").strip(),
+            "url": url,
+            "site": site,
+            "engine": r.get("engine") or "",
+            "read": url in pages,      # 是否已深度阅读（前端可标注）
+        })
+    _ui(ui_events, {"type": "sources", "query": used, "items": src_items})
+
+    # 输出给模型的材料：标题 + 完整链接 + 搜索摘要 + 正文节选
+    lines = [f"【联网检索结果】检索词：{used}　共 {len(results)} 条，"
+             f"其中 {len(pages)} 条已抓取网页正文供你精读。"]
     useful = 0
     for i, r in enumerate(results, 1):
         title = (r.get("title") or "").strip()
@@ -473,11 +595,13 @@ def _do_web_search(arguments, ui_events):
         if title and title not in ("搜索失败",) and "未获取到搜索结果" not in title and url:
             useful += 1
         lines.append(f"[{i}] {title}")
-        if desc:
-            lines.append(f"    摘要：{desc[:140]}")
         if url:
-            # 给**完整链接**（此前只给域名，导致模型无法提供可点击来源）
             lines.append(f"    链接：{url}")
+        if desc:
+            lines.append(f"    摘要：{desc[:200]}")
+        body = pages.get(url)
+        if body:
+            lines.append(f"    正文：{body}")
     if useful == 0:
         lines.append("（未获取到有效搜索结果。请如实告诉用户本次联网检索失败，不要编造内容；"
                      "可以建议用户换个更具体的说法再试。）")
@@ -487,13 +611,27 @@ def _do_web_search(arguments, ui_events):
                          "请如实说明「未检索到直接相关信息」，并建议用户换个关键词或提供更具体的名称，"
                          "不要用这些弱相关结果硬凑答案。）")
         lines.append(
-            "请基于以上检索结果用中文总结回答，并严格遵守：\n"
-            "1. 关键结论后用 [序号] 标注来源，例如「……[2]」；\n"
-            "2. 回答最后单独起一段「信息来源」，每条一行，格式："
-            "序号. 标题 — 完整链接（链接必须原样复制上面的「链接：」内容）；\n"
-            "3. 只能引用上面真实出现过的条目，**绝不编造链接或来源**；\n"
-            "4. 若结果不足以回答，如实说明局限，不要凭空补充。\n"
-            "注意：当前时间以系统提示中的时间为准。")
+            "请基于以上检索结果，用中文写一份**充实、有分析的回答**。要求：\n"
+            "1. **篇幅要够**：不要只写两三句结论。一般 400~900 字，信息多的可更长。\n"
+            "2. **结构清晰**：用「小标题 + 分点」组织，便于阅读；\n"
+            "3. **先总结、再分析、后展开**：\n"
+            "   · 先用一两句给出核心结论；\n"
+            "   · 再把各条材料的**具体信息**（名称、数字、时间、条款、名单等）提炼出来，\n"
+            "     不要笼统概括，要落到细节；\n"
+            "   · 有「正文」字段的条目是已抓取的网页正文，**优先从中提取细节**；\n"
+            "   · 不同来源说法不一致时，指出来并说明差异所在；\n"
+            "4. **给出你自己的判断**：单独一小段「几点看法」或类似小标题，\n"
+            "   基于材料做推断和评价（如适用性、风险、值得注意之处）。\n"
+            "   **属于你的推断要明确说是推断**，不要和检索到的事实混为一谈；\n"
+            "5. **标注来源**：引用了哪条材料，就在该句末尾用 [序号] 标注（如「……[2]」）；\n"
+            "6. **不要再写「信息来源」「参考资料」这类列表** —— "
+            "界面已经在回答下方单独提供了可展开的来源清单，重复列出是冗余；\n"
+            "7. 只能引用上面真实出现过的条目，**绝不编造链接、数字或事实**。\n"
+            "   特别注意：**不要编造电话号码、地址、邮箱、文号、日期等联系方式或标识**。\n"
+            "   材料里没有就别写；更不要用「020-XXXXXXX」这种占位式写法凑数——\n"
+            "   要提供联系方式就写「建议从官网获取」，否则会误导用户；\n"
+            "8. 若材料确实不足以回答某部分，就如实说明「检索结果未涉及」，不要凭空补充。\n"
+            "注意：当前时间以系统提示中的时间为准；涉及时效的信息请说明材料日期。")
     return "\n".join(lines)
 
 

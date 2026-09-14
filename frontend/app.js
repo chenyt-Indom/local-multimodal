@@ -543,6 +543,58 @@
   }
 
   // ---------- 发送 / 流式接收 ----------
+  // 检索来源列表：回答下方的可伸缩面板（默认折叠）
+  // 为什么放在正文之外：链接列表塞进回答气泡会把答案本身淹掉，
+  // 而且模型每次重写都可能漏抄或改动链接；由后端直接给出真实来源更可靠。
+  function renderSources(afterEl, data) {
+    const items = data.items || [];
+    const box = document.createElement("div");
+    box.className = "src-box";
+
+    const hdr = document.createElement("button");
+    hdr.className = "src-hdr";
+    hdr.innerHTML = `<span class="src-caret">▸</span>
+      <span class="src-title">📚 检索来源（${items.length}）</span>
+      <span class="src-hint">${data.query ? escapeHtml(data.query).slice(0, 40) : ""}</span>`;
+
+    const list = document.createElement("div");
+    list.className = "src-list";
+    list.hidden = true;
+
+    items.forEach((it) => {
+      const row = document.createElement("div");
+      row.className = "src-item";
+      const site = it.site ? `<span class="src-site">${escapeHtml(it.site)}</span>` : "";
+      const read = it.read ? `<span class="src-read" title="已抓取该页正文用于分析">已精读</span>` : "";
+      row.innerHTML = `<span class="src-idx">[${it.i}]</span>
+        <a class="src-link" href="${escapeHtml(it.url)}" target="_blank" rel="noopener"></a>
+        ${site}${read}`;
+      const a = row.querySelector(".src-link");
+      a.textContent = it.title || it.url;
+      a.title = it.url;
+      list.appendChild(row);
+    });
+
+    const toggle = () => {
+      list.hidden = !list.hidden;
+      hdr.classList.toggle("open", !list.hidden);
+      hdr.querySelector(".src-caret").textContent = list.hidden ? "▸" : "▾";
+    };
+    hdr.onclick = toggle;
+
+    box.appendChild(hdr);
+    box.appendChild(list);
+    // 插到回答气泡之后
+    if (afterEl && afterEl.parentNode) afterEl.parentNode.insertBefore(box, afterEl.nextSibling);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
   function showLightbox(mime, b64, prompt) {
     const ov = document.createElement("div");
     ov.className = "lightbox";
@@ -668,6 +720,9 @@
     // 后端可能发来 note（例如"输出被长度上限截断，正在重试"），
     // 收起来备用：万一最终没有正文，就把它显示出来，而不是留一个空气泡
     const notes = [];
+    // 联网检索的来源清单：由后端在 ui 事件里单独发来，
+    // 在回答下方渲染成可伸缩列表（不再让模型把链接写进正文）
+    let sourcesData = null;
 
     let thinking = "", answer = "";
     // ---------- 思考过程平滑逐字播放 ----------
@@ -801,7 +856,10 @@
             if (obj.message.content) { answer += obj.message.content; answerBubble.textContent = answer + "▌"; }
           }
           if (obj.tool_start) addToolChip(obj.tool_start.name);
-          if (obj.ui) addMedia(obj.ui);
+          if (obj.ui) {
+            if (obj.ui.type === "sources") sourcesData = obj.ui;   // 稍后在回答下方渲染
+            else addMedia(obj.ui);
+          }
           if (obj.note) { notes.push(obj.note); showToast(obj.note, "warn"); }
           if (obj.done) break;
         }
@@ -818,6 +876,10 @@
         answer = "";
       }
       if (answer) history.push({ role: "assistant", content: answer });
+      // 检索来源：渲染成回答下方的可伸缩列表（默认折叠，点标题展开）
+      if (sourcesData && sourcesData.items && sourcesData.items.length) {
+        renderSources(answerWrap, sourcesData);
+      }
       persistSession();   // 落盘，保证程序重启后能恢复这段对话
     } catch (err) {
       finishThinking();

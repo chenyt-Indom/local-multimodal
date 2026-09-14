@@ -102,6 +102,58 @@ MAX_TOKENS_CEILING = 8192
 # 无需全部塞进上下文——否则推理越来越慢，且容易撑爆窗口。
 MAX_CONTEXT_MESSAGES = 40
 
+
+def _est_tokens(text) -> int:
+    """粗略估算 token 数：中文约 1.2 字/token，其余约 3.5 字符/token。
+
+    只需要"够准到能做预算"，不追求精确——故意偏保守（宁可少带历史）。
+    """
+    if not text:
+        return 0
+    s = str(text)
+    cn = sum(1 for c in s if "\u4e00" <= c <= "\u9fff")
+    return int(cn / 1.2) + int((len(s) - cn) / 3.5) + 1
+
+
+def _trim_history_to_budget(messages: list, sys_prompt: str, tool_schemas: list,
+                            cfg: dict) -> list:
+    """按上下文预算裁剪历史消息（保留最新的）。
+
+    token 账：num_ctx = 系统提示 + 工具定义 + 历史 + 本轮输出 + 检索材料。
+    系统提示/工具定义/检索材料都是"写死的开销"，唯一能压缩的就是历史，
+    所以这里从最旧的开始丢，直到装得下。
+    """
+    try:
+        ctx_limit = int(cfg.get("num_ctx") or 8192)
+        reserve_out = int(cfg.get("max_tokens") or 2048)
+    except Exception:
+        ctx_limit, reserve_out = 8192, 2048
+
+    import json as _json
+    overhead = (_est_tokens(sys_prompt)
+                + _est_tokens(_json.dumps(tool_schemas, ensure_ascii=False)))
+    # 联网时，工具结果（8 条检索结果 + 若干篇网页正文）会在工具循环里
+    # 追加进上下文，此时还不知道具体多大 —— 按实测约 3600 token 预留，
+    # 否则"历史 + 检索材料"一起会撑爆窗口，Ollama 直接截断提示词。
+    search_reserve = 3800 if cfg.get("web_enabled") else 0
+    budget = ctx_limit - reserve_out - overhead - search_reserve - 512
+    if budget <= 0:
+        # 连固定开销都快占满了：只带最近 2 条，别把提示词撑爆
+        return messages[-2:]
+
+    kept, used = [], 0
+    for m in reversed(messages):
+        if len(kept) >= MAX_CONTEXT_MESSAGES:
+            break
+        t = _est_tokens(m.get("content") or "")
+        if kept and used + t > budget:
+            break
+        kept.append(m)
+        used += t
+    kept.reverse()
+    return kept
+
+
 # 触发自动记忆的信号词：出现这些词说明用户可能透露了值得长期记住的信息。
 # 只在命中时才做后台提炼，避免每轮都多跑一次模型。
 _MEMORY_SIGNALS = (
@@ -451,7 +503,13 @@ class _SystemPrompt:
                     "不要编造实时数据。\n"
                 )
             )
-            + "调用工具后，根据工具返回结果继续作答。能直接完成的就动手，不要只建议。",
+            + "调用工具后，根据工具返回结果继续作答。能直接完成的就动手，不要只建议。\n"
+            "- **回答要有实质内容，不要只给结论**：\n"
+            "  · 涉及知识性/分析性的问题，一般写 300 字以上，用「小标题 + 分点」组织；\n"
+            "  · 把材料里的**具体信息**（名称、数字、时间、条款）写出来，不要笼统概括；\n"
+            "  · 单纯打招呼、确认、道谢这类寒暄则简短回一句即可，不要刻意拉长。\n"
+            "- 若检索到的材料足以支撑推断，可以给出**你自己的分析和见解**，\n"
+            "  但必须让用户分得清「材料里写的」和「你的推断」——后者要明说是推断。",
         ]
         # 长期记忆（WorkBuddy 画像 + 检索到的记忆，精简注入）
         if cfg.get("memory_enabled", True):
@@ -483,23 +541,37 @@ async def chat(req: ChatRequest):
     # 简单问题收紧生成长度：把"先思考很久"压到几秒（qwen3-vl 无法真正关闭思考）。
     # 但以下情况**绝不能**收紧，否则模型来不及输出工具调用或总结（表现为"思考中断、没有回答"）：
     #   - 有图片上下文（可能要微改）
-    #   - 联网模式已开启（要搜索 + 逐条引用来源，最耗 token）
+    #   - 联网模式已开启（要搜索 + 深度阅读 + 引用来源，最耗 token）
     web_on = bool(cfg.get("web_enabled"))
     simple_q = (_is_simple_question(last_user)
                 and not images and not _recent_image() and not web_on)
     if simple_q:
         cfg["max_tokens"] = min(int(cfg.get("max_tokens") or 2048), SIMPLE_MAX_TOKENS)
     elif web_on:
-        # 联网场景给足空间：附件搜索结果 + 逐条列出来源链接会占很多 token
+        # 联网场景给足空间：材料多、要求写得详细
         cfg["max_tokens"] = max(int(cfg.get("max_tokens") or 2048), WEB_MAX_TOKENS)
 
-    # 联网搜索（仅当开启且用户明确想搜索）
-    if cfg.get("web_enabled") and _wants_search(last_user):
-        web_ctx = web_tools.ask_internet_search(last_user, top_k=cfg.get("web_top_k", 4))
-        if web_ctx:
-            messages.append({"role": "system", "content": web_ctx})
-
+    # 系统提示与工具定义属于**固定开销**，和聊天历史抢同一个上下文窗口，
+    # 所以要先算出来，才能知道还剩多少空间给历史。
     sys_prompt = _SystemPrompt.build(last_user)
+    tool_schemas = tools.make_schemas(cfg.get("web_enabled", False))
+
+    # ---------- 上下文预算：按剩余空间裁剪历史 ----------
+    # 工具定义本身就有 3000~4500 token，系统提示约 1000；
+    # 联网时还要塞进"8 条结果 + 若干篇网页正文"，动辄上万 token。
+    # 不按预算裁剪的话很容易超过 num_ctx，Ollama 会**直接截断提示词**
+    # （模型可能看不到系统提示或本轮问题）→ 表现为回答莫名其妙或干脆没有。
+    messages = _trim_history_to_budget(messages, sys_prompt, tool_schemas, cfg)
+
+    # 联网搜索：以前这里会**预先**跑一次搜索并把结果塞进上下文，
+    # 但模型自己也会调用 web_search 工具 —— 两条路径重复执行，结果两批材料叠加，
+    # 极易撑爆上下文窗口（表现为"搜完了却没有回答"）。
+    # 而且预检索那批材料既没有相关性过滤，也没有深度阅读，质量更差。
+    # 现在改成只给一句**提醒**，真正的检索统一走 web_search 工具。
+    if cfg.get("web_enabled") and _wants_search(last_user):
+        messages.append({"role": "system", "content": (
+            "用户这句话看起来需要最新信息。请先调用 web_search 工具检索，"
+            "再基于检索结果作答；不要在未检索的情况下凭记忆回答时效性内容。")})
 
     async def gen():
         # 每轮对话的本地工作消息序列 = system + 用户历史
@@ -507,7 +579,6 @@ async def chat(req: ChatRequest):
         final_text = ""
         final_thinking = ""
         session = req.session_id or ""
-        tool_schemas = tools.make_schemas(cfg.get("web_enabled", False))
 
         # 空回答重试：qwen3-vl 的思考会吃掉大量 token，偶尔会「想完了但没来得及写正文」，
         # 表现为思考戛然而止、界面什么都没有。这种情况按上面配置重跑一次并加倍配额。
