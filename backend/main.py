@@ -94,6 +94,10 @@ SIMPLE_MAX_TOKENS = 512
 # token 消耗远高于普通问答。给少了就会出现"搜索完了但没输出回答"。
 WEB_MAX_TOKENS = 4096
 
+# 输出长度天花板：空回答重试时加倍，但不能无限涨
+# （上下文窗口还要留给提示词与历史，超出只会让 Ollama 截断提示词）
+MAX_TOKENS_CEILING = 8192
+
 # 送入模型的历史消息上限（约 20 轮）。更早的内容已保存在会话文件与长期记忆中，
 # 无需全部塞进上下文——否则推理越来越慢，且容易撑爆窗口。
 MAX_CONTEXT_MESSAGES = 40
@@ -115,6 +119,14 @@ def _auto_extract_memory(last_user: str, answer: str, model: str, cfg: dict) -> 
 
     长期记忆是"久远对话可被清理"的前提——要点沉淀下来后，
     老的聊天记录就可以安全裁剪或清除。
+
+    ⚠️ **num_ctx 必须与聊天保持一致**（因此这里直接复用 cfg）。
+    Ollama 只要发现 num_ctx 与已加载的不同，就会**卸载并重载模型**
+    （实测 5 秒左右），而且**重载会中断正在进行的生成**。
+    此前这里写死 4096 而聊天用 8192，导致：
+      聊天 → 后台记忆(4096，重载) → 用户再发消息(8192，又重载) → 生成被打断
+    表现就是「模型加载一半、思考一半、没有回答」。这个坑很容易踩，
+    新增任何模型调用时都要复用同一个 num_ctx。
     """
     try:
         prompt = (
@@ -123,9 +135,11 @@ def _auto_extract_memory(last_user: str, answer: str, model: str, cfg: dict) -> 
             "若没有值得长期记住的内容，只输出两个字：无\n\n"
             f"用户：{last_user}\n助手：{(answer or '')[:300]}"
         )
+        params = dict(cfg)
+        params["temperature"] = 0.2
+        params["max_tokens"] = 120          # 只要一小段要点，但 num_ctx 必须一致
         resp = client.chat([{"role": "user", "content": prompt}], model=model,
-                           stream=False,
-                           params={"temperature": 0.2, "num_ctx": 4096, "max_tokens": 120})
+                           stream=False, params=params)
         data = resp.json() if hasattr(resp, "json") else resp
         text = ((data.get("message") or {}).get("content") or "").strip()
         text = text.split("\n")[0].strip()
@@ -495,12 +509,19 @@ async def chat(req: ChatRequest):
         session = req.session_id or ""
         tool_schemas = tools.make_schemas(cfg.get("web_enabled", False))
 
+        # 空回答重试：qwen3-vl 的思考会吃掉大量 token，偶尔会「想完了但没来得及写正文」，
+        # 表现为思考戛然而止、界面什么都没有。这种情况按上面配置重跑一次并加倍配额。
+        # 注意：用独立的 gen_params 而不是改 cfg —— 在 gen() 里给 cfg 赋值会让它
+        # 变成局部变量，导致前面读取 cfg 时报 UnboundLocalError。
+        retried_empty = False
+        gen_params = dict(cfg)
+
         for _round in range(MAX_TOOL_ROUNDS):
             # 工具调用中间轮不再重复附图片
             attach_images = images if _round == 0 else None
             try:
                 resp = client.chat(working, model=model, stream=True,
-                                   images_base64=attach_images, params=cfg,
+                                   images_base64=attach_images, params=gen_params,
                                    tools=tool_schemas)
             except ollama_client.OllamaError as e:
                 yield json.dumps({"error": str(e)} | {"__end": True}) + "\n"
@@ -508,6 +529,7 @@ async def chat(req: ChatRequest):
 
             round_msg = {"content": "", "thinking": None, "model": model}
             tool_calls = None
+            done_reason = ""
             for line in resp.iter_lines(decode_unicode=False):
                 if not line:
                     continue
@@ -535,8 +557,32 @@ async def chat(req: ChatRequest):
                     tc = m.get("tool_calls")
                     if tc:
                         tool_calls = tc
+                # Ollama 在最终块里给 done_reason：
+                #   "stop"   = 正常结束
+                #   "length" = 撞到 num_predict 上限被截断（评测数正好等于配额）
+                # 这是判断"回答是否被思考吃光"的**可靠信号**，比猜正文长不长准得多。
+                if obj.get("done"):
+                    done_reason = obj.get("done_reason") or ""
 
             if not tool_calls:
+                # 被思考吃光配额：Ollama 明确告诉我们 done_reason=length，
+                # 说明撞到了 num_predict 上限。典型表现是"思考到一半就断、没有回答"
+                # （思考把配额用尽，正文一个字都没来得及写）。
+                # 这不是模型坏了，纯粹是配额给少了——加倍重试一次。
+                truncated = (done_reason == "length")
+                if truncated and not retried_empty:
+                    retried_empty = True
+                    boosted = max(int(gen_params.get("max_tokens") or 2048) * 2, 4096)
+                    gen_params["max_tokens"] = min(boosted, MAX_TOKENS_CEILING)
+                    yield json.dumps({"note": (
+                        "上一次生成被输出长度上限截断（思考占用过多），"
+                        "正在以更长的配额重试…")}) + "\n"
+                    continue
+                if truncated and not round_msg["content"].strip():
+                    # 重试后仍被思考吃光：如实告知，避免用户看到空白一脸茫然
+                    yield json.dumps({"note": (
+                        "回答被输出长度上限截断。可尝试把问题问得更具体，"
+                        "或在界面调大「最大生成长度」。")}) + "\n"
                 break  # 本轮无工具调用，得到最终答复
 
             # ---------- 执行工具（Agent loop）----------

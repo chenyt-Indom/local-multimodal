@@ -172,6 +172,13 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 .msg.bot .bubble { background: var(--panel2); border: 1px solid var(--border); }
 .msg.user .bubble { background: var(--accent); border-bottom-right-radius: 4px; }
 .msg .bubble.thinking { color: var(--muted); }
+/* 模型没输出正文（多为思考吃光输出配额）：给个醒目的提示，别留空气泡 */
+.msg .bubble.empty-answer {
+  color: var(--warn, #f0b95c);
+  border-color: #8a6120;
+  background: rgba(138, 97, 32, .12);
+  font-size: 13px;
+}
 
 /* ---------- 思考过程折叠面板 ---------- */
 .think-hdr {

@@ -58,12 +58,26 @@ class OllamaClient:
              images_base64: list | None = None, params: dict | None = None,
              tools: list | None = None):
         """发送对话。images_base64 为图片 base64 字符串列表（附加到最后一条 user 消息）。
-        tools 为函数调用 schema 列表，用于 Agent 工具循环。"""
+        tools 为函数调用 schema 列表，用于 Agent 工具循环。
+
+        ⚠️ **num_ctx 一律取全局配置，忽略调用方传入的值。**
+        Ollama 只要发现 num_ctx 与当前已加载的不同，就会**卸载并重载模型**
+        （实测约 5 秒），而且**重载会中断正在进行的生成**。
+        曾经因为后台记忆提取用了 4096、聊天用 8192，导致：
+          聊天 → 记忆(重载) → 用户再发消息(又重载) → 生成被打断
+        用户看到的就是「模型加载一半、思考一半、没有回答」。
+        与其要求每个调用点自觉对齐，不如在这里统一收口——多一个调用点
+        也不会再踩这个坑。num_predict / temperature 仍可按调用区分。
+        """
         payload = {"model": model, "messages": messages, "stream": stream}
         if params:
+            try:
+                fixed_ctx = int(config.load_config().get("num_ctx") or 8192)
+            except Exception:
+                fixed_ctx = int(params.get("num_ctx") or 8192)
             payload["options"] = {
                 "temperature": params.get("temperature"),
-                "num_ctx": params.get("num_ctx"),
+                "num_ctx": fixed_ctx,
                 "num_predict": params.get("max_tokens"),
             }
         if tools:

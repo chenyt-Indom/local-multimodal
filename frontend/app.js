@@ -665,6 +665,9 @@
     answerWrap.appendChild(answerBubble);
     messagesEl.appendChild(answerWrap);
     messagesEl.scrollTop = messagesEl.scrollHeight;
+    // 后端可能发来 note（例如"输出被长度上限截断，正在重试"），
+    // 收起来备用：万一最终没有正文，就把它显示出来，而不是留一个空气泡
+    const notes = [];
 
     let thinking = "", answer = "";
     // ---------- 思考过程平滑逐字播放 ----------
@@ -799,13 +802,21 @@
           }
           if (obj.tool_start) addToolChip(obj.tool_start.name);
           if (obj.ui) addMedia(obj.ui);
+          if (obj.note) { notes.push(obj.note); showToast(obj.note, "warn"); }
           if (obj.done) break;
         }
         messagesEl.scrollTop = messagesEl.scrollHeight;
       }
       finishThinking();
       answerBubble.textContent = answer;
-      if (!answer) { answerWrap.style.display = "none"; answer = "（模型未给出文字回答）"; }
+      if (!answer) {
+        // 别把空白气泡藏起来让用户一脸茫然——明确说明发生了什么
+        answerBubble.textContent = notes.length
+          ? "⚠️ " + notes[notes.length - 1]
+          : "⚠️ 模型这次没有输出内容，请再试一次或换个问法。";
+        answerBubble.classList.add("empty-answer");
+        answer = "";
+      }
       if (answer) history.push({ role: "assistant", content: answer });
       persistSession();   // 落盘，保证程序重启后能恢复这段对话
     } catch (err) {

@@ -36,21 +36,16 @@ def make_schemas(web_enabled: bool = False) -> list:
             "function": {
                 "name": "web_image_search",
                 "description": (
-                    "【联网搜图】到网上找**已经存在**的真实图片，并把原图展示给用户。\n"
-                    "★ 什么时候用它：用户说「找张……的图」「搜一下……图片」「……长什么样」"
-                    "「来点……壁纸/照片」「有没有……的图片」——即用户想要看真实存在的图片。\n"
-                    "★ 与 generate_image 的区别（务必分清）：\n"
-                    "  · web_image_search = 搜索互联网上已有的真实照片/图片，不绘制（找现成的）\n"
-                    "  · generate_image   = AI 从零画一张不存在的图（造新的）\n"
-                    "  例：「找一张埃菲尔铁塔的照片」→ 本工具；"
-                    "「画一只穿宇航服的柯基」→ generate_image。\n"
-                    "若用户说的是「画/生成/绘制」，用 generate_image，不要用本工具。"
+                    "【联网搜图】到网上找**已经存在**的真实图片并展示原图。\n"
+                    "用户说「找/搜/看看……的图」「……长什么样」「来点……壁纸」时用它。\n"
+                    "与 generate_image 的区别：本工具=找现成的真实图，不绘制；"
+                    "generate_image=AI 从零画。说「画/生成/绘制」时用 generate_image。"
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "搜索关键词，用中文或英文的名词短语，如「埃菲尔铁塔 照片」「橘猫 壁纸」"},
-                        "n": {"type": "integer", "description": "返回图片数量，默认 4，最多 6"},
+                        "query": {"type": "string", "description": "名词短语关键词，如「埃菲尔铁塔 照片」「橘猫 壁纸」"},
+                        "n": {"type": "integer", "description": "返回数量，默认 4，最多 6"},
                     },
                     "required": ["query"],
                 },
@@ -75,7 +70,7 @@ def make_schemas(web_enabled: bool = False) -> list:
             "type": "function",
             "function": {
                 "name": "generate_image",
-                "description": "根据描述生成一张图片（文生图）。prompt 必须写成详细、具体的英文（例如 a cute corgi wearing astronaut helmet, futuristic city background），不要用中文。生成后会直接在界面展示给用户。",
+                "description": "根据描述生成图片（文生图）。prompt 必须是详细具体的**英文**描述，生成后直接展示给用户。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -92,7 +87,7 @@ def make_schemas(web_enabled: bool = False) -> list:
             "type": "function",
             "function": {
                 "name": "edit_image",
-                "description": "对一张已存在的图片进行微改（图生图）。适用于用户给了/引用了一张图、希望局部修改，例如「把背景改成夜晚」「给猫戴上帽子」「换成红色」。source 可填本地图片路径；若用户本轮拖入一张图片要求微改，则不填 source，直接用该图片。prompt 用英文描述需要的修改，并尽量注明保持其他部分不变。",
+                "description": "对一张已有图片做局部微改（图生图），如「把背景改成夜晚」「戴上帽子」。source 填本地路径；若用户本轮拖入的图要微改则不填 source。prompt 用英文，并注明保持其他部分不变。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -131,7 +126,7 @@ def make_schemas(web_enabled: bool = False) -> list:
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "读取用户本机指定路径的文件内容（文本/代码/PDF等）。仅当用户给出本地文件路径、需要读取该文件时才调用。注意：图片/视频如果已经附在对话中（用户拖入/上传），直接用视觉能力观看即可，不要为看图调用本工具；若用户提供一个视频文件路径要分析内容，才用本工具抽帧。",
+                "description": "读取本机指定路径的文件（文本/代码/PDF）。仅当用户给出本地文件路径时用。图片/视频若已附在对话中，直接用视觉能力看，不要调用本工具。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -190,7 +185,7 @@ def make_schemas(web_enabled: bool = False) -> list:
             "type": "function",
             "function": {
                 "name": "remember",
-                "description": "把用户透露的稳定事实/偏好/重要信息写入长期记忆的文段。记忆按【分区文段】组织（如 工作背景/个人背景/当前关注/近期动态）。只有值得长期记住的稳定信息才调用；临时问答、寒暄、一次性指令不要存。每次调用需给出 section（分区标题）和本次要写入的这一分区的最新整段文字 content——请基于该分区已有内容 + 本轮新信息重写合并后的完整文段（若该分区此前无内容则直接写新文段）。",
+                "description": "把值得长期记住的稳定信息（身份/偏好/背景/约定）写入长期记忆，按【分区文段】组织。寒暄、临时问答、一次性指令不要存。content 需给出该分区**合并旧内容后的完整文段**。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -241,21 +236,19 @@ _WEATHER_SCHEMA = {
         "name": "get_weather",
         "description": (
             "查询某地天气（实时 + 未来逐日预报）。"
-            "**凡涉及天气的一律用这个工具，不要用 web_search** —— "
-            "搜索引擎对天气查询只会返回「XX天气预报_15天」这类网站导航页，"
-            "拿不到任何真实温度数值；本工具直接返回气温、降水概率、风速等数据。"
-            "支持中文城市名（含地级市、县市）。"
+            "**天气一律用这个，不要用 web_search**（搜索引擎只给天气网站导航页，没有数值）。"
+            "支持中文城市名。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "city": {
                     "type": "string",
-                    "description": "城市名，如「北京」「上海」「深圳」「乌鲁木齐」。可带省份消歧：「广东 深圳」。",
+                    "description": "城市名，如「北京」「上海」，可带省份消歧：「广东 深圳」。",
                 },
                 "days": {
                     "type": "integer",
-                    "description": "预报天数，默认 3（含今天）。最多 16 天。",
+                    "description": "预报天数，默认 3（含今天），最多 16 天。",
                 },
             },
             "required": ["city"],
@@ -270,15 +263,10 @@ _WEB_SEARCH_SCHEMA = {
     "function": {
         "name": "web_search",
         "description": (
-            "联网搜索互联网上的最新信息。凡是涉及**实时或最新信息**的问题都应主动调用，例如："
-            "最新新闻、时事热点、近期发生的事件、实时数据（股价/汇率/比分）、"
-            "你不确定或知识可能过时的内容、需要查证的事实、某个新产品/新版本的现状等。"
-            "调用时会真的联网检索并把网页摘要返回给你，你再据此总结成答案。"
-            "**注意：查天气请改用 get_weather 工具**（搜索引擎给不出真实温度数值）。"
-            "查某单位/机构的公开信息（性质、地址、招生、公开招聘、年报等）可配合下面两种写法："
-            "在关键词里带上机构**全称**效果最好（如「广州民航职业技术学院 招生章程」）；"
-            "想限定官方来源时可用 site: 语法（如「深圳大学 site:edu.cn」）。"
-            "注意：日常闲聊、写作、翻译、代码等不需要联网的任务不要调用。"
+            "联网搜索最新信息：新闻时事、近期事件、实时数据（股价/汇率/比分）、"
+            "不确定或可能过时的内容、需要查证的事实。会真的联网检索并返回网页摘要。"
+            "查天气请用 get_weather；查机构公开信息时关键词带上**机构全称**效果最好。"
+            "闲聊、写作、翻译、代码等无需联网的任务不要调用。"
         ),
         "parameters": {
             "type": "object",
@@ -286,12 +274,9 @@ _WEB_SEARCH_SCHEMA = {
                 "query": {
                     "type": "string",
                     "description": (
-                        "搜索关键词。**务必精炼**：用 2~4 个核心词，不要写成完整句子，"
-                        "也不要塞入具体年月日（加了反而容易被搜索引擎带偏，返回日历类无关结果）。"
-                        "**中文提问请优先用中文关键词搜索**（中文资料的召回明显更好），"
-                        "只有查国外产品/英文资料时才用英文。"
-                        "示例（好）：「人工智能 最新进展」「英伟达 股价」「广州民航职业技术学院」；"
-                        "示例（差）：「2026年9月人工智能领域有哪些重要进展」（太长且含日期）"
+                        "搜索关键词，2~4 个核心词，不要写成完整句子、不要塞年月日"
+                        "（会被带偏成日历类结果）。中文提问用中文关键词。"
+                        "限定官方来源可加 site:（如「深圳大学 招生章程 site:edu.cn」）。"
                     ),
                 },
                 "top_k": {
