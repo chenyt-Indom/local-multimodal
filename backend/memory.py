@@ -27,7 +27,9 @@ MEMORY_DOC_FILE = os.path.join(DATA_DIR, "memory_doc.json")
 TRANSCRIPT_DIR = os.path.join(DATA_DIR, "transcript")
 
 # 初始分区骨架（内容为空，出现相关信息时再填充 / 由 AI 创建）
-DEFAULT_SECTIONS = ["工作背景", "个人背景", "当前关注", "近期动态"]
+# 分区按"信息类型"划分，而不是笼统一个"当前关注"——
+# 混在一起写会让后写的要点覆盖先写的（文段是整体替换的）。
+DEFAULT_SECTIONS = ["身份信息", "工作背景", "偏好习惯", "重要约定", "当前项目", "近期动态"]
 
 _STOP_WORDS = set(
     "的 了 在 是 和 与 我 你 他 她 它 我们 你们 一 个 有 也 都 要 把 让 这 那 就 吗 呢 啊 吧 很 会 可以 请 帮 下 换 或 并 及 想 要 说 请".split())
@@ -90,6 +92,16 @@ def _load_doc() -> dict:
     elif isinstance(doc, list):  # 兼容旧格式
         doc = {"sections": doc, "updated_at": _now()}
     doc.setdefault("sections", [])
+
+    # 轻量迁移：补齐缺失的标准分区（老数据只有"工作背景/个人背景/当前关注/近期动态"）。
+    # 只**追加**缺失的分区，绝不改动或删除用户已有的分区与内容。
+    titles = {(s.get("title") or "") for s in doc["sections"]}
+    missing = [t for t in DEFAULT_SECTIONS if t not in titles]
+    if missing:
+        for t in missing:
+            doc["sections"].append({"id": _next_id(), "title": t, "content": "",
+                                    "created_at": _now(), "updated_at": _now()})
+        _save_doc(doc)
     return doc
 
 
@@ -186,12 +198,17 @@ def remember(section: str, content: str) -> dict:
 # =====================================================================
 #  注入上下文 & 检索
 # =====================================================================
-def build_context(query: str, top_k: int = 5, cap: int = 3000) -> str:
-    """拼装要注入 system prompt 的记忆：整份非空文段，精简、不膨胀（cap 字符上限）。"""
+def build_context(query: str, top_k: int = 5, cap: int = 4000) -> str:
+    """拼装要注入 system prompt 的记忆：整份非空文段，精简、不膨胀（cap 字符上限）。
+
+    上限从 3000 提到 4000：分区变细之后（身份/工作/偏好/约定/项目/动态），
+    3000 字符很容易在最后一个分区处被截断，导致"记了却没注入给模型"。
+    """
     sections = [s for s in get_sections() if (s.get("content") or "").strip()]
     if not sections:
         return ""
-    lines = ["【用户长期记忆（文段式）。新信息用 remember 工具更新对应文段；只记稳定的；临时问答不要写入。】"]
+    lines = ["【用户长期记忆（文段式）。这是你**已经知道**的用户信息，回答时直接用，"
+             "不要再问一遍；有新信息用 remember 工具更新对应文段（合并旧内容），只记稳定的。】"]
     total = 0
     for s in sections:
         block = f"【{s.get('title', '')}】\n{s.get('content', '').strip()}"

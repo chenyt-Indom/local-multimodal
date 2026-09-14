@@ -528,3 +528,43 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 .dev-fail { color: var(--danger); font-weight: 600; }
 .dev-sub { color: var(--muted); font-size: 11.5px; margin-top: 3px; word-break: break-word; }
 .dev-sub b { color: var(--text); }
+
+/* ---------- 内存占用面板 ---------- */
+.mem-usage {
+  margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px;
+}
+.mu-head {
+  display: flex; align-items: center; gap: 7px; cursor: pointer;
+  font-size: 13px; font-weight: 600; padding: 4px 2px; border-radius: 6px;
+}
+.mu-head:hover { background: rgba(255, 255, 255, .04); }
+.mu-caret { color: var(--muted); font-size: 11px; }
+.mu-total { margin-left: auto; color: var(--muted); font-weight: 400; font-size: 12px; }
+.mu-body { margin-top: 8px; }
+.mu-totals {
+  background: var(--panel2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 10px; margin-bottom: 8px;
+}
+.mu-row {
+  display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap;
+  font-size: 12px; padding: 3px 0; color: var(--muted);
+}
+.mu-row span { min-width: 72px; }
+.mu-row b { color: var(--text); }
+.mu-row em { font-style: normal; font-size: 11px; opacity: .8; }
+.mu-row.keep b { color: var(--green); }
+.mu-list { display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow-y: auto; }
+.mu-sess {
+  background: var(--panel2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 7px 9px;
+}
+.mu-sess-head { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.mu-sess-title {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mu-sess-size { color: var(--muted); font-size: 11px; flex: none; }
+.mu-sess-meta { color: var(--muted); font-size: 11px; margin: 3px 0 5px; }
+.mu-warn { color: #f0b95c; }
+.mu-free { font-size: 11px; padding: 3px 8px; }
+.mu-actions { display: flex; gap: 6px; margin-top: 9px; }
+.mu-note { margin-top: 6px; font-size: 11px; line-height: 1.5; }

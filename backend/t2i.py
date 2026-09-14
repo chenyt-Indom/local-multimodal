@@ -93,8 +93,11 @@ def _why_no_cuda(torch) -> str:
     ver = (getattr(torch, "__version__", "") or "")
     if "+cpu" in ver:
         return (f"当前环境装的是 CPU 版 torch（{ver}），它根本没有编译进 CUDA 支持，"
-                "任何情况下都用不了显卡。"
-                "Docker 部署需要用 CUDA 版重建镜像后再启动（见使用说明「启用显卡」一节）。")
+                "任何情况下都用不了显卡。Docker 部署要两件事同时做：\n"
+                "① 用 CUDA 版重建镜像（--build-arg TORCH_INDEX=…/cu124）；\n"
+                "② 用 GPU 编排启动，让容器能拿到显卡"
+                "（docker compose -f compose.yml -f compose.gpu.yml up -d）。\n"
+                "详见使用说明「显卡会自动适配」一节。")
     if getattr(torch, "version", None) and torch.version.cuda is None:
         return f"当前 torch（{ver}）不是 CUDA 编译版本，无法调用显卡。"
     cuda_ver = getattr(getattr(torch, "version", None), "cuda", None)
@@ -139,10 +142,16 @@ def _probe(device: str) -> tuple:
 def set_device(mode: str) -> dict:
     """切换绘图设备，**切换前先校验、切换后做真实加载**。
 
+    支持三种选择：
+      auto —— 让程序自己判断（默认；有可用显卡就用显卡）
+      gpu  —— 强制显卡
+      cpu  —— 强制 CPU
+
     流程：
       1. 在目标设备上跑一次真实运算 —— 不通过就当场拒绝，保持原状；
-      2. 通过则记下选择、丢弃已加载的流水线（设备变了旧流水线不能用）；
-      3. 真把绘图流水线加载到新设备上 —— 这一步才是"确实能跑"的证明；
+      2. 记下选择；**只有设备确实变了**才丢弃已加载的流水线并重新加载
+         （否则改个 auto↔gpu 这种等价选择，不该白白等十几秒）；
+      3. 真把绘图流水线加载到新设备上 —— 这一步才是"确实能跑"的证明。
          模型文件缺失时退化为"仅设备可用"并如实说明。
 
     返回统一结构，字段含义见 device_info()。
@@ -150,14 +159,34 @@ def set_device(mode: str) -> dict:
     global _forced_device, _pipe, _edit_pipe, _device
 
     mode = (mode or "").strip().lower()
-    if mode not in ("cpu", "gpu"):
+    if mode not in ("auto", "cpu", "gpu"):
         cur = device_info()
         return {"ok": False, "requested": mode, "mode": cur["kind"],
                 "device": cur["device"], "gpu": cur["gpu"], "torch": cur["torch"],
                 "verified": False,
-                "reason": f"不支持的模式「{mode}」，只能是 cpu 或 gpu"}
+                "reason": f"不支持的模式「{mode}」，只能是 auto / cpu / gpu"}
 
-    target = "cuda" if mode == "gpu" else "cpu"
+    import torch
+    if mode == "auto":
+        target = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        target = "cuda" if mode == "gpu" else "cpu"
+
+    # 目标设备与当前已加载的一致 → 不必重载引擎，直接确认即可。
+    # 判断依据只看**实际设备**，不看选择：在「自动」和「GPU」之间来回点、
+    # 实际都是 GPU 时，不该白白等十几秒重新加载。
+    if _pipe is not None and _device == target:
+        try:
+            cfg = config.load_config()
+            cfg["t2i_device"] = mode
+            config.save_config(cfg)
+        except Exception:
+            pass
+        _forced_device = mode
+        info = device_info()
+        info.update({"ok": True, "requested": mode, "verified": True,
+                     "verify_note": f"设备未变化（仍为 {target}），沿用已加载的绘图引擎"})
+        return info
 
     # ---- 第一步：设备自身能不能算 ----
     ok, why = _probe(target)

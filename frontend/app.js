@@ -479,8 +479,113 @@
   };
   $("#memRefresh").onclick = loadMemory;
   $("#memClearAll").onclick = async () => {
-    if (confirm("确认清空全部记忆文段？")) { await api("/api/memory", { method: "DELETE" }); loadMemory(); }
+    if (confirm("确认清空全部记忆文段？此操作不可撤销。")) {
+      await api("/api/memory", { method: "DELETE" });
+      loadMemory();
+    }
   };
+
+  // ---------- 内存占用：看清占在哪 + 一键释放 ----------
+  // 设计原则：**释放只动对话记录与归档，长期记忆一律保留**。
+  // 用户最怕的是"清理的时候把有用的记忆也清了"，所以界面上要反复讲清楚这一点。
+  function fmtBytes(n) {
+    n = Number(n || 0);
+    if (n < 1024) return n + " B";
+    if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
+    if (n < 1073741824) return (n / 1048576).toFixed(1) + " MB";
+    return (n / 1073741824).toFixed(2) + " GB";
+  }
+  function fmtTokens(n) {
+    n = Number(n || 0);
+    return n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
+  }
+
+  async function loadMemoryUsage() {
+    const list = $("#muList"), totals = $("#muTotals"), total = $("#muTotal");
+    if (!list) return;
+    try {
+      const d = await api("/api/memory/usage");
+      if (!d.ok) return;
+      const t = d.totals || {};
+      total.textContent = fmtBytes(t.disk_bytes);
+      totals.innerHTML =
+        `<div class="mu-row"><span>对话记录</span><b>${fmtBytes(t.sessions_bytes)}</b>`
+        + `<em>${t.session_count} 个对话 · ${t.message_count} 条消息</em></div>`
+        + `<div class="mu-row"><span>归档底稿</span><b>${fmtBytes(t.transcript_bytes)}</b>`
+        + `<em>${t.transcript_files} 个文件（可安全释放）</em></div>`
+        + `<div class="mu-row keep"><span>🧠 长期记忆</span><b>${fmtBytes(t.memory_bytes)}</b>`
+        + `<em>${t.memory_used_sections}/${t.memory_sections} 个分区有内容（始终保留）</em></div>`
+        + (t.rss_bytes
+            ? `<div class="mu-row"><span>运行内存</span><b>${fmtBytes(t.rss_bytes)}</b><em>应用进程常驻内存</em></div>`
+            : "");
+
+      const items = d.sessions || [];
+      if (!items.length) {
+        list.innerHTML = '<p class="hint">暂无对话记录。</p>';
+      } else {
+        list.innerHTML = "";
+        items.slice(0, 12).forEach((s) => {
+          const row = document.createElement("div");
+          row.className = "mu-sess";
+          const full = s.messages >= (t.context_messages || 80);
+          row.innerHTML = `<div class="mu-sess-head">
+              <span class="mu-sess-title"></span>
+              <span class="mu-sess-size">${fmtBytes(s.bytes)}</span>
+            </div>
+            <div class="mu-sess-meta">${s.messages} 条 · 约 ${fmtTokens(s.tokens)} token`
+            + `${full ? ' · <span class="mu-warn">已达上下文上限，早期内容靠摘要保留</span>' : ''}</div>
+            <button class="btn sm ghost mu-free">释放此对话历史</button>`;
+          row.querySelector(".mu-sess-title").textContent = s.title || s.id;
+          row.querySelector(".mu-free").onclick = async (ev) => {
+            ev.stopPropagation();
+            if (!confirm(`释放「${s.title || s.id}」的对话记录？\n\n`
+                       + "长期记忆与偏好不受影响。")) return;
+            const r = await api("/api/memory/release", {
+              method: "POST",
+              body: JSON.stringify({ scope: "session", session_id: s.id }),
+            });
+            showToast(r.ok ? `已释放 ${fmtBytes(r.freed_bytes)}` : "释放失败",
+                      r.ok ? "ok" : "warn");
+            loadMemoryUsage();
+          };
+          list.appendChild(row);
+        });
+      }
+    } catch (e) { /* 忽略：面板不可用不影响其它功能 */ }
+  }
+
+  (function bindMemUsage() {
+    const head = $("#muToggle"), body = $("#muBody");
+    if (!head || !body) return;
+    head.onclick = () => {
+      body.hidden = !body.hidden;
+      head.querySelector(".mu-caret").textContent = body.hidden ? "▸" : "▾";
+      head.classList.toggle("open", !body.hidden);
+      if (!body.hidden) loadMemoryUsage();
+    };
+    const rf = $("#muRefresh");
+    if (rf) rf.onclick = (e) => { e.stopPropagation(); loadMemoryUsage(); };
+    const rl = $("#muRelease");
+    if (rl) rl.onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm("释放缓存占用？\n\n"
+                 + "· 会清理：归档底稿、几乎没用过的空会话、过长对话的早期记录\n"
+                 + "· 不会动：长期记忆（分区文段）、你的偏好与约定")) return;
+      rl.disabled = true;
+      try {
+        const r = await api("/api/memory/release",
+                            { method: "POST", body: JSON.stringify({ scope: "auto" }) });
+        if (r.ok) {
+          showToast(`已释放 ${fmtBytes(r.freed_bytes)}，长期记忆已保留`, "ok");
+        } else {
+          showToast(r.reason || "释放失败", "warn");
+        }
+        loadMemoryUsage();
+      } finally {
+        rl.disabled = false;
+      }
+    };
+  })();
 
   // ---------- 附件：图片 / 视频 ----------
   $("#attachBtn").onclick = () => $("#fileInput").click();
@@ -1012,12 +1117,22 @@
     badge.classList.toggle("gpu", kind === "gpu");
   }
 
-  function markDeviceOptions(kind) {
-    ["gpu", "cpu"].forEach((m) => {
-      const el = $("#" + (m === "gpu" ? "devStateGpu" : "devStateCpu"));
-      if (el) el.textContent = (m === kind) ? "当前" : "";
+  // 标记哪一项是"当前选择"：forced 是用户的选择（auto/cpu/gpu），
+  // kind 是实际生效的设备（cpu/gpu）。两者要分开显示，
+  // 否则"自动 → 实际 GPU"会被误标成"手动选了 GPU"。
+  const MODE_LABEL = { auto: "自动（推荐）", gpu: "GPU 加速", cpu: "CPU 模式" };
+
+  function markDeviceOptions(forced, kind) {
+    ["auto", "gpu", "cpu"].forEach((m) => {
+      const el = $("#devState" + m.charAt(0).toUpperCase() + m.slice(1));
+      if (el) {
+        // 「自动」选中时补一句实际用的是什么，避免用户猜
+        el.textContent = (m === forced)
+          ? (m === "auto" ? "当前·" + (kind === "gpu" ? "GPU" : "CPU") : "当前")
+          : "";
+      }
       const btn = document.querySelector(`.dev-opt[data-mode="${m}"]`);
-      if (btn) btn.classList.toggle("active", m === kind);
+      if (btn) btn.classList.toggle("active", m === forced);
     });
   }
 
@@ -1035,11 +1150,12 @@
     try {
       const d = await api("/api/t2i/capability");
       renderDeviceBadge(d.kind, d.gpu);
-      markDeviceOptions(d.kind);
+      markDeviceOptions(d.forced || "auto", d.kind);
       badge.title = (d.kind === "gpu"
         ? `绘图使用显卡加速：${d.gpu || "未知型号"}`
         : `绘图使用 CPU，单张约 20 秒`)
         + `\ntorch ${d.torch || "?"}`
+        + `\n选择：${MODE_LABEL[d.forced] || d.forced}`
         + (d.reason ? `\n${d.reason}` : "")
         + "\n点击可切换设备";
       badge.classList.remove("loading");
@@ -1054,8 +1170,8 @@
     deviceSwitching = true;
     const badge = $("#deviceBadge");
     badge.classList.add("loading");
-    const label = mode === "gpu" ? "GPU 加速" : "CPU 模式";
-    setDeviceStatus(`⏳ 正在切换到 ${label}，并在该设备上实际加载绘图引擎校验…`, "busy");
+    const label = MODE_LABEL[mode] || mode;
+    setDeviceStatus(`⏳ 正在切换到「${label}」，并校验设备可用性…`, "busy");
     try {
       const r = await api("/api/t2i/device", {
         method: "POST",
@@ -1063,24 +1179,24 @@
       });
       if (r.ok) {
         renderDeviceBadge(r.mode, r.gpu);
-        markDeviceOptions(r.mode);
+        markDeviceOptions(r.forced || mode, r.mode);
         const extra = r.note ? `<div class="dev-sub">${r.note}</div>` : "";
         setDeviceStatus(
-          `<div class="dev-ok">✅ 已成功切换到 ${r.mode === "gpu" ? "GPU 加速" : "CPU 模式"}`
-          + `${r.gpu ? "（" + r.gpu + "）" : ""}</div>`
-          + `<div class="dev-sub">绘图引擎已在目标设备上加载成功`
-          + `${r.torch ? "　torch " + r.torch : ""}</div>` + extra, "ok");
-        showToast(`设备已切换：${r.mode === "gpu" ? "GPU 加速" : "CPU 模式"}`, "ok");
+          `<div class="dev-ok">✅ 已切换到「${label}」</div>`
+          + `<div class="dev-sub">绘图实际使用：<b>`
+          + `${r.mode === "gpu" ? "GPU 加速" : "CPU 模式"}`
+          + `${r.gpu ? "（" + r.gpu + "）" : ""}</b>　已通过运行校验</div>` + extra,
+          "ok");
+        showToast(`设备已切换：${label}`, "ok");
       } else {
-        // 失败：把「当前是什么模式」和「为什么失败」都摆出来
         const cur = r.mode === "gpu" ? "GPU 加速" : "CPU 模式";
         setDeviceStatus(
-          `<div class="dev-fail">❌ 切换到 ${label} 失败</div>`
+          `<div class="dev-fail">❌ 切换到「${label}」失败</div>`
           + `<div class="dev-sub">当前仍是：<b>${cur}</b></div>`
           + `<div class="dev-sub">失败原因：${r.reason || "未知"}</div>`, "fail");
-        markDeviceOptions(r.mode);
+        markDeviceOptions(r.forced || r.mode, r.mode);
         renderDeviceBadge(r.mode, r.gpu);
-        showToast(`切换到 ${label} 失败，当前为 ${cur}`, "warn");
+        showToast(`切换到「${label}」失败，当前为 ${cur}`, "warn");
       }
     } catch (e) {
       setDeviceStatus(`<div class="dev-fail">❌ 切换失败：${e.message || e}</div>`, "fail");

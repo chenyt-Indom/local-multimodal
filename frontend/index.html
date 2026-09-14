@@ -50,9 +50,9 @@
     <!-- 抱负操作无需按钮：直接对话驱动 -->
     <section class="panel memory" id="memoryPanel">
       <h2>🧠 记忆库 · 文段式</h2>
-      <p class="hint">记忆按分区文段整体维护（如 工作背景 / 个人背景 / 当前关注 / 近期动态）。AI 会自动更新补充；你也可直接编辑、删除、新增文段。</p>
+      <p class="hint">记忆按分区文段整体维护（身份信息 / 工作背景 / 偏好习惯 / 重要约定 / 当前项目 / 近期动态）。AI 会自动更新补充；你也可直接编辑、删除、新增文段。</p>
       <div class="row">
-        <input type="text" id="secTitleInput" placeholder="新分区标题，如 工作背景" />
+        <input type="text" id="secTitleInput" placeholder="新分区标题，如 偏好习惯" />
         <button class="btn sm" id="secAdd">＋ 新增</button>
       </div>
       <div class="mini-toolbar">
@@ -61,6 +61,24 @@
       </div>
       <div class="list" id="memoryList">
         <p class="hint">暂无记忆文段。AI 会在对话中按"分区文段"自动写入，也可手动新增。</p>
+      </div>
+
+      <!-- 内存占用：看清是哪块在占地方，并一键释放（长期记忆始终保留） -->
+      <div class="mem-usage" id="memUsage">
+        <div class="mu-head" id="muToggle">
+          <span class="mu-caret">▸</span>
+          <span>💾 内存占用</span>
+          <span class="mu-total" id="muTotal">—</span>
+        </div>
+        <div class="mu-body" id="muBody" hidden>
+          <div class="mu-totals" id="muTotals"></div>
+          <div class="mu-list" id="muList"></div>
+          <div class="mu-actions">
+            <button class="btn sm" id="muRelease">🧹 一键释放</button>
+            <button class="btn sm ghost" id="muRefresh">刷新</button>
+          </div>
+          <p class="hint mu-note">释放只清理**对话记录与归档**，长期记忆（上面的分区文段）一律保留。</p>
+        </div>
       </div>
     </section>
   </aside>
@@ -78,6 +96,11 @@
         </button>
         <div class="device-menu" id="deviceMenu" hidden>
           <div class="dev-title">绘图计算设备</div>
+          <button class="dev-opt" data-mode="auto">
+            <span class="dev-ico">🔍</span>
+            <span class="dev-name">自动（推荐）</span>
+            <span class="dev-state" id="devStateAuto"></span>
+          </button>
           <button class="dev-opt" data-mode="gpu">
             <span class="dev-ico">⚡</span>
             <span class="dev-name">GPU 加速</span>

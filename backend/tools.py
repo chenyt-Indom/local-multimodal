@@ -186,7 +186,7 @@ def make_schemas(web_enabled: bool = False) -> list:
             "type": "function",
             "function": {
                 "name": "remember",
-                "description": "把值得长期记住的稳定信息（身份/偏好/背景/约定）写入长期记忆，按【分区文段】组织。寒暄、临时问答、一次性指令不要存。content 需给出该分区**合并旧内容后的完整文段**。",
+                "description": "把值得长期记住的稳定信息（身份/偏好/约定/项目）写入长期记忆，按【分区文段】组织。分区建议用：身份信息 / 工作背景 / 偏好习惯 / 重要约定 / 当前项目 / 近期动态。寒暄、临时问答、一次性指令不要存。content 必须是该分区**合并旧内容后的完整文段**——把旧文段和新信息一起重写，只写新增部分会覆盖掉原有记忆。",
                 "parameters": {
                     "type": "object",
                     "properties": {

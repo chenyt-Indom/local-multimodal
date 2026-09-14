@@ -4,14 +4,25 @@
 #
 # 构建（上下文为包内的 build 目录）：
 #   docker build -f docker/Dockerfile.app -t local-multimodal-app:latest .
-# 绘图想走显卡（体积更大）：
+# 绘图想走显卡（体积会大很多，约 3~4 GB）：
 #   docker build -f docker/Dockerfile.app \
-#     --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu124 \
+#     --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu130 \
 #     -t local-multimodal-app:latest .
+#
+# ⚠️ CUDA 版本怎么选（实测踩过坑）：
+#   torch 轮子是按 GPU **算力架构**编译的，选错了会在推理时报
+#   "no kernel image is available for execution on the device"。
+#     · RTX 50 系（Blackwell，sm_120）→ 必须 cu128 及以上，**cu124 不行**，用 cu130
+#     · RTX 40 系（Ada，sm_89）/ 30 系（Ampere，sm_86）→ cu124 / cu128 均可
+#   不确定就用 cu130（向下兼容较老的架构）。
 FROM python:3.12-slim
 
-# torch 来源：默认 CPU 版（任何机器都能跑）；可换成 cu124 走 NVIDIA 显卡
+# torch 来源：默认 CPU 版（任何机器都能跑）；可换成 cu130 走 NVIDIA 显卡
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cpu
+# 固定 torch / torchvision 版本，保证 CPU 版与 CUDA 版**除后端外完全一致**，
+# 避免因版本漂移引入 diffusers / transformers 的兼容问题。
+ARG TORCH_VER=2.14.0
+ARG TORCHVISION_VER=0.29.0
 # pip 源，默认官方；国内可传 --build-arg PIP_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG PIP_INDEX=https://pypi.org/simple
 
@@ -41,7 +52,8 @@ RUN pip install --index-url "${PIP_INDEX}" -r requirements-app.txt
 #   "operator torchvision::nms does not exist"，进而让 transformers / diffusers
 #   在 import 阶段就崩 —— 表现为「图片微改 / 文生图 引擎加载失败」。
 # 把这一对先装好，后面 pip 会认为依赖已满足，不会再把它们换掉。
-RUN pip install --index-url ${TORCH_INDEX} torch torchvision
+RUN pip install --index-url ${TORCH_INDEX} \
+        "torch==${TORCH_VER}" "torchvision==${TORCHVISION_VER}"
 COPY docker/requirements-image.txt ./
 RUN pip install --index-url "${PIP_INDEX}" -r requirements-image.txt
 
