@@ -53,6 +53,172 @@ _edit_pipe = None       # 图生图（img2img 微改）流水线
 _upscaler = None        # 超分网络（RealESRGAN）
 _lock = threading.Lock()
 
+# 用户手动指定的绘图设备："auto" / "cpu" / "gpu"
+# 前端右上角的「CPU 模式 / GPU 加速」徽标点一下就能改这个值。
+_forced_device = None
+
+
+def _get_forced() -> str:
+    """读取用户选择（缓存首次读到的值，之后以内存为准）。"""
+    global _forced_device
+    if _forced_device is None:
+        try:
+            v = (config.load_config().get("t2i_device") or "auto").lower()
+        except Exception:
+            v = "auto"
+        _forced_device = v if v in ("auto", "cpu", "gpu") else "auto"
+    return _forced_device
+
+
+def _pick_device(torch) -> str:
+    """决定实际使用的设备。
+
+    强制了 gpu 但显卡不可用时**回落到 cpu**（而不是抛异常让绘图整个不可用）——
+    切换接口在切之前已经拒绝过这种情况，所以正常流程不会走到这里；
+    这里只是兜底，避免配置被手工改坏后整个功能挂掉。
+    """
+    forced = _get_forced()
+    if forced == "cpu":
+        return "cpu"
+    if forced == "gpu":
+        try:
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            return "cpu"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _why_no_cuda(torch) -> str:
+    """把"为什么用不了显卡"说清楚 —— 用户最需要的就是这句话。"""
+    ver = (getattr(torch, "__version__", "") or "")
+    if "+cpu" in ver:
+        return (f"当前环境装的是 CPU 版 torch（{ver}），它根本没有编译进 CUDA 支持，"
+                "任何情况下都用不了显卡。"
+                "Docker 部署需要用 CUDA 版重建镜像后再启动（见使用说明「启用显卡」一节）。")
+    if getattr(torch, "version", None) and torch.version.cuda is None:
+        return f"当前 torch（{ver}）不是 CUDA 编译版本，无法调用显卡。"
+    cuda_ver = getattr(getattr(torch, "version", None), "cuda", None)
+    try:
+        n = int(torch.cuda.device_count())
+    except Exception:
+        n = 0
+    if n == 0:
+        return (f"torch 是 CUDA 版（CUDA {cuda_ver}），但检测不到任何显卡设备。"
+                "若在 Docker 里运行，多半是容器没有拿到显卡，"
+                "需要用 GPU 编排启动：docker compose -f compose.yml -f compose.gpu.yml up -d")
+    return "未检测到可用的 CUDA 设备。"
+
+
+def _probe(device: str) -> tuple:
+    """在目标设备上跑一次**真实矩阵运算**，确认它真能算。
+
+    只查 torch.cuda.is_available() 是不够的 —— 那个为 True 但一算就崩
+    （显存被占满、驱动版本不匹配、容器透传不完整）的情况相当常见。
+    返回 (是否可用, 失败原因)。
+    """
+    import torch
+    try:
+        if device == "cuda":
+            if not torch.cuda.is_available():
+                return False, _why_no_cuda(torch)
+            t = torch.randn(128, 128, device="cuda")
+            val = float((t @ t).sum().item())
+            torch.cuda.synchronize()
+            if val != val:          # NaN
+                return False, "显卡运算返回了异常结果（NaN），设备可能不稳定"
+        else:
+            t = torch.randn(128, 128)
+            val = float((t @ t).sum().item())
+            if val != val:
+                return False, "CPU 运算返回了异常结果"
+        return True, ""
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def set_device(mode: str) -> dict:
+    """切换绘图设备，**切换前先校验、切换后做真实加载**。
+
+    流程：
+      1. 在目标设备上跑一次真实运算 —— 不通过就当场拒绝，保持原状；
+      2. 通过则记下选择、丢弃已加载的流水线（设备变了旧流水线不能用）；
+      3. 真把绘图流水线加载到新设备上 —— 这一步才是"确实能跑"的证明；
+         模型文件缺失时退化为"仅设备可用"并如实说明。
+
+    返回统一结构，字段含义见 device_info()。
+    """
+    global _forced_device, _pipe, _edit_pipe, _device
+
+    mode = (mode or "").strip().lower()
+    if mode not in ("cpu", "gpu"):
+        cur = device_info()
+        return {"ok": False, "requested": mode, "mode": cur["kind"],
+                "device": cur["device"], "gpu": cur["gpu"], "torch": cur["torch"],
+                "verified": False,
+                "reason": f"不支持的模式「{mode}」，只能是 cpu 或 gpu"}
+
+    target = "cuda" if mode == "gpu" else "cpu"
+
+    # ---- 第一步：设备自身能不能算 ----
+    ok, why = _probe(target)
+    if not ok:
+        cur = device_info()
+        return {"ok": False, "requested": mode, "mode": cur["kind"],
+                "device": cur["device"], "gpu": cur["gpu"], "torch": cur["torch"],
+                "verified": False, "reason": why}
+
+    # ---- 第二步：记下选择并丢弃旧流水线（设备变了，旧的必须重载）----
+    try:
+        cfg = config.load_config()
+        cfg["t2i_device"] = mode
+        config.save_config(cfg)
+    except Exception:
+        pass      # 落盘失败不影响本次切换，只是重启后会回到上次的值
+    _forced_device = mode
+    with _lock:
+        _pipe = None
+        _device = None
+        _edit_pipe = None
+
+    # ---- 第三步：真把流水线加载到新设备上 ----
+    # 这才是"确实能跑"的证据：设备可用不代表这个模型能装上去
+    # （显存不够、权重精度不兼容都会在这步炸）。
+    verified, verify_note = True, ""
+    model_ready = (os.path.isdir(LOCAL_MODEL_DIR)
+                   and os.path.exists(os.path.join(LOCAL_MODEL_DIR, "model_index.json")))
+    if model_ready:
+        try:
+            pipe, dev = _get_pipe()
+            if dev != target:
+                verified, verify_note = False, (
+                    f"流水线实际加载到了 {dev}，与目标的 {target} 不一致")
+        except Exception as e:
+            _log_exc(f"切换设备后加载绘图引擎（{mode}）", e)
+            verified, verify_note = False, f"绘图引擎在 {target} 上加载失败：{e}"
+    else:
+        verify_note = "绘图模型未安装，本次只校验了设备本身是否可用"
+
+    info = device_info()
+    info.update({"ok": verified, "requested": mode, "verified": verified,
+                 "verify_note": verify_note})
+    if not verified:
+        # 加载失败：把选择退回自动，避免之后每次绘图都撞同一个错
+        try:
+            cfg = config.load_config()
+            cfg["t2i_device"] = "auto"
+            config.save_config(cfg)
+        except Exception:
+            pass
+        _forced_device = "auto"
+        with _lock:
+            _pipe = None
+            _device = None
+            _edit_pipe = None
+        info["reason"] = verify_note
+        cur = device_info()
+        info.update({"mode": cur["kind"], "device": cur["device"], "gpu": cur["gpu"]})
+    return info
+
 
 def _log_exc(where: str, exc: Exception) -> None:
     """把异常完整堆栈写入日志文件（界面只显示简短信息，详情查日志）。"""
@@ -72,8 +238,8 @@ def _load_pipe():
     import torch
     from diffusers import AutoPipelineForText2Image
 
-    # 本机有无 CUDA：RTX 5070 Ti 应可用
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # 设备选择：用户在界面上手动切过就听用户的，否则自动探测
+    device = _pick_device(torch)
     # 精度必须跟着设备走：CPU 上用 float16 无法推理（diffusers 会直接警告并失败）。
     # 而本机模型目录（ModelScope 下载）常常只含 fp16 权重（unet 尤其），
     # 必须传 variant="fp16" 才能取到文件 —— 所以通用组合是
@@ -180,29 +346,47 @@ def device_info() -> dict:
     """当前绘图会用什么设备（不加载模型，仅探测）。
 
     文生图与图片微改共用同一个 torch 环境，因此两者设备一致。
-    容器默认镜像是 CPU 版 torch → cpu；源码运行若装了 CUDA 版则 → cuda。
+    返回字段：
+      kind/device  —— 实际会用到的（cpu / gpu、cpu / cuda）
+      gpu          —— 显卡型号（有的话）
+      torch        —— torch 版本
+      forced       —— 用户的选择：auto / cpu / gpu
+      note         —— 一句话说明现状
+      reason       —— **用不了显卡时的具体原因**（前端切换失败要展示它）
+      can_gpu      —— 显卡当前是否真的可用
     """
     info = {"device": "cpu", "kind": "cpu", "gpu": None, "torch": None,
-            "cuda_available": False, "note": ""}
+            "cuda_available": False, "note": "", "reason": "",
+            "forced": "auto", "can_gpu": False}
+    try:
+        info["forced"] = _get_forced()
+    except Exception:
+        pass
     try:
         import torch
         info["torch"] = torch.__version__
         info["cuda_available"] = bool(torch.cuda.is_available())
         if info["cuda_available"]:
-            info["device"] = "cuda"
-            info["kind"] = "gpu"
             try:
                 info["gpu"] = torch.cuda.get_device_name(0)
             except Exception:
                 info["gpu"] = None
+            info["can_gpu"] = True
+        # 下面反映的是「用户选择 + 实际能力」共同决定的结果。
+        # 选了 cpu 就老老实实说 cpu，哪怕机器上有显卡。
+        if info["forced"] == "cpu":
+            info["device"], info["kind"] = "cpu", "cpu"
+            info["note"] = "已锁定为 CPU 模式" + (
+                "（本机其实有可用显卡，切换即可加速）" if info["cuda_available"] else "")
+        elif info["cuda_available"]:
+            info["device"], info["kind"] = "cuda", "gpu"
+            info["note"] = "使用显卡加速"
         else:
-            # 区分「没显卡」和「装了 CPU 版 torch」——后者换镜像即可提速
-            if "+cpu" in (torch.__version__ or ""):
-                info["note"] = "当前是 CPU 版 torch，有显卡可换 CUDA 版镜像提速"
-            else:
-                info["note"] = "未检测到可用的 CUDA 设备"
+            info["reason"] = _why_no_cuda(torch)
+            info["note"] = info["reason"]
     except Exception as e:
         info["note"] = f"torch 不可用：{e}"
+        info["reason"] = info["note"]
     return info
 
 

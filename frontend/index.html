@@ -71,7 +71,26 @@
       <button class="icon-btn" id="toggleSidebar">☰</button>
       <h2>智能体对话</h2>
       <span class="privacy">🤖 自主规划 · 调用工具 · 完全本地</span>
-      <span class="privacy" id="deviceBadge" title="绘图（文生图 / 图片微改）使用的计算设备"></span>
+      <!-- 计算设备徽标：点一下即可切换 CPU / GPU，切换后会做真实校验 -->
+      <div class="device-wrap">
+        <button class="device-badge" id="deviceBadge" title="绘图（文生图 / 图片微改）使用的计算设备，点击切换">
+          <span id="deviceBadgeText">设备检测中…</span><span class="dev-caret">▾</span>
+        </button>
+        <div class="device-menu" id="deviceMenu" hidden>
+          <div class="dev-title">绘图计算设备</div>
+          <button class="dev-opt" data-mode="gpu">
+            <span class="dev-ico">⚡</span>
+            <span class="dev-name">GPU 加速</span>
+            <span class="dev-state" id="devStateGpu"></span>
+          </button>
+          <button class="dev-opt" data-mode="cpu">
+            <span class="dev-ico">🖥</span>
+            <span class="dev-name">CPU 模式</span>
+            <span class="dev-state" id="devStateCpu"></span>
+          </button>
+          <div class="dev-status" id="deviceStatus" hidden></div>
+        </div>
+      </div>
     </header>
 
     <!-- 顶部正中：能力开关（极简，仅开关，无复杂输入） -->

@@ -883,7 +883,38 @@ def t2i_capability():
     dev = t2i.device_info()
     return {"ok": True, "hd_available": t2i.available_upscale(),
             "device": dev["device"], "kind": dev["kind"], "gpu": dev["gpu"],
-            "torch": dev["torch"], "note": dev["note"]}
+            "torch": dev["torch"], "note": dev["note"],
+            "forced": dev.get("forced", "auto"),
+            "can_gpu": dev.get("can_gpu", False),
+            "reason": dev.get("reason", "")}
+
+
+@app.post("/api/t2i/device")
+def t2i_set_device(body: dict):
+    """切换绘图设备（CPU / GPU）。
+
+    切换会**先校验设备能否真的运算**，再把绘图引擎实际加载到目标设备上；
+    两步都通过才算成功。失败时保持原状并返回当前模式与具体原因 ——
+    绝不"假装切换成功"、等到绘图时才报错。
+    """
+    mode = (body or {}).get("mode", "")
+    result = t2i.set_device(mode)
+    if not result.get("ok"):
+        # 失败也返回 200：这是"操作结果"而不是接口错误，
+        # 前端需要结构化的 reason 才能把原因讲清楚。
+        return {"ok": False, "mode": result.get("mode", "cpu"),
+                "device": result.get("device", "cpu"),
+                "gpu": result.get("gpu"), "torch": result.get("torch"),
+                "reason": result.get("reason") or "切换失败",
+                "verified": False,
+                "forced": result.get("mode", "cpu"),
+                "requested": result.get("requested", mode)}
+    return {"ok": True, "mode": result["kind"], "device": result["device"],
+            "gpu": result["gpu"], "torch": result["torch"],
+            "note": result.get("verify_note") or result.get("note") or "",
+            "verified": bool(result.get("verified")),
+            "forced": result.get("forced", mode),
+            "requested": result.get("requested", mode)}
 
 
 @app.post("/api/t2i/unload")

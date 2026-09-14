@@ -995,20 +995,126 @@
     renderSessions(list);
   })();
 
-  // 绘图设备提示：文生图与图片微改共用同一个 torch 环境，设备一致
-  async function loadDevice() {
-    const el = $("#deviceBadge");
+  // ---------- 绘图计算设备：徽标 + 切换菜单 ----------
+  // 文生图与图片微改共用同一个 torch 环境，设备一致。
+  // 切换是"有后果"的操作：后端会在新设备上跑一次真实运算、并把绘图引擎
+  // 实际加载上去，两步都过了才算成功。所以这里必须把结果讲清楚，
+  // 失败时尤其要说明**当前是什么模式**和**为什么失败**。
+  let deviceSwitching = false;
+
+  function renderDeviceBadge(kind, gpu) {
+    const text = $("#deviceBadgeText");
+    if (!text) return;
+    text.textContent = kind === "gpu"
+      ? ("⚡ GPU 加速" + (gpu ? "（" + gpu + "）" : ""))
+      : "🖥 CPU 模式";
+    const badge = $("#deviceBadge");
+    badge.classList.toggle("gpu", kind === "gpu");
+  }
+
+  function markDeviceOptions(kind) {
+    ["gpu", "cpu"].forEach((m) => {
+      const el = $("#" + (m === "gpu" ? "devStateGpu" : "devStateCpu"));
+      if (el) el.textContent = (m === kind) ? "当前" : "";
+      const btn = document.querySelector(`.dev-opt[data-mode="${m}"]`);
+      if (btn) btn.classList.toggle("active", m === kind);
+    });
+  }
+
+  function setDeviceStatus(html, cls) {
+    const el = $("#deviceStatus");
     if (!el) return;
+    el.innerHTML = html || "";
+    el.className = "dev-status" + (cls ? " " + cls : "");
+    el.hidden = !html;
+  }
+
+  async function loadDevice() {
+    const badge = $("#deviceBadge");
+    if (!badge) return;
     try {
       const d = await api("/api/t2i/capability");
-      const isGpu = d.kind === "gpu";
-      el.textContent = isGpu ? ("🖥 GPU 加速" + (d.gpu ? "（" + d.gpu + "）" : "")) : "🖥 CPU 模式";
-      el.title = isGpu
-        ? `绘图（文生图 / 图片微改）使用显卡加速\n${d.gpu || ""}\ntorch ${d.torch || ""}`
-        : `绘图（文生图 / 图片微改）使用 CPU，单张约 20 秒\n${d.note || ""}\ntorch ${d.torch || ""}`;
-      el.style.opacity = "0.75";
-    } catch (e) { el.textContent = ""; }
+      renderDeviceBadge(d.kind, d.gpu);
+      markDeviceOptions(d.kind);
+      badge.title = (d.kind === "gpu"
+        ? `绘图使用显卡加速：${d.gpu || "未知型号"}`
+        : `绘图使用 CPU，单张约 20 秒`)
+        + `\ntorch ${d.torch || "?"}`
+        + (d.reason ? `\n${d.reason}` : "")
+        + "\n点击可切换设备";
+      badge.classList.remove("loading");
+    } catch (e) {
+      const text = $("#deviceBadgeText");
+      if (text) text.textContent = "设备未知";
+    }
   }
+
+  async function switchDevice(mode) {
+    if (deviceSwitching) return;
+    deviceSwitching = true;
+    const badge = $("#deviceBadge");
+    badge.classList.add("loading");
+    const label = mode === "gpu" ? "GPU 加速" : "CPU 模式";
+    setDeviceStatus(`⏳ 正在切换到 ${label}，并在该设备上实际加载绘图引擎校验…`, "busy");
+    try {
+      const r = await api("/api/t2i/device", {
+        method: "POST",
+        body: JSON.stringify({ mode }),
+      });
+      if (r.ok) {
+        renderDeviceBadge(r.mode, r.gpu);
+        markDeviceOptions(r.mode);
+        const extra = r.note ? `<div class="dev-sub">${r.note}</div>` : "";
+        setDeviceStatus(
+          `<div class="dev-ok">✅ 已成功切换到 ${r.mode === "gpu" ? "GPU 加速" : "CPU 模式"}`
+          + `${r.gpu ? "（" + r.gpu + "）" : ""}</div>`
+          + `<div class="dev-sub">绘图引擎已在目标设备上加载成功`
+          + `${r.torch ? "　torch " + r.torch : ""}</div>` + extra, "ok");
+        showToast(`设备已切换：${r.mode === "gpu" ? "GPU 加速" : "CPU 模式"}`, "ok");
+      } else {
+        // 失败：把「当前是什么模式」和「为什么失败」都摆出来
+        const cur = r.mode === "gpu" ? "GPU 加速" : "CPU 模式";
+        setDeviceStatus(
+          `<div class="dev-fail">❌ 切换到 ${label} 失败</div>`
+          + `<div class="dev-sub">当前仍是：<b>${cur}</b></div>`
+          + `<div class="dev-sub">失败原因：${r.reason || "未知"}</div>`, "fail");
+        markDeviceOptions(r.mode);
+        renderDeviceBadge(r.mode, r.gpu);
+        showToast(`切换到 ${label} 失败，当前为 ${cur}`, "warn");
+      }
+    } catch (e) {
+      setDeviceStatus(`<div class="dev-fail">❌ 切换失败：${e.message || e}</div>`, "fail");
+    } finally {
+      deviceSwitching = false;
+      badge.classList.remove("loading");
+    }
+  }
+
+  (function bindDeviceMenu() {
+    const badge = $("#deviceBadge");
+    const menu = $("#deviceMenu");
+    if (!badge || !menu) return;
+    badge.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      menu.hidden = !menu.hidden;
+      if (!menu.hidden) {
+        // 打开时刷新一下当前状态，并清掉上一次的结果（避免误读成这次的）
+        setDeviceStatus("");
+        loadDevice();
+      }
+    });
+    menu.querySelectorAll(".dev-opt").forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        switchDevice(btn.dataset.mode);
+      });
+    });
+    // 点别处收起；切换进行中不收起（要看结果）
+    document.addEventListener("click", () => {
+      if (!deviceSwitching) menu.hidden = true;
+    });
+    menu.addEventListener("click", (ev) => ev.stopPropagation());
+  })();
 
   refreshHealth();
   loadToggles();
