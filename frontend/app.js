@@ -1431,11 +1431,13 @@
         `<span class="code-meta">${escapeHtml(meta.join(" · "))}</span>` +
         `<span class="code-btns"><button class="btn sm ghost code-edit">✏ 编辑</button>` +
         `<button class="btn sm ghost code-run">▶ 运行</button>` +
+        `<button class="btn sm ghost code-save">💾 存到文库</button>` +
         `<button class="btn sm ghost code-copy">📋 复制</button></span></div>` +
         `<pre class="code-body"><code></code></pre><div class="code-out"></div>`;
       const codeEl = card.querySelector(".code-body code");
       const editBtn = card.querySelector(".code-edit");
       const runBtn = card.querySelector(".code-run");
+      const saveBtn = card.querySelector(".code-save");
       const copyBtn = card.querySelector(".code-copy");
       const outEl = card.querySelector(".code-out");
       let current = ui.code || "";
@@ -1501,6 +1503,27 @@
           runBtn.textContent = old;
         }
       };
+      // 存到生成文库：代码模型那一轮没有工具，保存只能靠这个按钮。
+      // 后端会按语言挑后缀、优先用用户点名的文件名（"就叫 stats.py"）。
+      saveBtn.onclick = async () => {
+        const code = grab();
+        if (!code.trim()) { showToast("代码是空的", "warn"); return; }
+        current = code;
+        saveBtn.disabled = true;
+        try {
+          const r = await api("/api/code/save", {
+            method: "POST",
+            body: JSON.stringify({ code, language: ui.lang || "", user_text: ui.userText || "" }),
+          });
+          showToast("已存入生成文库：" + (r.rel || ""), "ok");
+          // 面板可能正开着：刷新一下列表（不传参，别改当前选中项）
+          try { if (typeof loadDoclib === "function") loadDoclib(); } catch (e) {}
+        } catch (e) {
+          showToast("保存失败：" + String(e.message || e), "warn");
+        } finally {
+          saveBtn.disabled = false;
+        }
+      };
       copyBtn.onclick = async () => {
         try {
           await navigator.clipboard.writeText(grab());
@@ -1533,7 +1556,7 @@
           d.textContent = p.v;
           bubble.appendChild(d);
         } else {
-          bubble.appendChild(makeCodeCard({ code: p.v }, "📄 代码（可编辑后直接运行）"));
+          bubble.appendChild(makeCodeCard({ code: p.v, lang: p.lang }, "📄 代码（可编辑后直接运行）"));
         }
       });
     };

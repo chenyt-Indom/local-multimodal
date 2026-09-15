@@ -1142,6 +1142,30 @@ def _is_writing_task(text: str) -> bool:
     return any(k in t for k in _WRITING_HINTS)
 
 
+# 用户话里出现的"本机路径"线索：盘符 / UNC / 家目录 / 常见 Unix 绝对路径。
+_LOCAL_PATH_RE = re.compile(
+    r"[A-Za-z]:[\\/]"                       # C:\  D:/  （Windows 盘符）
+    r"|\\\\[A-Za-z0-9_.\-]+[\\/]"           # \\server\share
+    r"|(?:^|[\s（(\"'「])~[\\/]"             # ~/  ~\
+    r"|(?:^|[\s（(\"'「])/(?:home|Users|mnt|tmp|opt|var|data|root)/"
+)
+
+
+def _mentions_local_path(text: str) -> bool:
+    """用户这句话里有没有**本机路径**。
+
+    ⚠️ 有路径就**不能**换到专用代码模型。原因：
+    qwen2.5-coder 不支持 Ollama 的原生工具调用，切过去就只能**整轮不给工具**
+    （否则它把调用当 JSON 文本吐出来）—— 那样它既读不了文件也写不了文件。
+    实测问它「读取 D:\\...\\demo.py 把代码展开给我看」，它会答
+    **「抱歉，我无法读取或访问本地文件」**，还建议你"开启联网开关"（完全跑偏）。
+    这种轮次留在默认模型上（它有 read_file / write_file / library）才做得成。
+
+    "存到生成文库"**不算**：那一步由前端按钮/兜底逻辑落盘，不依赖模型调工具。
+    """
+    return bool(_LOCAL_PATH_RE.search(text or ""))
+
+
 def _needs_task_model(text: str) -> bool:
     """要不要换用"专用模型"（非思考型）。
 
@@ -1149,7 +1173,11 @@ def _needs_task_model(text: str) -> bool:
     但它是代码模型，多轮里会跑偏 —— 把工具调用当 JSON 文本吐出来、
     话题漂到无关内容（让它写作文，它导出了一份"Python 网络请求示例"）。
     长文创作改走"砍工具 + 加额度"的路子（见 _writing_tools），用回默认模型。
+
+    ⚠️ **带本机路径的请求也不算** —— 见 `_mentions_local_path` 的说明。
     """
+    if _mentions_local_path(text):
+        return False          # 要读写本机文件 → 必须留在有工具的默认模型上
     return _is_code_task(text)
 
 
@@ -1196,9 +1224,104 @@ def _wants_file(text: str) -> bool:
     return any(k in t for k in _WANT_FILE_HINTS)
 
 
-def _autosave_answer(text: str) -> str:
-    """把模型写好的正文自动存进生成文库，返回相对路径（失败返回空串）。"""
+# ---------- 把代码存成"能直接跑的源码文件" ----------
+# 代码块的语言标记 → 文件后缀
+_LANG_EXT = {
+    "python": ".py", "py": ".py", "python3": ".py",
+    "javascript": ".js", "js": ".js", "node": ".js",
+    "typescript": ".ts", "ts": ".ts", "tsx": ".tsx", "jsx": ".jsx",
+    "java": ".java", "c": ".c", "cpp": ".cpp", "c++": ".cpp", "cxx": ".cpp",
+    "csharp": ".cs", "cs": ".cs", "go": ".go", "golang": ".go",
+    "rust": ".rs", "rs": ".rs", "kotlin": ".kt", "swift": ".swift",
+    "bash": ".sh", "sh": ".sh", "shell": ".sh", "zsh": ".sh",
+    "powershell": ".ps1", "ps1": ".ps1", "bat": ".bat", "cmd": ".bat",
+    "sql": ".sql", "html": ".html", "css": ".css", "scss": ".scss",
+    "json": ".json", "yaml": ".yml", "yml": ".yml", "xml": ".xml",
+    "markdown": ".md", "md": ".md", "text": ".txt", "txt": ".txt",
+}
+# ```lang 代码块（允许语言标记为空）
+_FENCE_RE = re.compile(r"```([A-Za-z0-9_+#.\-]*)[ \t]*\r?\n(.*?)```", re.S)
+# 用户点名要的文件名，如"文件名就叫 stats.py"
+_NAMED_FILE_RE = re.compile(
+    r"[\w\u4e00-\u9fa5\-]{1,40}\.(?:py|js|ts|tsx|jsx|java|go|rs|c|cpp|cs|kt|swift"
+    r"|sh|ps1|bat|sql|html|css|scss|json|ya?ml|xml|md|txt)\b", re.I)
+
+
+def _slug_name(s: str, fallback: str = "code") -> str:
+    s = re.sub(r'[\\/:*?"<>|\r\n\t]', "", s or "").strip()
+    return s[:48] or fallback
+
+
+def _guess_code_filename(code: str, language: str = "", user_text: str = "") -> str:
+    """给一段代码取文件名。
+
+    优先级：① 用户点名要的名字（"文件名就叫 stats.py"）
+            ② 代码里第一个 def/class/function 名 + 语言后缀
+            ③ 时间戳 + 语言后缀
+    """
+    m = _NAMED_FILE_RE.search(user_text or "")
+    if m:
+        return _slug_name(m.group(0))
+    ext = _LANG_EXT.get((language or "").strip().lower(), ".txt")
+    # ⚠️ 名字长度从 0 个额外字符起算 —— 原来写 `\w{1,32}`（要求至少 2 个字符），
+    # 于是 `function f(x)` 这种单字母函数名匹配不上，白白掉到时间戳兜底。
+    m = re.search(r"^\s*(?:def|class|func|function)\s+([A-Za-z_]\w{0,32})",
+                  code or "", re.M)
+    if m:
+        return "%s%s" % (m.group(1), ext)
+    return "%s%s" % (time.strftime("%m%d-%H%M"), ext)
+
+
+def _save_code_to_doclib(code: str, language: str = "", filename: str = "",
+                         user_text: str = "") -> str:
+    """把一段代码存成生成文库里的**源码文件**，返回相对路径（失败返回空串）。
+
+    ⚠️ 为什么得单独做这件事：代码模型这一轮**没有工具**（它不支持原生工具调用，
+    给了 schema 只会把调用当 JSON 文本吐出来）。所以"存文件"不能指望模型自己
+    去调 library —— 由前端代码卡片的「💾 存到文库」按钮，或这里的兜底逻辑来做。
+    """
+    code = (code or "").strip("\n")
+    if not code.strip():
+        return ""
+    name = _slug_name(filename) if filename else _guess_code_filename(code, language, user_text)
+    if "." not in os.path.basename(name):
+        name += _LANG_EXT.get((language or "").strip().lower(), ".txt")
     try:
+        r = doclib.write_file(name, code)
+        if not r.get("ok"):
+            logging.getLogger("uvicorn.error").warning(
+                "存代码到文库失败：%s", r.get("error"))
+            return ""
+        return r.get("rel") or ""
+    except Exception:
+        logging.getLogger("uvicorn.error").warning("存代码到文库异常", exc_info=True)
+        return ""
+
+
+def _autosave_answer(text: str, user_text: str = "") -> str:
+    """把模型写好的正文自动存进生成文库，返回相对路径（失败返回空串）。
+
+    分两种情况：
+    - 正文里有**像样的代码块** → 存成**可直接运行的源码文件**（.py/.js/…），
+      文件名优先用用户点名的那个。原来是统一存 .md，结果"写个 stats.py"最后
+      得到一个名字里带标题、后缀还是 .md 的文件 —— 又丑又跑不了。
+    - 其他（作文 / 报告 / 方案）→ 仍然存成 .md，用首行当标题。
+    """
+    try:
+        blocks = _FENCE_RE.findall(text or "")
+        plain = _FENCE_RE.sub("", text or "").strip()
+        # ⚠️ 不要要求"有且只有一个代码块" —— 实测模型的回答常是
+        # 「一段说明 + 主代码块 + 一小段用法/输出示例」，那样就变成 2 个块，
+        # 会被判成"不是代码回答"而存成 .md（踩过）。取**最大的那块**即可。
+        #
+        # 阈值也**不能定高**：一个"扫描目录按大小排序"的脚本只有 4 行、约 110 字，
+        # 按"≥5 行或 ≥200 字"就会被误判成长文（踩过）。这里放宽到 3 行 / 100 字。
+        if blocks and len(plain) < 800:
+            lang, code = max(blocks, key=lambda b: len(b[1]))
+            if len(code.strip().splitlines()) >= 3 or len(code) >= 100:
+                rel = _save_code_to_doclib(code, lang, "", user_text)
+                if rel:
+                    return rel
         first = ""
         for ln in (text or "").splitlines():
             seg = ln.strip().lstrip("#＃* ").strip()
@@ -1609,7 +1732,12 @@ async def chat(req: ChatRequest):
                 "请直接把完整可运行的代码写进 ``` 代码块里（标注语言），"
                 "并在后面用一小段说明解释思路与你验证用的数据。"
                 "**绝对不要**输出形如 {\"name\": \"...\", \"arguments\": {...}} 的 JSON —— "
-                "那是工具调用的内部格式，写出来用户看到的是一堆乱码。")
+                "那是工具调用的内部格式，写出来用户看到的是一堆乱码。"
+                "\n【代码要能直接跑】用户会在界面上点「▶ 运行」执行你的代码："
+                "\n· **不要用 input() 等交互输入** —— 运行环境没有键盘，会直接报 EOFError。"
+                "需要参数就写成模块顶部的变量，或从 sys.argv 取并给默认值。"
+                "\n· 结尾要有 print() 把结果打出来，否则界面上只会显示「没有输出」。"
+                "\n· 尽量只用标准库（沙箱里的第三方库不保证装全）。")
         working = [{"role": "system", "content": full_sys}] + messages
         final_text = ""
         final_thinking = ""
@@ -1801,7 +1929,8 @@ async def chat(req: ChatRequest):
         # 但文库目录是空的 —— 它压根没调工具。用户以为存好了，这种"虚假完成"最坑。
         if (_wants_file(last_user) and "library" not in used_tools
                 and len(final_text.strip()) > 200):
-            _saved = _autosave_answer(final_text)
+            # 带上用户原话：正文是代码块时，要用他点名的文件名（"就叫 stats.py"）
+            _saved = _autosave_answer(final_text, last_user)
             if _saved:
                 yield json.dumps({"ui": {"type": "library", "act": "write",
                                          "rel": _saved, "auto": True}}) + "\n"
@@ -1948,9 +2077,6 @@ def library_open_folder():
     return _open_folder_impl(doclib.ensure_dir())
 
 
-@app.post("/api/chat/stop")
-
-
 @app.post("/api/code/run")
 def code_run(req: CodeRunRequest):
     """前端代码卡片里的「▶ 运行」——跑用户自己写的/改过的代码。
@@ -1961,6 +2087,24 @@ def code_run(req: CodeRunRequest):
     r = tools.run_code(req.code, allow_risky=True)
     r.pop("needs_confirm", None)
     return {"ok": True, **r}
+
+
+@app.post("/api/code/save")
+def code_save(body: dict):
+    """前端代码卡片里的「💾 存到文库」——把这段代码存成生成文库里的源码文件。
+
+    为什么要这个端点：代码模型那一轮**没有工具**（它不支持原生工具调用），
+    没法自己调 library 保存。所以保存动作由前端按钮触发，落盘逻辑复用
+    `_save_code_to_doclib`（和自动兜底同一套命名规则）。
+    """
+    b = body or {}
+    code = str(b.get("code") or "")
+    lang = str(b.get("language") or "")
+    name = str(b.get("filename") or "")
+    rel = _save_code_to_doclib(code, lang, name, str(b.get("user_text") or ""))
+    if not rel:
+        raise HTTPException(status_code=400, detail="保存失败：代码为空或文件名不合法")
+    return {"ok": True, "rel": rel}
 
 
 @app.post("/api/chat/stop")
