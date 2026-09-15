@@ -40,6 +40,24 @@ def _ensure_dir():
     os.makedirs(KB_DIR, exist_ok=True)
 
 
+def ensure_dir() -> str:
+    """确保知识库目录存在并放一份说明，返回路径（启动时调用）。
+
+    用户直接把 .txt / .md 拷进这个目录就行，**不需要任何导入操作** ——
+    检索时 `_build_index` 会按目录实际内容重建索引，放进去就能被查到。
+    """
+    _ensure_dir()
+    readme = os.path.join(KB_DIR, "_说明.txt")
+    if not os.path.exists(readme):
+        try:
+            with open(readme, "w", encoding="utf-8") as f:
+                f.write("把领域资料（.txt / .md）放进这个文件夹即可被检索到，"
+                        "不需要重新导入。\n以 _ 开头的文件会被忽略。\n")
+        except Exception:
+            pass
+    return KB_DIR
+
+
 def _doc_id(path):
     return os.path.basename(path).split(".")[0]
 
@@ -186,11 +204,23 @@ def search(query: str, top_k: int = 6):
 
 
 def build_rag_context(query: str, top_k: int = 4) -> str:
-    """把检索结果拼成可注入 system 的 RAG 上下文。"""
+    """把检索结果拼成可注入 system 的 RAG 上下文。
+
+    只在**真的命中**时才有内容（无关提问的分数是 0，`search` 会直接返回空），
+    所以这相当于"自动检索"：相关就自动带上，不相关一点都不占上下文。
+
+    同时在末尾告诉模型还能用 search_knowledge 工具继续深挖 ——
+    自动检索只给最相关的几段，需要更多细节或想先看目录时由模型自己决定。
+    """
     results = search(query, top_k)
     if not results:
         return ""
-    lines = ["【知识库资料】"]
+    lines = ["【知识库资料】（来自用户导入的领域文档，**优先于联网结果采信**；"
+             "回答时注明出自哪一篇）"]
     for i, r in enumerate(results, 1):
         lines.append(f"[资料{i}]({r['filename']})\n{r['content']}")
+    lines.append("\n（以上是自动检索到的相关片段，通常够用。"
+                 "若需要更多细节、或想先看看知识库里都有哪些资料，"
+                 "可调用 search_knowledge 工具（list_all=true 列目录）；"
+                 "需要时效性信息时也可同时调用 web_search。）")
     return "\n".join(lines)

@@ -26,6 +26,13 @@ from . import (config, ollama_client, memory, kb, file_tools, video, web_tools,
 app = FastAPI(title="本地多模态助手", version="1.0.0")
 client = ollama_client.OllamaClient()
 
+# 启动时就把知识库目录建好 —— 用户可以直接往里拷 .txt / .md，
+# 不用先"导入"一次才知道往哪放。
+try:
+    kb.ensure_dir()
+except Exception:
+    pass
+
 # 最近一次出现过的图片（base64），供后续「把这张图改成…」直接微改，免去重新导入。
 # 单用户桌面应用，保存最近一张即可；换新图时自动覆盖。
 _LAST_IMAGE: dict = {"b64": None, "ts": 0.0, "ttl": 3600.0}
@@ -446,11 +453,17 @@ def _request_host_open(target: str) -> bool:
 
 
 @app.post("/api/open_folder")
-@app.post("/api/open_folder")
 def open_folder(req: OpenFolderRequest = None):
     """在系统文件管理器中打开指定路径（默认打开 saved_images 目录）。"""
     return _open_folder_impl((req.path if req and req.path else None)
                              or config.data("saved_images"))
+
+
+@app.post("/api/kb/open_folder")
+def kb_open_folder():
+    """打开「知识库」文件夹 —— 用户把 .txt/.md 丢进去就能被检索。"""
+    kb.ensure_dir()
+    return _open_folder_impl(kb.KB_DIR)
 
 
 @app.post("/api/library/open_folder")
@@ -625,6 +638,13 @@ class _SystemPrompt:
                 )
             )
             + "调用工具后，根据工具返回结果继续作答。能直接完成的就动手，不要只建议。\n"
+            "- **一轮里可以同时发起多个工具调用**：如果几件事彼此不依赖"
+            "（例如同时要「查知识库」+「联网搜索」+「看时间」），"
+            "就**在同一条回复里一起发出**，不要一个一个轮着来 —— "
+            "它们会被并行执行，总耗时只取决于最慢的那个，比串行快得多、也更准。\n"
+            "  只有当下一个工具的**参数依赖**上一个工具的结果时，才分轮调用。\n"
+            "- **知识库优先**：用户自己的资料（知识库）比网上搜到的更贴合其领域，"
+            "两者都有相关内容时以知识库为准，联网只用来补时效性信息。\n"
             "- **回答要有实质内容，不要只给结论**：\n"
             "  · 涉及知识性/分析性的问题，一般写 300 字以上，用「小标题 + 分点」组织；\n"
             "  · 把材料里的**具体信息**（名称、数字、时间、条款）写出来，不要笼统概括；\n"
@@ -645,6 +665,54 @@ class _SystemPrompt:
                 parts.append(ctx)
         parts.append("回答请使用中文，简洁、直接、可执行。")
         return "\n\n".join(p for p in parts if p)
+
+
+async def _stream_lines(resp):
+    """在子线程里读阻塞的 `requests.iter_lines`，通过队列交回事件循环。
+
+    ⚠️ **为什么必须这样绕一层**（实测踩过）：
+    `StreamingResponse` 要的是 async 生成器，但 `requests.iter_lines()` 是**阻塞**的。
+    直接在 async 生成器里 for 循环读它，会把事件循环整个占住 ——
+    uvicorn 拿不到执行机会去 flush socket 缓冲，
+    于是所有分块**憋到最后一次性发出去**。
+    表现就是用户看到的：发完消息后长时间没反应，然后思考和回答"一股脑"全冒出来。
+    （实测 547 个分块全部在同一时刻到达；而直连 Ollama 首块只要 0.4s。）
+
+    改成"子线程阻塞读 + 队列传递"后，事件循环始终空闲，每来一块就能立刻推给前端。
+    """
+    q: asyncio.Queue = asyncio.Queue(maxsize=256)
+    loop = asyncio.get_running_loop()
+
+    def _worker():
+        try:
+            for ln in resp.iter_lines(decode_unicode=False):
+                loop.call_soon_threadsafe(_q_put, q, ln)
+        except Exception:
+            pass
+        finally:
+            loop.call_soon_threadsafe(_q_put, q, None)   # 结束哨兵
+
+    threading.Thread(target=_worker, daemon=True, name="ollama-stream").start()
+    while True:
+        item = await q.get()
+        if item is None:
+            break
+        yield item
+
+
+def _q_put(q, item) -> None:
+    """往队列里塞数据；满了就丢最旧的，绝不阻塞读取线程。"""
+    try:
+        q.put_nowait(item)
+    except asyncio.QueueFull:
+        try:
+            q.get_nowait()
+        except Exception:
+            pass
+        try:
+            q.put_nowait(item)
+        except Exception:
+            pass
 
 
 @app.post("/api/chat")
@@ -681,7 +749,8 @@ async def chat(req: ChatRequest):
     # session 必须提前取到：记忆是按对话隔离的，注入时必须知道是哪个对话。
     session = req.session_id or ""
     sys_prompt = _SystemPrompt.build(last_user, session)
-    tool_schemas = tools.make_schemas(cfg.get("web_enabled", False))
+    tool_schemas = tools.make_schemas(cfg.get("web_enabled", False),
+                                      cfg.get("rag_enabled", False))
 
     # ---------- 上下文预算：按剩余空间裁剪历史 ----------
     # 工具定义本身就有 3000~4500 token，系统提示约 1000；
@@ -739,7 +808,9 @@ async def chat(req: ChatRequest):
             round_msg = {"content": "", "thinking": None, "model": model}
             tool_calls = None
             done_reason = ""
-            for line in resp.iter_lines(decode_unicode=False):
+            # 注意：必须用 _stream_lines（子线程读 + 队列），
+            # 不能直接 for line in resp.iter_lines() —— 见它的注释
+            async for line in _stream_lines(resp):
                 if not line:
                     continue
                 if isinstance(line, bytes):
@@ -805,22 +876,50 @@ async def chat(req: ChatRequest):
             # session：记忆按对话隔离，写记忆的工具必须知道当前是哪个对话
             ctx = {"images": images or _recent_image(), "shown_images": [],
                    "session": session}
+
+            # 先把本轮所有工具调用解析出来，并逐个通知前端"开始执行"
+            calls = []
             for tc in tool_calls:
                 fn = (tc.get("function") or {})
                 name = fn.get("name", "")
-                args = fn.get("arguments") or (fn.get("arguments") if isinstance(fn.get("arguments"), dict) else {})
+                args = fn.get("arguments") or {}
                 if isinstance(args, str):
                     try:
                         args = json.loads(args)
                     except Exception:
                         args = {}
+                if not isinstance(args, dict):
+                    args = {}
+                calls.append((name, args))
                 yield json.dumps({"tool_start": {"name": name, "args": args}}) + "\n"
-                mark = len(ui_events)
-                result = await asyncio.to_thread(tools.dispatch, name, args, ui_events, ctx)
+
+            # ---------- 并行执行本轮工具 ----------
+            # 模型经常一轮里同时要好几样东西（查知识库 + 联网搜索 + 看时间…）。
+            # 串行执行时总耗时是它们**相加**；并行后只取决于最慢的那个，
+            # 对"多工具协同"的任务体感差别很明显。
+            # 每个工具用**独立的 ui_events 列表**，避免并发写入互相污染，
+            # 最后再按原顺序合并，保证前端看到的次序稳定。
+            async def _run_one(idx, name, args):
+                ev = []
+                try:
+                    # dispatch 里都是阻塞逻辑（网络/文件/推理），必须丢线程池，
+                    # 否则会占住事件循环、把流式输出又憋成"一次性返回"。
+                    res = await asyncio.to_thread(tools.dispatch, name, args, ev,
+                                                  dict(ctx))
+                except Exception as e:
+                    res = f"[工具执行失败] {name}：{e}"
+                return idx, name, res, ev
+
+            if len(calls) > 1:
+                yield json.dumps({"tool_parallel": len(calls)}) + "\n"
+            gathered = await asyncio.gather(
+                *[_run_one(i, n, a) for i, (n, a) in enumerate(calls)])
+            for _idx, name, result, ev in sorted(gathered, key=lambda x: x[0]):
                 # 把本次新产生的图片登记下来，后续工具（如保存到图库）可按序号引用
-                for e in ui_events[mark:]:
+                for e in ev:
                     if e.get("type") == "image":
                         ctx["shown_images"].append(e)
+                ui_events.extend(ev)
                 # 注意：Ollama 的 tool 消息用 tool_name 关联调用，不是 tool_calls/tool_call_id，
                 # 否则模型读不到工具返回内容（会误答"没查到/无法联网"）。
                 working.append({"role": "tool", "content": result, "tool_name": name})

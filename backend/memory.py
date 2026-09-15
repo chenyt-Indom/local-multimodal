@@ -32,9 +32,11 @@ LEGACY_DOC_FILE = os.path.join(DATA_DIR, "memory_doc.json")        # 多分区�
 LEGACY_CONV_FILE = os.path.join(MEM_DIR, "conversations.json")     # 早期"每对话一块"版
 LEGACY_GLOBAL_FILE = os.path.join(MEM_DIR, "global.json")          # 早期"全局偏好"版
 
-# 上限。**故意不大**：记忆的价值是"关键信息随手可得"，
-# 塞成几千字只会稀释重点，还会挤占上下文窗口。
-LONG_CAP = 2000      # 长期记忆
+# 上限。
+# 长期记忆放宽到 15000 字：它是跨对话共享的"用户档案 + 领域知识"，
+# 用户明确要求能装下更多内容（原来 2000 字确实容易顶到）。
+# 短期记忆仍保持精简 —— 它只服务当前这一件事，塞多了反而稀释重点。
+LONG_CAP = 15000     # 长期记忆
 SHORT_CAP = 1000     # 单个对话的短期记忆
 
 _STOP_WORDS = set(

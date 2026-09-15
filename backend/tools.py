@@ -25,11 +25,12 @@ from . import memory as memory_mod
 # =====================================================================
 #  工具 Schema（发给模型）
 # =====================================================================
-def make_schemas(web_enabled: bool = False) -> list:
+def make_schemas(web_enabled: bool = False, kb_enabled: bool = False) -> list:
     """返回工具 schema 列表。
 
     web_enabled=True 时才暴露联网搜索工具——保证"开关不开不联网"的约定：
     关着的时候模型连工具都看不到，自然不会去联网。
+    kb_enabled 同理：关着就不给知识库工具。
     """
     schemas = [
         {
@@ -225,10 +226,42 @@ def make_schemas(web_enabled: bool = False) -> list:
             },
         },
     ]
+    # 知识库工具只在「知识库」开关打开时暴露 —— 与联网同样的约定：
+    # 开关关着，模型连工具都看不到，自然就不会去翻资料。
+    if kb_enabled:
+        schemas.append(_KB_SCHEMA)
     if web_enabled:
         schemas.append(_WEATHER_SCHEMA)   # 天气走数据 API，比搜索可靠得多
         schemas.append(_WEB_SEARCH_SCHEMA)
     return schemas
+
+
+# 知识库检索工具（受「知识库」开关控制）
+_KB_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "search_knowledge",
+        "description": (
+            "检索本地知识库（用户导入的领域文档）。**这是用户自己的资料，"
+            "优先级高于联网搜索**：涉及专业领域、内部规范、项目/产品资料时，先来这里查。\n"
+            "· 建议先用 list_all=true 摸清有哪些文档，再针对性检索；\n"
+            "· 一次没查到就换关键词再查，允许多轮检索；\n"
+            "· 需要时效性信息时，可以**在同一轮里同时调用本工具和 web_search**，"
+            "用知识库答内部细节、用网络补最新情况。\n"
+            "（若系统提示里已出现「知识库资料」，说明自动检索已命中，不必重复查。）"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string",
+                          "description": "检索关键词。用文档里可能出现的原词/术语效果最好"},
+                "list_all": {"type": "boolean",
+                             "description": "true = 列出全部文档的标题与开头（想先摸清有哪些资料时用）"},
+            },
+            "required": [],
+        },
+    },
+}
 
 
 # 天气工具：走结构化数据源，不要用搜索引擎
@@ -344,6 +377,8 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
         return _do_remember(arguments, context)
     if name == "search_memory":
         return _do_search_memory(arguments)
+    if name == "search_knowledge":
+        return _do_search_knowledge(arguments)
     if name == "get_time":
         return time.strftime("%Y-%m-%d %H:%M:%S (%A)")
     if name == "web_search":
@@ -965,6 +1000,52 @@ def _do_remember(arguments, context=None):
         return "错误：无法确定当前对话，记忆未写入。"
     ok = memory_mod.merge_short(session, content)
     return ("已记入本次对话的短期记忆。" if ok else "这条已经在本对话记忆里了，没有重复记。")
+
+
+def _do_search_knowledge(arguments):
+    """检索本地知识库。让模型**自己决定**要不要查、查什么。
+
+    以前只有"每轮自动注入前 top_k 篇"，模型没法在需要时多查几轮；
+    现在给它这个工具，它可以：先列目录看有哪些资料 → 再按关键词精查 →
+    必要时换关键词再查一遍，甚至与联网搜索同时使用。
+    """
+    from . import kb as kb_mod
+    docs = kb_mod.list_documents()
+    if not docs:
+        return ("知识库是空的。请告诉用户：把 .txt/.md 文档放进知识库文件夹即可，"
+                "之后就能自动检索。")
+
+    # 先摸清有哪些资料
+    if arguments.get("list_all"):
+        lines = [f"知识库共有 {len(docs)} 篇文档："]
+        for i, d in enumerate(docs, 1):
+            fn = d.get("filename") or d.get("id") or "?"
+            # 顺带把开头一小段带出来，模型才好判断"这篇是不是我要的"
+            try:
+                with open(os.path.join(kb_mod.KB_DIR, fn), "r", encoding="utf-8") as f:
+                    head = f.read(90).replace("\n", " ").strip()
+            except Exception:
+                head = ""
+            lines.append(f"{i}. 《{fn}》（{d.get('chars', 0)} 字）{head}")
+        lines.append("\n需要细节时，用 query 参数针对性检索。")
+        return "\n".join(lines)
+
+    query = (arguments.get("query") or "").strip()
+    if not query:
+        return ("请给出 query 参数（检索关键词），或用 list_all=true 先列出知识库有哪些文档。")
+
+    hits = kb_mod.search(query, top_k=int(arguments.get("top_k") or 6))
+    if not hits:
+        return (f"知识库里没有与「{query}」相关的内容。"
+                f"（当前共 {len(docs)} 篇文档；可换关键词再试，或 list_all=true 看看都有什么）")
+    lines = [f"知识库检索结果（关键词：{query}）："]
+    for i, h in enumerate(hits, 1):
+        title = h.get("filename") or h.get("doc_id") or "?"
+        body = (h.get("content") or "").strip()
+        lines.append(f"\n[{i}] 《{title}》\n{body[:1200]}")
+    lines.append("\n（以上来自用户自己的知识库，比联网结果更贴合其领域；"
+                 "回答时请优先采用，并注明出自哪一篇。）")
+    return "\n".join(lines)
 
 
 def _do_search_memory(arguments):

@@ -1008,6 +1008,10 @@
             if (obj.message.content) { answer += obj.message.content; answerBubble.textContent = answer + "▌"; }
           }
           if (obj.tool_start) addToolChip(obj.tool_start.name);
+          // 一轮里同时发起多个工具时给个提示 —— 让用户知道这是并行执行、在省时间
+          if (obj.tool_parallel) {
+            addToolChip(`⚡ 并行执行 ${obj.tool_parallel} 个工具`);
+          }
           if (obj.ui) {
             if (obj.ui.type === "sources") sourcesData = obj.ui;   // 稍后在回答下方渲染
             else addMedia(obj.ui);
@@ -1130,6 +1134,23 @@
     };
     voiceUI("idle");
   }
+
+  // 页面一打开就连上语音通道。
+  // **必须做**：后端起播后唤醒事件、识别文本都是通过这条 WebSocket 推过来的，
+  // 不连的话"喊醒了窗口却收不到话" —— 只有 🎤 按钮被点过才会连就太晚了。
+  (async function attachVoice() {
+    try {
+      const st = await api("/api/voice/status");
+      if (!st || st.running !== true) return;      // 后端没在听，保持"未开启"
+      const ws = voiceConnect();
+      const onOpen = () => {
+        voiceOn = true;
+        voiceUI(st.state === "awake" ? "awake" : "listening");
+      };
+      if (ws.readyState === 1) onOpen();
+      else ws.addEventListener("open", onOpen, { once: true });
+    } catch (e) { /* 语音不可用时保持原样 */ }
+  })();
 
   // ---------- 初始化 ----------
   // 先恢复会话（含上次的历史消息），再跑其它轮询
