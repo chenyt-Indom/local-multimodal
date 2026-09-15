@@ -587,7 +587,38 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
   border-radius: 7px; padding: 6px 8px; margin-bottom: 5px; font-size: 12px;
 }
 .kb-item .kb-name {
-  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  /* 名称现在位于 .kb-body（纵向 flex）内，这里不能再写 flex:1，否则会被纵向拉高 */
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .kb-item .kb-size { color: var(--muted); font-size: 10.5px; flex: none; }
 .kb-item .kb-del { padding: 1px 7px; line-height: 1.4; }
+
+/* ---------- 文档附件卡片（拖进聊天框的文档） ---------- */
+.attachment.doc {
+  display: inline-flex; align-items: center; gap: 7px;
+  background: var(--panel2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 5px 8px; max-width: 240px;
+}
+.attachment.doc.loading { opacity: .6; }
+.attachment.doc .doc-ico { font-size: 17px; flex: none; }
+.attachment.doc .doc-meta {
+  display: flex; flex-direction: column; min-width: 0; line-height: 1.25;
+}
+.attachment.doc .doc-meta b {
+  font-size: 11.5px; font-weight: 500;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.attachment.doc .doc-meta em { font-style: normal; font-size: 10px; color: var(--muted); }
+.attachment.doc .x { cursor: pointer; color: var(--muted); flex: none; }
+.attachment.doc .x:hover { color: var(--danger); }
+/* 已发送的文档提示（跟在用户消息下面） */
+.bubble.doc-sent {
+  background: var(--panel2); color: var(--muted); font-size: 11.5px;
+  border: 1px dashed var(--border); padding: 5px 9px;
+}
+
+.kb-item.bad { border-color: rgba(229, 83, 75, .45); }
+.kb-item .kb-ico { font-size: 15px; flex: none; }
+.kb-item .kb-body { display: flex; flex-direction: column; flex: 1; min-width: 0; line-height: 1.3; }
+.kb-item .kb-sub { font-size: 10px; color: var(--muted); }
+.kb-item.bad .kb-sub { color: #e08a80; }

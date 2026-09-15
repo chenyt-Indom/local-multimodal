@@ -2,6 +2,7 @@
 (() => {
   const $ = (s) => document.querySelector(s);
   let images = [];          // 待发送附件 base64（含 data: 前缀）
+  let docs = [];            // 待发送文档：[{name, text, chars}]（拖进来时抽取正文）
   let videoB64 = null;      // 待发送视频帧 base64 列表
   let streaming = false;
   const history = [];       // 会话消息（用于多轮上下文）
@@ -206,19 +207,59 @@
   // ---------- 事件 ----------
   $("#toggleSidebar").onclick = () => $("#sidebar").classList.toggle("hidden");
 
-  // ---------- 拖拽图片到聊天框 ----------
+  // ---------- 拖拽文件到聊天框 ----------
+  // 文档类扩展名：拖进来会**抽取正文**当作本轮资料（和拖图片一个体验）
+  const DOC_EXT = /\.(txt|md|markdown|csv|tsv|json|log|ini|cfg|yaml|yml|xml|html?|py|js|ts|java|c|cpp|go|rs|sql|sh|bat|pdf|docx?|xlsx?|pptx?|wps|et|dps)$/i;
+
+  // 字数显示：不足 1000 就照实写，别四舍五入成"1k"（一份 50 字的文件显示"1k 字"很误导）
+  function fmtChars(n) {
+    n = Number(n || 0);
+    return n >= 1000 ? (n / 1000).toFixed(1) + "k 字" : n + " 字";
+  }
+
+  async function addDocAttachment(f) {
+    const chip = { name: f.name, text: "", chars: 0, loading: true };
+    docs.push(chip);
+    renderAttachments();
+    try {
+      const fd = new FormData();
+      fd.append("file", f, f.name);
+      const r = await fetch("/api/doc/extract", { method: "POST", body: fd });
+      const d = await r.json();
+      if (d.ok) {
+        chip.text = d.text || "";
+        chip.chars = d.chars || 0;
+        chip.loading = false;
+        chip.note = d.note || "";
+      } else {
+        // 抽不出文字（例如旧版 .doc/.wps）：如实告诉用户，别静默失败
+        const i = docs.indexOf(chip);
+        if (i >= 0) docs.splice(i, 1);
+        showToast(`《${f.name}》读不出文字：${d.error || "格式不支持"}`, "warn");
+      }
+    } catch (e) {
+      const i = docs.indexOf(chip);
+      if (i >= 0) docs.splice(i, 1);
+      showToast(`《${f.name}》上传失败：${e.message || e}`, "warn");
+    }
+    renderAttachments();
+  }
+
   function onDropFiles(files) {
     if (!files) return;
     [...files].forEach((f) => {
-      if (f && f.type && f.type.startsWith("image/")) {
+      if (!f) return;
+      if (f.type && f.type.startsWith("image/")) {
         const reader = new FileReader();
         reader.onload = () => { images.push(reader.result); renderAttachments(); };
         reader.readAsDataURL(f);
-      } else if (f && /\.(mp4|avi|mkv|mov|webm|flv|wmv|m4v|ts)$/i.test(f.name || "")) {
+      } else if (/\.(mp4|avi|mkv|mov|webm|flv|wmv|m4v|ts)$/i.test(f.name || "")) {
         // 视频：交给底部按钮处理逻辑保持一致（复用 videoInput）
         const dt = new DataTransfer(); dt.items.add(f);
         $("#videoInput").files = dt.files;
         $("#videoInput").dispatchEvent(new Event("change"));
+      } else if (DOC_EXT.test(f.name || "")) {
+        addDocAttachment(f);      // 文档：抽正文当资料
       }
     });
   }
@@ -315,11 +356,24 @@
       list.innerHTML = "";
       docs.forEach((doc) => {
         const row = document.createElement("div");
-        row.className = "kb-item";
-        row.innerHTML = `<span class="kb-name"></span>
-          <span class="kb-size">${Math.max(1, Math.round((doc.chars || 0) / 100) / 10)}k 字</span>
+        row.className = "kb-item" + (doc.indexed ? "" : " bad");
+        const ext = (doc.ext || "").toLowerCase();
+        const icon = ext === "pdf" ? "📕"
+          : ["doc", "docx", "wps"].includes(ext) ? "📘"
+          : ["xls", "xlsx", "et", "csv"].includes(ext) ? "📗"
+          : ["ppt", "pptx", "dps"].includes(ext) ? "📙" : "📄";
+        row.innerHTML = `<span class="kb-ico">${icon}</span>
+          <span class="kb-body">
+            <span class="kb-name"></span>
+            <span class="kb-sub"></span>
+          </span>
+          <span class="kb-size"></span>
           <button class="btn sm ghost danger kb-del" title="从知识库移除">×</button>`;
         row.querySelector(".kb-name").textContent = doc.filename || doc.id;
+        row.querySelector(".kb-sub").textContent = doc.indexed
+          ? `${fmtChars(doc.chars)} · 可检索`
+          : (doc.note || "读不出文字");      // 读不了要说清原因，不能让人以为没放进去
+        row.querySelector(".kb-size").textContent = fmtBytes(doc.size || 0);
         row.querySelector(".kb-del").onclick = async () => {
           if (!confirm(`从知识库移除《${doc.filename}》？\n（磁盘上的文件也会一起删掉）`)) return;
           await api("/api/kb/" + encodeURIComponent(doc.filename), { method: "DELETE" });
@@ -732,6 +786,22 @@
       d.querySelector(".x").onclick = () => { images.splice(i, 1); renderAttachments(); };
       box.appendChild(d);
     });
+    // 文档附件：显示成一张小卡片（文件名 + 字数）
+    docs.forEach((doc, i) => {
+      const d = document.createElement("div");
+      d.className = "attachment doc" + (doc.loading ? " loading" : "");
+      const icon = /\.pdf$/i.test(doc.name) ? "📕"
+                 : /\.(docx?|wps)$/i.test(doc.name) ? "📘"
+                 : /\.(xlsx?|et)$/i.test(doc.name) ? "📗"
+                 : /\.(pptx?|dps)$/i.test(doc.name) ? "📙" : "📄";
+      d.innerHTML = `<span class="doc-ico">${icon}</span>
+        <span class="doc-meta"><b></b><em></em></span><span class="x">✕</span>`;
+      d.querySelector("b").textContent = doc.name;
+      d.querySelector("em").textContent = doc.loading
+        ? "解析中…" : fmtChars(doc.chars);
+      d.querySelector(".x").onclick = () => { docs.splice(i, 1); renderAttachments(); };
+      box.appendChild(d);
+    });
     if (videoB64) {
       const d = document.createElement("div"); d.className = "attachment vid";
       d.innerHTML = `<span style="font-size:22px">🎬</span><span class="x">✕</span>`;
@@ -857,13 +927,24 @@
       });
     }
     const media = videoB64 ? [...videoB64] : imgB64;
-    images = []; videoB64 = null; renderAttachments();
+    // 文档附件：把抽取出的正文带上（解析中的/失败的不要发）
+    const docPayload = docs.filter((d) => d.text && d.text.trim())
+                           .map((d) => ({ name: d.name, text: d.text }));
+    if (docPayload.length) {
+      const el = document.createElement("div");
+      el.className = "msg user";
+      el.innerHTML = `<div class="bubble doc-sent"></div>`;
+      el.querySelector(".doc-sent").textContent =
+        "📎 " + docPayload.map((d) => d.name).join("、");
+      messagesEl.appendChild(el);
+    }
+    images = []; videoB64 = null; docs = []; renderAttachments();
     inputEl.value = ""; autoGrow();
-    await doSend(promptText, media.length ? media : null);
+    await doSend(promptText, media.length ? media : null, docPayload);
     loadMemory();   // 对话后同步 AI 写入的记忆文段
   }
 
-  async function doSend(promptText, mediaB64) {
+  async function doSend(promptText, mediaB64, docPayload) {
     history.push({ role: "user", content: promptText });
 
     // ---------- 思考过程：默认折叠，但实时刷新状态；展开可见实时全文 ----------
@@ -1029,7 +1110,9 @@
     $("#sendBtn").disabled = true;
     try {
       const resp = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: history, images_b64: mediaB64, stream: true, session_id: sessionId }) });
+        body: JSON.stringify({ messages: history, images_b64: mediaB64,
+                               docs: (docPayload && docPayload.length) ? docPayload : null,
+                               stream: true, session_id: sessionId }) });
       if (!resp.ok) {
         const e = await resp.json();
         throw new Error(e.detail || resp.statusText);

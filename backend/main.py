@@ -344,6 +344,7 @@ class ChatRequest(BaseModel):
     messages: list[dict]
     model: str | None = None
     images_b64: list[str] | None = None   # 附加到本轮 user 消息的图片
+    docs: list[dict] | None = None        # 拖进来的文档：[{name, text}]
     stream: bool = True
     session_id: str | None = None         # 会话标识，用于历史会话透视归档
 
@@ -597,7 +598,7 @@ class _SystemPrompt:
     """WorkBuddy 风格系统提示：精简注入分层记忆，给出工具使用引导。"""
 
     @staticmethod
-    def build(last_user_text: str, session: str = ""):
+    def build(last_user_text: str, session: str = "", docs: list = None):
         cfg = config.load_config()
         parts = [
             # 时间感知：让模型始终知道"今夕是何年何时"，避免说"不知道今天日期"
@@ -658,6 +659,24 @@ class _SystemPrompt:
             ctx = memory.build_context(session, query=last_user_text)
             if ctx:
                 parts.append(ctx)
+        # 用户拖进来的文档：正文直接给模型，让它能针对内容回答
+        if docs:
+            blocks, budget = [], 60000      # 总字数上限，避免把上下文撑爆
+            for d in docs[:5]:
+                text = str((d or {}).get("text") or "").strip()
+                name = str((d or {}).get("name") or "文档").strip()
+                if not text:
+                    continue
+                take = text[:max(0, budget)]
+                budget -= len(take)
+                blocks.append(f"《{name}》\n{take}")
+                if budget <= 0:
+                    break
+            if blocks:
+                parts.append(
+                    "【用户本轮拖入的文档】—— 请**直接依据这些内容**回答；"
+                    "用户问文档里的事时不要说自己看不到文件，也不要凭空编造文中没有的内容：\n\n"
+                    + "\n\n---\n\n".join(blocks))
         # RAG 知识库
         if cfg.get("rag_enabled"):
             ctx = kb.build_rag_context(last_user_text, top_k=cfg.get("rag_top_k", 4))
@@ -748,7 +767,7 @@ async def chat(req: ChatRequest):
     # 所以要先算出来，才能知道还剩多少空间给历史。
     # session 必须提前取到：记忆是按对话隔离的，注入时必须知道是哪个对话。
     session = req.session_id or ""
-    sys_prompt = _SystemPrompt.build(last_user, session)
+    sys_prompt = _SystemPrompt.build(last_user, session, req.docs)
     tool_schemas = tools.make_schemas(cfg.get("web_enabled", False),
                                       cfg.get("rag_enabled", False))
 
@@ -1345,9 +1364,46 @@ def kb_save(body: UploadBody):
 
 @app.post("/api/kb/upload")
 async def kb_upload(file: UploadFile):
-    content = (await file.read()).decode("utf-8", errors="replace")
-    doc = kb.save_document(file.filename, content)
+    """上传文档到知识库。
+
+    **按原始字节存盘**，不做任何解码 —— PDF / Word 都是二进制，
+    以前 decode("utf-8", errors="replace") 会把文件解坏，存进去等于垃圾。
+    解析交给读取时按扩展名走 doc_extract。
+    """
+    data = await file.read()
+    doc = kb.save_bytes(file.filename or "未命名", data)
     return {"ok": True, "document": doc}
+
+
+@app.post("/api/doc/extract")
+async def doc_extract_upload(file: UploadFile):
+    """从上传的文档里抽取文本（拖拽文档到聊天框时调用）。
+
+    只抽文本返回，**不落盘** —— 用户只是"想让模型看这份文档"，
+    并不一定要收进知识库。想留下的可以再用 /api/kb/upload。
+    """
+    import tempfile
+    from . import doc_extract
+    name = file.filename or "未命名"
+    data = await file.read()
+    if not data:
+        return {"ok": False, "name": name, "error": "文件是空的"}
+    tmp = os.path.join(tempfile.gettempdir(),
+                       f"mm_doc_{int(time.time() * 1000)}_"
+                       + os.path.basename(name).replace("..", ""))
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        text, note = doc_extract.extract_text(tmp)
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+    return {"ok": bool(text.strip()), "name": name,
+            "chars": len(text), "text": text, "note": note,
+            "supported": doc_extract.is_supported(name),
+            "error": "" if text.strip() else (note or "没能从这份文档里读出文字")}
 
 
 @app.delete("/api/kb/{name}")
