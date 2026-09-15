@@ -707,7 +707,9 @@ IMG_HEADERS = {
                   "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
     "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
     "Accept-Language": "zh-CN,zh;q=0.9",
-    "Referer": "https://cn.bing.com/",       # 绕开多数站点的防盗链
+    # 注意：这里**故意不写死 Referer**。
+    # 以前写死 cn.bing.com，结果百度系图库（bkimg.cdn.bcebos.com 等）全部 403，
+    # 用户看到的就是"搜图结果特别少"。Referer 由 download_image 按来源页动态给。
 }
 
 
@@ -776,19 +778,52 @@ def image_search(query: str, n: int = 4) -> list:
     return final
 
 
+def _fetch_bytes(url: str, referer: str | None, max_bytes: int,
+                 timeout: int) -> bytes | None:
+    """取一次图片字节。HTTP 错误往外抛（调用方据此决定要不要换 Referer）。"""
+    h = dict(IMG_HEADERS)
+    if referer:
+        h["Referer"] = referer
+    req = urllib.request.Request(url, headers=h)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if ctype and not ctype.startswith("image/"):
+            return None                      # 拿到的是网页/错误页，不是图
+        raw = resp.read(max_bytes + 1)
+    return None if len(raw) > max_bytes else raw
+
+
 def download_image(url: str, max_bytes: int = 8 * 1024 * 1024,
-                   timeout: int = 25) -> bytes | None:
-    """下载图片原始字节（限制体积，避免大图拖垮前端）。"""
-    try:
-        req = urllib.request.Request(url, headers=IMG_HEADERS)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            ctype = (resp.headers.get("Content-Type") or "").lower()
-            if ctype and not ctype.startswith("image/"):
-                return None
-            raw = resp.read(max_bytes + 1)
-        return None if len(raw) > max_bytes else raw
-    except Exception:
-        return None
+                   timeout: int = 25, referer: str | None = None) -> bytes | None:
+    """下载图片原始字节（限制体积，避免大图拖垮前端）。
+
+    ⚠️ **防盗链是这里最大的坑**（实测，也是"搜图结果很少"的根因）：
+    同一个链接，`Referer` 给 `https://cn.bing.com/` 会 **403 Forbidden**，
+    改成**图片所在页**或 `https://baike.baidu.com/` 就能正常拿到
+    （实测同一张图：bing 的 Referer → 403；来源页 → 11248 字节，正常）。
+
+    所以这里按「来源页 → 百度 → bing → 不带」依次重试。
+    只在 **401/403**（防盗链）时才换下一个 Referer ——
+    404 之类换 Referer 也没用，网络超时更不该反复重试浪费时间。
+    """
+    import urllib.error
+
+    refs = [referer, "https://baike.baidu.com/", "https://cn.bing.com/", None]
+    tried = set()
+    for i, r in enumerate(refs):
+        if r in tried:
+            continue
+        tried.add(r)
+        try:
+            # 第一次给足超时；后续重试只是换个 Referer，给短一点，别让失败拖慢整体
+            return _fetch_bytes(url, r, max_bytes, timeout if i == 0 else min(timeout, 8))
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                continue                     # 防盗链 → 换 Referer 再试
+            return None                      # 404/410 等，换 Referer 也无用
+        except Exception:
+            return None                      # 网络问题，不反复重试
+    return None
 
 
 # ---------- 调用外部 API ----------

@@ -46,8 +46,8 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False) -> list:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "名词短语关键词，如「埃菲尔铁塔 照片」「橘猫 壁纸」"},
-                        "n": {"type": "integer", "description": "返回数量，默认 4，最多 6"},
+                        "query": {"type": "string", "description": "名词短语关键词，如「埃菲尔铁塔 照片」「橘猫 壁纸」。**只放名词**，不要塞「详细特征/介绍/怎么样」这类词，那样会搜出无关内容"},
+                        "n": {"type": "integer", "description": "想要几张，默认 4，最多 8。用户嫌少时可以调大或再搜一次"},
                     },
                     "required": ["query"],
                 },
@@ -709,20 +709,29 @@ def _do_web_image_search(arguments, ui_events):
         n = int(arguments.get("n") or 4)
     except Exception:
         n = 4
-    n = max(1, min(n, 6))
+    n = max(1, min(n, 8))
 
+    # 多要一些候选再筛：搜索结果里总有一部分因为**防盗链或链接失效**下载不下来，
+    # 只按 n 条去取的话，实际能展示的会明显少于预期 —— 用户反馈过"搜图图片太少"。
     try:
-        results = web_tools.image_search(query, n=n)
+        results = web_tools.image_search(query, n=max(n * 3, 12))
     except Exception as exc:
         return f"联网搜图失败：{exc}"
     if not results:
-        return "联网搜图没有找到相关图片。可以换个更通用的关键词再试。"
+        return (f"联网搜图没有找到「{query}」的图片。"
+                "请**如实**告诉用户没搜到，不要凭印象去描述图片长什么样。")
 
-    shown, lines = 0, [f"【联网搜图】关键词：{query}"]
+    shown, tried, lines = 0, 0, [f"【联网搜图】关键词：{query}"]
     for r in results:
         if shown >= n:
             break
-        raw = web_tools.download_image(r["url"])
+        tried += 1
+        referer = r.get("source") or None
+        raw = web_tools.download_image(r["url"], referer=referer)
+        if not raw and r.get("thumb"):
+            # 原图被防盗链挡住时退一步用缩略图 —— 缩略图通常挂在允许外链的 CDN 上，
+            # 虽然小一些，但总比"一张都显示不出来"强。
+            raw = web_tools.download_image(r["thumb"], referer=referer)
         if not raw:
             continue
         shown += 1
@@ -747,11 +756,15 @@ def _do_web_image_search(arguments, ui_events):
         lines.append(f"    图片直链：{r['url']}")
 
     if shown == 0:
-        return "联网搜图失败：找到了结果但图片下载不下来（可能被目标站点防盗链拦截）。"
+        return (f"联网搜图失败：找到 {len(results)} 个候选，但图片都没能下载下来"
+                "（多为目标站点的防盗链）。请**如实**说明没取到图片，"
+                "不要改口去描述图片内容，也不要编造物种特征。")
 
     lines.append(
         f"已把 {shown} 张**网上搜索到的真实原图**展示给用户（这是搜索结果，不是你画的）。"
-        "请用中文简要说明找到了什么内容，并提示：可点图片下方「保存到图库」留存。")
+        f"（本轮共检查 {tried} 个候选，其余因防盗链或链接失效未能取到。）"
+        "请用中文简要说明找到了什么内容，并提示：可点图片下方「保存到图库」留存。"
+        "**只描述实际看到的内容，不要补充未经核实的事实**（搜图搜不到生物学特征）。")
     return "\n".join(lines)
 
 
