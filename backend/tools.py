@@ -1480,21 +1480,35 @@ def run_file(path: str, allow_risky: bool = False) -> dict:
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env.pop("MM_DATA_DIR", None)      # 被跑的代码不该摸到应用数据目录
     try:
-        pr = _sp.run([sys.executable, "-X", "utf8", os.path.basename(p)],
-                     cwd=os.path.dirname(p) or ".", env=env, capture_output=True,
-                     text=True, encoding="utf-8", errors="replace",
-                     timeout=RUN_TIMEOUT)
-        return {"needs_confirm": False, "risky": risky,
-                "out": (pr.stdout or "").strip(), "err": (pr.stderr or "").strip(),
-                "rc": pr.returncode, "seconds": round(time.time() - t0, 2)}
-    except _sp.TimeoutExpired:
-        return {"needs_confirm": False, "risky": risky, "out": "", "rc": None,
-                "seconds": round(time.time() - t0, 2),
-                "err": "执行超过 %d 秒，已被强制中止。" % RUN_TIMEOUT}
+        # 用 Popen + communicate（而不是 subprocess.run）：超时分支里还能
+        # **拿到已经打印出来的内容**。run 的 TimeoutExpired 会把缓冲一起丢掉，
+        # 于是"跑满 25 秒的计时器"在界面上显示成"（没有输出）"—— 实测踩过。
+        pr = _sp.Popen([sys.executable, "-X", "utf8", "-u", os.path.basename(p)],
+                       cwd=os.path.dirname(p) or ".", env=env,
+                       stdout=_sp.PIPE, stderr=_sp.PIPE,
+                       text=True, encoding="utf-8", errors="replace")
     except Exception as exc:
         return {"needs_confirm": False, "risky": risky, "out": "", "rc": -1,
                 "seconds": round(time.time() - t0, 2),
-                "err": "%s: %s" % (type(exc).__name__, exc)}
+                "err": "无法启动：%s: %s" % (type(exc).__name__, exc)}
+    try:
+        out, err = pr.communicate(timeout=RUN_TIMEOUT)
+        rc = pr.returncode
+    except _sp.TimeoutExpired:
+        pr.kill()
+        try:
+            out, err = pr.communicate()          # 收尸并取回已产出的输出
+        except Exception:
+            out, err = "", ""
+        return {"needs_confirm": False, "risky": risky,
+                "out": (out or "").strip(),
+                "err": ((err or "").strip()
+                        + "\n执行超过 %d 秒，已被强制中止（上面是中止前已经打印的内容）。"
+                        % RUN_TIMEOUT).strip(),
+                "rc": None, "seconds": round(time.time() - t0, 2)}
+    return {"needs_confirm": False, "risky": risky,
+            "out": (out or "").strip(), "err": (err or "").strip(),
+            "rc": rc, "seconds": round(time.time() - t0, 2)}
 
 
 def _do_workspace_list() -> str:

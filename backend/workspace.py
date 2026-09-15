@@ -23,6 +23,7 @@ import io
 import os
 import re
 import shutil
+import sys
 import time
 import zipfile
 
@@ -440,6 +441,163 @@ def norm_upload_name(filename: str) -> str:
     n = os.path.basename(str(filename or "").replace("\\", "/")).strip()
     n = re.sub(r'[\\/:*?"<>|\r\n]+', "_", n).strip(". ")
     return n or ("file_%d" % int(time.time()))
+
+
+# ------------------------------------------------- 运行（流式，像终端那样实时出字）
+# 为什么单独做一套：原来的实现是 `subprocess.run(capture_output=True)` ——
+# **跑完才拿得到输出**。于是计时器、服务器这类长任务在你眼里就是"一直正在执行"；
+# 而且**一旦超时被强杀，那 25 秒里打印的东西全被丢掉**（实测：番茄钟跑满 25 秒，
+# 界面显示"（没有输出）"）。流式版边跑边推，超时也保留已产出的内容。
+_RUNS = {}          # run_id -> Popen
+
+
+def start_run(rel: str, proj: str = "", run_id: str = "") -> dict:
+    """启动工作区里的 .py，返回 Popen —— 输出由调用方边读边推给前端。
+
+    与 `tools.run_file` 的分工：
+      · 这个给**用户手点「▶ 运行」**用：**不设超时**，要不要停由用户按「■ 停止」决定；
+      · `run_file` 给**模型工具**用：必须封顶，否则一个死循环就把智能体挂住了。
+    """
+    import subprocess as _sp
+    if not rel.lower().endswith(".py"):
+        return {"ok": False, "error": "目前只能直接运行 .py 文件。"}
+    try:
+        p = abs_path(rel, proj)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    if not os.path.isfile(p):
+        return {"ok": False, "error": "文件不存在：%s" % rel}
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            code = f.read()
+    except Exception as e:
+        return {"ok": False, "error": "读取失败：%s" % e}
+
+    from . import tools as _tools          # 延迟导入，避免模块级循环依赖
+    risky = _tools.scan_risky(code)
+
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"          # ⚠️ 关键：不加这个子进程会缓冲，看不到实时输出
+    env.pop("MM_DATA_DIR", None)
+    try:
+        proc = _sp.Popen(
+            # -u 同样是为了**关掉子进程缓冲**，否则 print 会攒成一块再吐
+            [sys.executable, "-X", "utf8", "-u", os.path.basename(p)],
+            cwd=os.path.dirname(p) or ".", env=env,
+            stdout=_sp.PIPE, stderr=_sp.STDOUT,
+            text=True, encoding="utf-8", errors="replace", bufsize=1)
+    except Exception as e:
+        return {"ok": False, "error": "启动失败：%s" % e}
+    _RUNS[run_id] = proc
+    return {"ok": True, "proc": proc, "rel": safe_rel(rel), "risky": risky}
+
+
+def stop_run(run_id: str = "") -> dict:
+    """停掉正在跑的进程；不给 id 就把所有在跑的停掉。"""
+    targets = [run_id] if run_id and run_id in _RUNS else list(_RUNS)
+    if not targets:
+        return {"ok": False, "error": "当前没有正在运行的进程"}
+    n = 0
+    for k in targets:
+        proc = _RUNS.pop(k, None)
+        if proc is None:
+            continue
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=4)
+            except Exception:
+                proc.kill()
+            n += 1
+        except Exception:
+            pass
+    return {"ok": True, "stopped": n}
+
+
+def reap_runs() -> None:
+    """清掉已经结束的进程记录。"""
+    for k in [k for k, v in _RUNS.items() if v.poll() is not None]:
+        _RUNS.pop(k, None)
+
+
+def kill_all_runs() -> None:
+    """起新任务 / 退出时把残留进程收干净。"""
+    stop_run("")
+
+
+def running_count() -> int:
+    reap_runs()
+    return len(_RUNS)
+
+
+# --------------------------------------------------------------- 用外部专业 IDE 打开
+def _find_ide() -> tuple:
+    """找本机已装的 PyCharm / VS Code，返回 (可执行文件, 名字)。
+
+    JetBrains 装在哪，最靠谱的线索是它自己在
+    `%LOCALAPPDATA%\\JetBrains\\PyCharm<版本>\\.home` 里写下的安装路径
+    （本机就是靠它找到 `D:\\PyCharm 2026.1.3` 的）——比猜目录名稳。
+    """
+    import glob
+    cands = []
+    home_root = os.path.join(os.path.expanduser("~"), "AppData", "Local", "JetBrains")
+    for d in glob.glob(os.path.join(home_root, "PyCharm*")):
+        f = os.path.join(d, ".home")
+        if os.path.isfile(f):
+            try:
+                with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                    root = fh.read().strip()
+            except Exception:
+                continue
+            for exe in ("bin/pycharm64.exe", "bin/pycharm.exe", "bin/pycharm.sh"):
+                cands.append((os.path.join(root, exe.replace("/", os.sep)), "PyCharm"))
+    for pat, name in (
+            (r"C:\Program Files\JetBrains\PyCharm*\bin\pycharm64.exe", "PyCharm"),
+            (r"C:\Program Files (x86)\JetBrains\PyCharm*\bin\pycharm64.exe", "PyCharm"),
+            (r"D:\PyCharm*\bin\pycharm64.exe", "PyCharm"),
+            (r"C:\Users\*\AppData\Local\Programs\PyCharm*\bin\pycharm64.exe", "PyCharm"),
+            (r"C:\Program Files\Microsoft VS Code\Code.exe", "VS Code"),
+            (r"C:\Users\*\AppData\Local\Programs\Microsoft VS Code\Code.exe", "VS Code")):
+        for hit in glob.glob(pat):
+            cands.append((hit, name))
+    for exe, name in cands:
+        if exe and os.path.isfile(exe):
+            return exe, name
+    return "", ""
+
+
+def open_in_ide(proj: str = "") -> dict:
+    """用外部专业 IDE（PyCharm / VS Code）打开当前项目。"""
+    import subprocess as _sp
+    p = safe_project(proj) if str(proj or "").strip() else active_project()
+    d = root(p)
+    exe, name = _find_ide()
+    if not exe:
+        return {"ok": False, "error": "没找到 PyCharm / VS Code。"
+                                      "可以在资源管理器里手动打开项目文件夹。",
+                "path": d}
+    try:
+        _sp.Popen([exe, d], close_fds=True)
+    except Exception as e:
+        return {"ok": False, "error": "启动失败：%s" % e, "path": d}
+    return {"ok": True, "ide": name, "exe": exe, "path": d, "project": p}
+
+
+def open_folder(proj: str = "") -> dict:
+    """在资源管理器里打开项目文件夹（找不到 IDE 时的兜底）。"""
+    p = safe_project(proj) if str(proj or "").strip() else active_project()
+    d = root(p)
+    try:
+        if os.name == "nt":
+            os.startfile(d)          # noqa: S606 —— Windows 专用，这里是预期行为
+        else:
+            import subprocess as _sp
+            _sp.Popen(["xdg-open", d])
+    except Exception as e:
+        return {"ok": False, "error": str(e), "path": d}
+    return {"ok": True, "path": d, "project": p}
 
 
 # --------------------------------------------------------------- 语法检查（调试）

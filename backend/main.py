@@ -13,6 +13,7 @@ from fastapi.responses import StreamingResponse, FileResponse, PlainTextResponse
 from pydantic import BaseModel
 
 import os
+import queue
 import re
 import sys
 import base64
@@ -1257,6 +1258,9 @@ _TEXT_TOOL_DOCS = {
     "get_time": '获取当前日期与时间。参数 {}',
 }
 _TEXT_TOOL_NAMES = set(_TEXT_TOOL_DOCS)
+# 正文里出现这些，就说明模型开始写"文本协议工具调用"了 —— 用来做流式时的边界判断
+_TEXT_TOOL_MARKS = ("```tool", "```tool_call", "```json", '{"name"')
+_TEXT_TOOL_MARK_MAX = max(len(m) for m in _TEXT_TOOL_MARKS)
 
 # 文本工具名 → 真实工具名（save_file 其实就是 library 的 write 动作）
 _TEXT_TOOL_ALIAS = {"save_file": "library"}
@@ -1368,6 +1372,33 @@ def _split_text_tool_calls(text: str):
                             cleaned = cleaned.replace(seg, "")
                         break
     return calls, cleaned.strip()
+
+
+def _safe_emit_len(text: str) -> int:
+    """正文里从哪个位置开始**可能**是"文本协议工具调用"——之前的部分可以安全推给用户。
+
+    这是"既要逐字流式、又不能把 ```tool 那坨 JSON 闪到界面上"的解法：
+    用**前缀匹配**把尾巴先扣住。只要结尾这几个字符可能是某个标记的开头，
+    就先不发，等后续内容来了再判断。
+    """
+    t = text or ""
+    if not t:
+        return 0
+    # ① 已经能看出是工具块的起点 → 从那里开始全扣住
+    best = len(t)
+    for mark in _TEXT_TOOL_MARKS:
+        i = t.find(mark)
+        if 0 <= i < best:
+            best = i
+    # ② 结尾可能正打到一半（"`"、"``"、"{" …）→ 也扣住
+    #    用**前缀匹配**而不是穷举，这样 ```tool_call / ```json / {"name" 都能覆盖
+    for k in range(1, _TEXT_TOOL_MARK_MAX):
+        if len(t) < k:
+            break
+        suffix = t[-k:]
+        if any(m.startswith(suffix) for m in _TEXT_TOOL_MARKS):
+            best = min(best, len(t) - k)
+    return max(0, best)
 
 
 def _route_code_model(cfg: dict, text: str, fallback: str, prev_code: bool = False):
@@ -2051,6 +2082,7 @@ async def chat(req: ChatRequest):
                 return
 
             round_msg = {"content": "", "thinking": None, "model": model}
+            code_emitted = 0        # 代码轮已经推给前端的正文长度（见 _safe_emit_len）
             tool_calls = None
             done_reason = ""
             # 注意：必须用 _stream_lines（子线程读 + 队列），
@@ -2076,11 +2108,16 @@ async def chat(req: ChatRequest):
                 if m.get("content"):
                     round_msg["content"] += m["content"]
                     if code_model_on:
-                        # 代码轮**先缓冲、不即时透出**：正文里可能夹着文本协议
-                        # 工具调用（```tool + JSON），那坨东西不能给用户看。
-                        # 等这轮结束、摘干净之后再整段吐出去。代码模型很快
-                        # （3~15 秒），这点缓冲代价远小于"界面上闪出一堆 JSON"。
-                        pass
+                        # 代码轮**也要逐字流式** —— 只是要把"可能开始写工具调用"
+                        # 的那段尾巴先扣住，等确认不是 ```tool 块再补发（见 _safe_emit_len）。
+                        # 之前是整轮缓冲、到轮末才吐：实测 19 秒一个事件都不出、
+                        # 然后一坨砸下来，用户体感就是"模型卡住了"。
+                        _safe = _safe_emit_len(round_msg["content"])
+                        if _safe > code_emitted:
+                            _piece = round_msg["content"][code_emitted:_safe]
+                            code_emitted = _safe
+                            final_text += _piece
+                            yield json.dumps({"message": {"content": _piece}}) + "\n"
                     else:
                         final_text += m["content"]
                         # 仅把用户可见的文本增量透出
@@ -2096,15 +2133,20 @@ async def chat(req: ChatRequest):
                 if obj.get("done"):
                     done_reason = obj.get("done_reason") or ""
 
-            # ---- 代码轮：把缓冲的正文摘掉文本协议调用后，整段吐给用户 ----
+            # ---- 代码轮：摘掉文本协议调用，并补发之前被扣住的尾巴 ----
             # 放在 `if not tool_calls` 之前 —— 解析出来的调用要能接进下面同一套执行逻辑。
             text_protocol = False
             if code_model_on and round_msg["content"]:
                 _calls, _clean = _split_text_tool_calls(round_msg["content"])
                 round_msg["content"] = _clean
-                if _clean:
-                    final_text += _clean
-                    yield json.dumps({"message": {"content": _clean}}) + "\n"
+                # 逐字流式时把"可能是工具调用"的尾巴扣住了，这里确认过再补发。
+                # 用 `> code_emitted` 判断：如果扣住的那段真是 ```tool 块，
+                # 清理后的正文会比已发的短，那就什么都不补。
+                if len(_clean) > code_emitted:
+                    _tail = _clean[code_emitted:]
+                    code_emitted = len(_clean)
+                    final_text += _tail
+                    yield json.dumps({"message": {"content": _tail}}) + "\n"
                 # 再校验一次白名单与开关：设置里关掉了「本地算代码」就不许执行
                 _calls = [c for c in _calls if c["name"] in code_text_tools]
                 if _calls:
@@ -2618,6 +2660,141 @@ def ws_git_push(body: dict):
         repo=str(b.get("repo") or ""),
         message=str(b.get("message") or ""),
         branch=str(b.get("branch") or "main"))
+
+
+@app.post("/api/ws/run_stream")
+async def ws_run_stream(body: dict):
+    """**流式**运行工作区里的 .py —— 像终端一样边跑边出字。
+
+    为什么不用原来那个 `/api/ws/run`：它是 `subprocess.run(capture_output=True)`，
+    **跑完才拿得到输出**。计时器/服务器这类长任务在界面上就是"一直正在执行"，
+    而且**一旦超时被强杀，这期间打印的内容全被丢掉**（实测番茄钟跑了 25 秒，
+    界面显示"（没有输出）"）。这里逐行推 NDJSON，超时也保留已产出的内容。
+    不设超时 —— 要不要停由用户按「■ 停止」决定。
+    """
+    b = body or {}
+    rid = str(b.get("id") or "")
+    workspace.kill_all_runs()             # 一次只跑一个，免得进程越堆越多
+    r = workspace.start_run(str(b.get("rel") or ""), run_id=rid)
+    if not r.get("ok"):
+        async def _bad():
+            yield json.dumps({"t": "end", "ok": False,
+                              "error": r.get("error")}, ensure_ascii=False) + "\n"
+        return StreamingResponse(_bad(), media_type="application/x-ndjson")
+
+    proc = r["proc"]
+
+    async def _gen():
+        q: queue.Queue = queue.Queue()
+
+        def _pump():
+            # 子进程的 stdout 是阻塞读的，必须丢到线程里，否则会把事件循环卡死
+            try:
+                for line in iter(proc.stdout.readline, ""):
+                    q.put(line)
+            except Exception:
+                pass
+            finally:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+                q.put(None)
+
+        threading.Thread(target=_pump, daemon=True).start()
+        yield json.dumps({"t": "start", "rel": r["rel"], "id": rid,
+                          "risky": r.get("risky") or []}, ensure_ascii=False) + "\n"
+        t0 = time.time()
+        while True:
+            try:
+                item = q.get_nowait()
+            except queue.Empty:
+                # 进程结束且队列空了 → 收工
+                if proc.poll() is not None and q.empty():
+                    break
+                await asyncio.sleep(0.03)     # 让出事件循环，保证真的是"边跑边推"
+                continue
+            if item is None:
+                break
+            yield json.dumps({"t": "out", "data": item}, ensure_ascii=False) + "\n"
+        rc = proc.poll()
+        if rc is None:
+            try:
+                rc = proc.wait(timeout=3)
+            except Exception:
+                rc = None
+        workspace.reap_runs()
+        yield json.dumps({"t": "end", "ok": True, "rc": rc,
+                          "seconds": round(time.time() - t0, 2)},
+                         ensure_ascii=False) + "\n"
+
+    return StreamingResponse(_gen(), media_type="application/x-ndjson")
+
+
+@app.post("/api/ws/run_stop")
+def ws_run_stop(body: dict):
+    """停掉正在跑的用户脚本。"""
+    return workspace.stop_run(str((body or {}).get("id") or ""))
+
+
+@app.get("/api/ws/run_status")
+def ws_run_status():
+    return {"ok": True, "running": workspace.running_count()}
+
+
+# ---------- 用外部专业 IDE 打开项目 ----------
+@app.post("/api/ws/warm")
+def ws_warm(body: dict):
+    """**预热模型**：打开开发台时调一次，免得第一次写代码干等十几秒。
+
+    实测冷启动那一下：代码模型要现加载，首字节能到 14 秒（界面上就是"没反应"）。
+    这里在后台用空 prompt 把它拉进显存并设 30 分钟保活，后面就是秒回。
+    """
+    import urllib.request as _u
+    try:
+        cfg = config.load_config() or {}
+    except Exception:
+        cfg = {}
+    want = str((body or {}).get("model") or "").strip()
+    models = [want] if want else [
+        m for m in [cfg.get("code_model"), cfg.get("default_model")] if m]
+    if not models:
+        return {"ok": False, "error": "没有可预热的模型"}
+    base = str(cfg.get("ollama_url") or "http://127.0.0.1:11434").rstrip("/")
+    payloads = [json.dumps({"model": m, "prompt": "", "stream": False,
+                            "keep_alive": "30m",
+                            "options": {"num_predict": 1}}).encode()
+                for m in models]
+
+    def _job():
+        for m, raw in zip(models, payloads):
+            try:
+                req = _u.Request(base + "/api/generate", data=raw,
+                                 headers={"Content-Type": "application/json"})
+                _u.urlopen(req, timeout=600).read()
+                logger.info("已预热模型 %s", m)
+            except Exception as e:
+                logger.warning("预热模型 %s 失败：%s", m, e)
+
+    threading.Thread(target=_job, daemon=True).start()
+    return {"ok": True, "models": models}
+
+
+@app.post("/api/ws/open_ide")
+def ws_open_ide(body: dict):
+    """用本机已装的 PyCharm / VS Code 打开当前项目。
+
+    为什么不自己造一个"更专业的编辑器"：断点调试、变量监视、重构、
+    代码导航这些东西，成熟 IDE 花了十几年 —— 与其重造一个半成品，
+    不如**把专业 IDE 直接接进来**（项目目录就是同一个，改完这边刷新即可）。
+    """
+    return workspace.open_in_ide(str((body or {}).get("project") or ""))
+
+
+@app.post("/api/ws/open_folder")
+def ws_open_folder(body: dict):
+    """在资源管理器里打开项目文件夹。"""
+    return workspace.open_folder(str((body or {}).get("project") or ""))
 
 
 @app.get("/api/doclib/files")

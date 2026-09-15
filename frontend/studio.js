@@ -383,23 +383,119 @@
     $("stOutBody").textContent = body;
   }
 
+  var runId = "";
+  var stoppedByUser = false;
+
+  function setRunning(on) {
+    var s = $("stRunStop");
+    if (s) s.hidden = !on;
+    var b = $("stRun");
+    if (b) { b.disabled = !!on; b.textContent = on ? "▶ 运行中…" : "▶ 运行"; }
+  }
+
+  /* 运行 = **流式**（像终端一样边跑边出字），不是跑完才给结果。
+     原来用 /api/ws/run 是同步的：计时器/服务器这类长任务就是"一直正在执行"，
+     而且超时被强杀时那段时间打印的内容全丢（实测番茄钟跑满 25 秒 →
+     界面显示"（没有输出）"）。见后端 ws_run_stream 的注释。 */
   async function runCur() {
+    if (runId) { toast("已经有一个在跑了，先点「■ 停止」"); return; }
     if (!cur) { toast("先打开一个文件"); return; }
     if (!/\.py$/i.test(cur)) { toast("目前只有 .py 能直接运行；前端项目请点「🚀 部署」"); return; }
     if (dirty[cur]) await saveCur();
-    showOut("运行中…", "正在执行 " + cur + " …");
-    var d = await jpost("/api/ws/run", { rel: cur });
-    if (d.needs_confirm) {
-      var risk = (d.risky || []).join("、");
-      if (confirm("这段代码里有需要确认的操作：" + risk + "\n\n确定要运行吗？")) {
-        d = await jpost("/api/ws/confirm_run", { rel: cur });
-      } else { showOut("已取消", "你拒绝了这次执行。"); return; }
+
+    var out = $("stOutBody");
+    $("stOut").hidden = false;
+    $("stOutTitle").textContent = "运行中 · " + cur + "（实时输出）";
+    out.textContent = "";
+    runId = "r" + Date.now();
+    stoppedByUser = false;
+    setRunning(true);
+    var t0 = Date.now();
+    var head = "";
+    try {
+      var resp = await fetch("/api/ws/run_stream", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rel: cur, id: runId })
+      });
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      var reader = resp.body.getReader();
+      var dec = new TextDecoder();
+      var tail = "";
+      while (true) {
+        var chunk = await reader.read();
+        if (chunk.done) break;
+        tail += dec.decode(chunk.value, { stream: true });
+        var lines = tail.split("\n");
+        tail = lines.pop();
+        for (var i = 0; i < lines.length; i++) {
+          var s = lines[i];
+          if (!s.trim()) continue;
+          var o;
+          try { o = JSON.parse(s); } catch (e) { continue; }
+          if (o.t === "out") {
+            out.textContent += o.data;
+            out.scrollTop = out.scrollHeight;      // 自动滚到底，像终端
+          } else if (o.t === "start") {
+            if (o.risky && o.risky.length) {
+              out.textContent += "[注意] 这段代码含：" + o.risky.join("、") + "\n";
+            }
+          } else if (o.t === "end") {
+            var secs = ((Date.now() - t0) / 1000).toFixed(2);
+            if (o.ok === false) {
+              head = "启动失败";
+              out.textContent += "\n" + (o.error || "未知错误");
+            } else {
+              head = "退出码 " + o.rc + "   用时 " + secs + " 秒"
+                + (stoppedByUser ? "   （你手动停止了）" : "");
+            }
+          }
+        }
+      }
+    } catch (e) {
+      head = "运行出错";
+      out.textContent += "\n" + (e.message || e);
+    } finally {
+      runId = "";
+      setRunning(false);
+      var body = out.textContent;
+      if (!body.trim()) body = "（没有输出 —— 代码里记得加 print()）";
+      out.textContent = head + "\n" + "─".repeat(34) + "\n" + body;
+      $("stOutTitle").textContent = "运行结果 · " + cur;
+      stoppedByUser = false;
     }
-    if (!d.ok) { showOut("运行失败", d.error || "未知错误"); return; }
-    var out = ["退出码 " + d.rc + "   用时 " + d.seconds + " 秒", "", "── 标准输出 ──",
-      d.out || "（没有输出 —— 代码里记得加 print()）"];
-    if (d.err) { out.push("", "── 错误 ──", d.err); }
-    showOut("运行结果 · " + cur, out.join("\n"));
+  }
+
+  async function stopRun() {
+    stoppedByUser = true;
+    try { await jpost("/api/ws/run_stop", { id: runId }); }
+    catch (e) { toast("停止失败：" + e.message); }
+  }
+
+  /* 用本机已装的专业 IDE 打开这个项目。
+     断点调试、变量监视、重构、代码导航这些，成熟 IDE 打磨了十几年 ——
+     与其自研一个半成品，不如把专业 IDE 直接接进来（**就是同一个项目目录**）。 */
+  async function openIde() {
+    try {
+      var d = await jpost("/api/ws/open_ide", {});
+      if (!d.ok) {
+        showOut("打开失败", (d.error || "") + "\n\n项目路径：\n" + (d.path || ""));
+        return;
+      }
+      showOut("已用 " + d.ide + " 打开", "项目目录：\n" + d.path +
+        "\n\n在 " + d.ide + " 里直接改这个目录即可 —— 改完回开发台点「⟳」刷新。");
+      toast("已用 " + d.ide + " 打开项目");
+    } catch (e) { showOut("打开失败", String(e.message || e)); }
+  }
+
+  async function openFolder() {
+    try {
+      var d = await jpost("/api/ws/open_folder", {});
+      if (!d.ok) {
+        showOut("打开失败", (d.error || "") + "\n\n" + (d.path || ""));
+        return;
+      }
+      toast("已在资源管理器打开");
+    } catch (e) { showOut("打开失败", String(e.message || e)); }
   }
 
   function previewCur() {
@@ -712,6 +808,8 @@
     var btn = $("openStudioBtn");
     if (btn) btn.textContent = "💬 回到聊天";
     try { await initEditor(); } catch (e) { toast("编辑器加载失败：" + e.message); }
+    // 后台预热模型：不做的话第一次写代码要现加载，界面上会"卡"十几秒
+    jpost("/api/ws/warm", {}).catch(function () { /* 预热失败不影响使用 */ });
     await loadProjects();
     await refresh();
     await loadChanges();
@@ -837,6 +935,9 @@
     $("stPreview").onclick = previewCur;
     $("stDeploy").onclick = deploy;
     $("stUpload").onclick = uploadProject;
+    $("stIde").onclick = openIde;
+    $("stFolder").onclick = openFolder;
+    $("stRunStop").onclick = stopRun;
     $("stDebug").onclick = debugCur;
     $("stOutFix").onclick = function () {
       var body = ($("stOutBody").textContent || "").trim();
