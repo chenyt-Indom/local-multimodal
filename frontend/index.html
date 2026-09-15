@@ -25,6 +25,20 @@
       </div>
     </div>
 
+    <!-- 知识库：把 .txt/.md 丢进文件夹即可被检索，无需导入 -->
+    <section class="panel kbpanel" id="kbPanel">
+      <div class="sec-head">
+        <h2>📚 知识库</h2>
+        <span class="head-acts">
+          <button class="btn sm ghost" id="kbOpenFolder" title="打开知识库文件夹 —— 把 .txt/.md 放进去就能被检索到">📂 打开文件夹</button>
+          <button class="btn sm ghost" id="kbRefresh">刷新</button>
+        </span>
+      </div>
+      <p class="hint" id="kbHint">把领域资料（.txt / .md）放进这个文件夹即可，**不需要导入**，放进去就能被检索到。</p>
+      <div class="kb-path" id="kbPath"></div>
+      <div class="list" id="kbList"></div>
+    </section>
+
     <!-- 图片库：搜到的图 / 生成的图统一留存，可随时调用与删除 -->
     <section class="panel library" id="libraryPanel">
       <div class="sec-head">

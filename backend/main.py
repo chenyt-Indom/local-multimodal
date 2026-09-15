@@ -1331,7 +1331,10 @@ class UploadBody(BaseModel):
 
 @app.get("/api/kb")
 def kb_list():
-    return {"ok": True, "documents": kb.list_documents()}
+    """列出知识库文档，并带上目录路径（前端要显示"该把文件放哪"）。"""
+    docs = kb.list_documents()
+    return {"ok": True, "documents": docs, "dir": kb.KB_DIR,
+            "enabled": bool(config.load_config().get("rag_enabled"))}
 
 
 @app.post("/api/kb")

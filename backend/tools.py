@@ -233,6 +233,11 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False) -> list:
     if web_enabled:
         schemas.append(_WEATHER_SCHEMA)   # 天气走数据 API，比搜索可靠得多
         schemas.append(_WEB_SEARCH_SCHEMA)
+    else:
+        # ⚠️ 联网搜图走的是外网，必须跟着「联网」开关一起关。
+        # 之前它写死在基础列表里，关着联网也能搜图 —— 与"关着不联网"的约定矛盾。
+        schemas = [s for s in schemas
+                   if s["function"]["name"] != "web_image_search"]
     return schemas
 
 

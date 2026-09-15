@@ -573,3 +573,21 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 .mem-block textarea:focus { outline: none; border-color: var(--accent); }
 .mem-meta { font-size: 11px; color: var(--muted); margin: 5px 0 2px; }
 .hint.sm { font-size: 11px; margin: 0 0 6px; line-height: 1.5; }
+
+/* ---------- 知识库面板 ---------- */
+.kbpanel .kb-path {
+  font-size: 10.5px; color: var(--muted); word-break: break-all;
+  background: var(--panel2); border: 1px solid var(--border);
+  border-radius: 6px; padding: 5px 7px; margin: 6px 0;
+  font-family: ui-monospace, Consolas, monospace;
+}
+.kb-item {
+  display: flex; align-items: center; gap: 7px;
+  background: var(--panel2); border: 1px solid var(--border);
+  border-radius: 7px; padding: 6px 8px; margin-bottom: 5px; font-size: 12px;
+}
+.kb-item .kb-name {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.kb-item .kb-size { color: var(--muted); font-size: 10.5px; flex: none; }
+.kb-item .kb-del { padding: 1px 7px; line-height: 1.4; }

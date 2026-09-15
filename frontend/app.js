@@ -292,6 +292,52 @@
       openFolderRequest("/api/library/open_folder", { method: "POST" });
   }
 
+  // ---------- 知识库 ----------
+  // 把 .txt/.md 丢进这个文件夹就会被检索到，**不需要导入操作** ——
+  // 所以界面上最重要的一件事就是"让人知道该往哪放"，
+  // 因此把目录路径直接显示出来，并提供一键打开。
+  async function loadKb() {
+    const list = $("#kbList"), pathEl = $("#kbPath"), hint = $("#kbHint");
+    if (!list) return;
+    try {
+      const d = await api("/api/kb");
+      if (pathEl) pathEl.textContent = d.dir || "";
+      const docs = d.documents || [];
+      if (hint) {
+        hint.innerHTML = docs.length
+          ? `已收录 <b>${docs.length}</b> 篇文档。把新的 .txt / .md 放进文件夹即自动生效。`
+          : "还没有资料。把 .txt / .md 文件放进下面的文件夹即可，<b>不需要导入</b>。";
+      }
+      if (!docs.length) {
+        list.innerHTML = '<p class="hint">（空）</p>';
+        return;
+      }
+      list.innerHTML = "";
+      docs.forEach((doc) => {
+        const row = document.createElement("div");
+        row.className = "kb-item";
+        row.innerHTML = `<span class="kb-name"></span>
+          <span class="kb-size">${Math.max(1, Math.round((doc.chars || 0) / 100) / 10)}k 字</span>
+          <button class="btn sm ghost danger kb-del" title="从知识库移除">×</button>`;
+        row.querySelector(".kb-name").textContent = doc.filename || doc.id;
+        row.querySelector(".kb-del").onclick = async () => {
+          if (!confirm(`从知识库移除《${doc.filename}》？\n（磁盘上的文件也会一起删掉）`)) return;
+          await api("/api/kb/" + encodeURIComponent(doc.filename), { method: "DELETE" });
+          loadKb();
+        };
+        list.appendChild(row);
+      });
+    } catch (e) { /* 静默 */ }
+  }
+
+  (function bindKbPanel() {
+    const open = $("#kbOpenFolder");
+    if (open) open.onclick = () =>
+      openFolderRequest("/api/kb/open_folder", { method: "POST" });
+    const rf = $("#kbRefresh");
+    if (rf) rf.onclick = loadKb;
+  })();
+
   // ---------- 多会话管理 ----------
   // 每个会话互相独立（各自的消息与上下文），全部持久化在后端，
   // 程序重启后自动恢复上次使用的会话。
@@ -1303,6 +1349,7 @@
   refreshHealth();
   loadToggles();
   loadMemory();
+  loadKb();
   loadLibrary();
   loadDevice();
   setInterval(refreshHealth, 5000);
