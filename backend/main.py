@@ -1082,6 +1082,20 @@ _CODE_ACTIONS = (
     "生成", "帮我", "给我", "补全", "完成",
 )
 
+# ⚠️ **大白话的"造东西"需求**（2026-09-16 补，vibecoding 场景）
+# 普通人描述需求不会说"写代码/脚本/python"，只会说「帮我做个小网页」
+# 「我想要个记账的小程序」。光靠上面那两张技术词表，这类请求**一个都匹配不上**，
+# 会被送到**思考型默认模型**上 —— 实测「帮我做一个小网页，番茄钟」跑了 7 分钟
+# 还没出结果（GPU 一直 97% 在"思考"），因为思考型模型既慢又不擅长写代码。
+# 规则：**造东西的动作（或明确的"我想要"） + 软件类产物名词** → 当成代码任务。
+# 只留明确的软件产物，别放「清单/表格/方案」这类也能是文档的词（会误切）。
+_BUILD_VERBS = ("做", "写", "实现", "开发", "搭", "搞", "弄", "生成", "编",
+                "想要", "我要", "要个", "来个")
+_PRODUCT_NOUNS = (
+    "网页", "页面", "网站", "小程序", "应用", "软件", "工具", "脚本",
+    "程序", "插件", "组件", "界面", "面板", "游戏", "app", "exe",
+)
+
 
 def _is_code_task(text: str) -> bool:
     t = (text or "").lower()
@@ -1094,6 +1108,10 @@ def _is_code_task(text: str) -> bool:
     # 只是"提到了"Python/JSON 这类词 —— 还要有动作词才算真要写代码
     if any(k in t for k in _CODE_WEAK):
         return any(a in t for a in _CODE_ACTIONS)
+    # 大白话的造物需求：「帮我做个小网页」「我想要个记账的小程序」
+    # （没有技术词，但有"做/写/搞…" + 软件类产物）
+    if any(k in t for k in _PRODUCT_NOUNS) and any(k in t for k in _BUILD_VERBS):
+        return True
     return False
 
 # 长文创作类请求：这些任务**必须一次写出几百上千字**，
@@ -1166,7 +1184,7 @@ def _mentions_local_path(text: str) -> bool:
     return bool(_LOCAL_PATH_RE.search(text or ""))
 
 
-def _needs_task_model(text: str) -> bool:
+def _needs_task_model(text: str, prev_code: bool = False) -> bool:
     """要不要换用"专用模型"（非思考型）。
 
     ⚠️ **长文创作不算在内**（试过，更糟）：换成 qwen2.5-coder 之后确实不出空答案了，
@@ -1175,20 +1193,27 @@ def _needs_task_model(text: str) -> bool:
     长文创作改走"砍工具 + 加额度"的路子（见 _writing_tools），用回默认模型。
 
     ⚠️ **带本机路径的请求也不算** —— 见 `_mentions_local_path` 的说明。
+
+    prev_code：上一轮回答里有没有代码块。**迭代轮次全靠这个兜住** ——
+    用户第二轮往往只说「再帮我改两处：加个深色模式」，这句话里一个代码关键词都没有，
+    只按本句判定就会掉回默认（思考型）模型；而那个模型的系统提示里写着 library 工具，
+    它会直接编「已保存到 xxx.html（3580 字节）」，**一个字代码都不给**（实测）。
     """
     if _mentions_local_path(text):
         return False          # 要读写本机文件 → 必须留在有工具的默认模型上
+    if prev_code:
+        return True           # 上一轮刚写过代码，这轮显然还在改它
     return _is_code_task(text)
 
 
-def _route_code_model(cfg: dict, text: str, fallback: str):
+def _route_code_model(cfg: dict, text: str, fallback: str, prev_code: bool = False):
     """代码类请求换用专用代码模型，返回 (模型名, 给用户看的提示)。"""
     if not cfg.get("code_auto_route", True):
         return fallback, ""
     want = str(cfg.get("code_model") or "").strip()
     if not want or want == fallback:
         return fallback, ""
-    if not _needs_task_model(text):
+    if not _needs_task_model(text, prev_code=prev_code):
         return fallback, ""
     if want not in _installed_models():
         # 还没下载 → 静默用回默认模型。配置名留着，用户下载后自动生效，不用改设置。
@@ -1376,7 +1401,8 @@ class _SystemPrompt:
     """WorkBuddy 风格系统提示：精简注入分层记忆，给出工具使用引导。"""
 
     @staticmethod
-    def build(last_user_text: str, session: str = "", docs: list = None):
+    def build(last_user_text: str, session: str = "", docs: list = None,
+              no_tools: bool = False):
         cfg = config.load_config()
         parts = [
             # 时间感知：让模型始终知道"今夕是何年何时"，避免说"不知道今天日期"
@@ -1478,6 +1504,18 @@ class _SystemPrompt:
             if ctx:
                 parts.append(ctx)
         parts.append("回答请使用中文，简洁、直接、可执行。")
+        if no_tools:
+            # ⚠️ **必须把工具说明整段摘掉，光追加一句"没有工具"不够。**
+            # 那段说明又长又具体（"用 library 工具写进生成文库""写文件才进文库"…），
+            # 模型会照着它编：实测让代码模型改个番茄钟，它回
+            # 「已成功保存到 `网页/番茄钟.html`（4730 字节）」——
+            # 文件压根不存在，而且**一个字代码都没给**，用户手上什么都没有。
+            # 工具说明是 parts 里的**一整个元素**（以这句开头），所以能整体摘掉。
+            parts = [p for p in parts if not p.startswith("你可以调用以下工具")]
+            parts.append(
+                "【本轮没有任何工具】工具清单已被移除。不要调用工具、不要描述工具，"
+                "更**不要声称**自己调用了工具、保存了文件或运行了代码 —— 那些你做不到。"
+                "需要用户动手的，直接告诉他点哪里（如「点卡片上的 ▶ 运行」）。")
         return "\n\n".join(p for p in parts if p)
 
 
@@ -1601,9 +1639,19 @@ async def chat(req: ChatRequest):
 
     last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
 
+    # ⚠️ 迭代轮次：上一轮回答里如果有代码块，这一轮就算用户只说「再改两处」，
+    # 也仍然是在改代码 —— 必须继续用代码模型。只看本句会把这类请求漏掉。
+    prev_code = False
+    _last_u = next((i for i in range(len(messages) - 1, -1, -1)
+                    if messages[i].get("role") == "user"), len(messages))
+    for _m in reversed(messages[:_last_u]):
+        if _m.get("role") == "assistant":
+            prev_code = "```" in str(_m.get("content") or "")
+            break
+
     # 本轮像写代码 → 换专用代码模型（只影响这一轮，下一轮自动回默认模型）
     if not req.model:
-        model, model_note = _route_code_model(cfg, last_user, model)
+        model, model_note = _route_code_model(cfg, last_user, model, prev_code=prev_code)
     # 本轮实际用的模型是不是"专用代码模型"？
     # 它不支持原生工具调用，工具定义必须整轮砍掉（见下面 tool_schemas 的处理）。
     _code_model_name = str(cfg.get("code_model") or "").strip()
@@ -1626,8 +1674,10 @@ async def chat(req: ChatRequest):
     # 所以要先算出来，才能知道还剩多少空间给历史。
     # session 必须提前取到：记忆是按对话隔离的，注入时必须知道是哪个对话。
     session = req.session_id or ""
-    sys_prompt = _SystemPrompt.build(last_user, session, req.docs)
-    if cfg.get("code_exec_enabled"):
+    sys_prompt = _SystemPrompt.build(last_user, session, req.docs, no_tools=code_model_on)
+    # ⚠️ 这两段都在描述工具（run_python / ask_user / library）。代码模型那一轮
+    # 工具已被清空，留着它们只会让模型"照着描述编"（实测：声称已保存文件、却没给代码）。
+    if cfg.get("code_exec_enabled") and not code_model_on:
         sys_prompt += (
             "\n\n【本地执行代码】你有一个 run_python 工具，可以在用户电脑上**真跑** Python。\n"
             "- 凡是要精确计算、处理数据、验证算法、换算日期/单位、测试正则的，"
@@ -1635,8 +1685,9 @@ async def chat(req: ChatRequest):
             "- 拿到的输出是真实结果，请依据它作答；如果代码报错，先说明错在哪、"
             "给出修正后的代码并**再跑一次**。\n"
             "- 回答里保留代码（用户要的是代码），但结论必须来自真实运行结果。")
-    # 创作类任务（作文/方案/报告）与生成文库的用法
-    sys_prompt += (
+    # 创作类任务（作文/方案/报告）与生成文库的用法（同上：代码模型那轮不注入）
+    if not code_model_on:
+        sys_prompt += (
         "\n\n【写作文 / 拟方案 / 写报告这类创作任务】\n"
         "- **信息不够就先问**：如果用户没说清【用途、给谁看、字数、文体、"
         "要突出的重点、时间或背景】，**必须调用 ask_user 工具**问 2~4 个关键问题再动笔"
@@ -1727,17 +1778,33 @@ async def chat(req: ChatRequest):
         if code_model_on:
             # 代码模型不支持工具调用，得明确告诉它"直接写代码"，
             # 否则它会模仿工具调用的格式吐一堵 JSON（实测）。
+            #
+            # ⚠️ 光说"没有工具"还不够 —— 上面系统提示的正文里明明写着
+            # 「你可以调用以下工具」「用 library 工具写进生成文库」。
+            # 工具 schema 被清掉、提示词却还在描述工具，模型就会**以为自己存了**：
+            # 实测第二轮改需求时它只回 337 字，写着
+            # 「已保存到文件夹 代码/番茄钟/番茄钟.html（4208 字节）」——
+            # 文件压根不存在，而且**一个字代码都没给**，用户啥也拿不到。
+            # 所以这里要写成**覆盖性**的硬规则，并明确禁止"虚假完成"。
             full_sys += (
-                "\n\n【本轮说明】本轮已切换到专用代码模型，**没有工具可用**。"
-                "请直接把完整可运行的代码写进 ``` 代码块里（标注语言），"
-                "并在后面用一小段说明解释思路与你验证用的数据。"
-                "**绝对不要**输出形如 {\"name\": \"...\", \"arguments\": {...}} 的 JSON —— "
+                "\n\n【本轮最高优先级 · 覆盖上面所有关于工具的说明】\n"
+                "本轮**一个工具都没有**（工具清单已被移除），所以：\n"
+                "· 上面提到的 library / 生成文库 / 保存文件 / 运行代码 **一律不适用**。\n"
+                "  **绝对不要说**「已保存到…」「已经写入…」「文件已生成」「我已经运行并验证」——\n"
+                "  你做不到这些，说了就是骗人。\n"
+                "· **必须把完整代码重新写一遍**放在 ``` 代码块里（标注语言）。\n"
+                "  哪怕是改一个小地方，也要给出改完之后的**整份代码**，\n"
+                "  不能只说「我改了 A、加了 B」——那样用户手上没有可用的东西。\n"
+                "· 需要用户自己做的动作，就直说：「请点卡片上的 ▶ 运行」「请点 💾 存到文库」。\n"
+                "· **不要**输出形如 {\"name\": \"...\", \"arguments\": {...}} 的 JSON —— "
                 "那是工具调用的内部格式，写出来用户看到的是一堆乱码。"
                 "\n【代码要能直接跑】用户会在界面上点「▶ 运行」执行你的代码："
                 "\n· **不要用 input() 等交互输入** —— 运行环境没有键盘，会直接报 EOFError。"
                 "需要参数就写成模块顶部的变量，或从 sys.argv 取并给默认值。"
                 "\n· 结尾要有 print() 把结果打出来，否则界面上只会显示「没有输出」。"
-                "\n· 尽量只用标准库（沙箱里的第三方库不保证装全）。")
+                "\n· 尽量只用标准库（沙箱里的第三方库不保证装全）。"
+                "\n· 网页类产物：写成**单个自包含的 .html**（样式和脚本都内联），"
+                "用户双击就能用，别引用外部 CDN。")
         working = [{"role": "system", "content": full_sys}] + messages
         final_text = ""
         final_thinking = ""
