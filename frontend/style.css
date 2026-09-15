@@ -658,3 +658,68 @@ body.dragging .drop-overlay,
 .btn.stop:hover { background: rgba(229, 83, 75, .14); animation: none; }
 @keyframes stopPulse { 0%, 100% { opacity: 1 } 50% { opacity: .6 } }
 @media (prefers-reduced-motion: reduce) { .btn.stop { animation: none } }
+
+/* ---------- 代码卡片（模型执行的代码 / 回答里的代码块）---------- */
+.code-card {
+  margin: 10px 0; border: 1px solid var(--border); border-radius: 12px;
+  background: #12151c; overflow: hidden;
+}
+.code-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 10px; background: var(--panel2); border-bottom: 1px solid var(--border);
+}
+.code-title { font-size: 12px; font-weight: 600; color: var(--text); }
+.code-risk {
+  font-size: 11px; color: #f0b429; background: rgba(240,180,41,.12);
+  border: 1px solid rgba(240,180,41,.35); border-radius: 999px; padding: 2px 8px;
+}
+.code-meta { font-size: 11px; color: var(--muted); }
+.code-btns { margin-left: auto; display: flex; gap: 6px; }
+.code-body {
+  margin: 0; padding: 12px; overflow-x: auto; font-size: 12.5px; line-height: 1.55;
+  font-family: Consolas, "Cascadia Mono", Menlo, monospace; color: #d9e2f1;
+  background: transparent; white-space: pre-wrap; word-break: break-word;
+}
+.code-edit-area {
+  display: block; width: 100%; min-height: 150px; resize: vertical;
+  border: none; outline: none; background: #0b0e13; color: #d9e2f1;
+  font-family: Consolas, "Cascadia Mono", Menlo, monospace;
+  font-size: 12.5px; line-height: 1.55;
+}
+.code-out { border-top: 1px dashed var(--border); }
+.code-part { padding: 8px 12px; font-size: 12px; color: var(--text); }
+.code-part b {
+  display: block; margin-bottom: 4px; color: var(--muted);
+  font-weight: 600; font-size: 11px;
+}
+.code-part pre {
+  margin: 0; white-space: pre-wrap; word-break: break-word;
+  font-family: Consolas, "Cascadia Mono", Menlo, monospace; color: #cfe3d4;
+}
+.code-part.err pre { color: #f08a84; }
+.code-part.empty { color: var(--muted); }
+.code-time { padding: 0 12px 8px; font-size: 11px; color: var(--muted); }
+.md-text { white-space: pre-wrap; }
+
+/* ---------- 危险操作确认弹窗 ---------- */
+.confirm-layer {
+  position: fixed; inset: 0; z-index: 10000; display: flex;
+  align-items: center; justify-content: center;
+  background: rgba(8,10,14,.72); backdrop-filter: blur(2px);
+}
+.confirm-box {
+  width: min(680px, 92vw); max-height: 86vh; overflow: auto;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+  padding: 18px; box-shadow: 0 22px 60px rgba(0,0,0,.55);
+}
+.confirm-title { font-size: 16px; font-weight: 600; color: #f0b429; }
+.confirm-reason { margin-top: 8px; font-size: 13px; color: var(--text); }
+.confirm-code {
+  margin-top: 10px; padding: 12px; max-height: 320px; overflow: auto;
+  background: #0b0e13; border: 1px solid var(--border); border-radius: 10px;
+  font-family: Consolas, "Cascadia Mono", Menlo, monospace; font-size: 12.5px;
+  line-height: 1.55; color: #d9e2f1; white-space: pre-wrap; word-break: break-word;
+}
+.confirm-tip { margin-top: 10px; font-size: 12px; color: var(--muted); }
+.confirm-btns { margin-top: 14px; display: flex; gap: 10px; justify-content: flex-end; }
+.confirm-btns .btn { width: auto; margin: 0; padding: 8px 16px; }

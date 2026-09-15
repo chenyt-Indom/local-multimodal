@@ -455,7 +455,7 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
     if name == "search_knowledge":
         return _do_search_knowledge(arguments)
     if name == "run_python":
-        return _do_run_python(arguments)
+        return _do_run_python(arguments, ui_events, context)
     if name == "get_time":
         return time.strftime("%Y-%m-%d %H:%M:%S (%A)")
     if name == "web_search":
@@ -1127,75 +1127,145 @@ def _do_remember(arguments, context=None):
 # ---------- 本地代码执行（"离线计算"）----------
 RUN_TIMEOUT = 25          # 秒。计算题够用，也避免死循环把机器占住
 
-# 出现这些字样就**不执行** —— 目标是"只算数"，不是"让模型操作你的电脑"。
+# 需要"先问用户"的操作。**不再一律拦截** ——
+# 用户明确要求：发现危险操作先问一句，批准了就执行，而不是直接拒绝。
+# 每项配一句人话理由，前端弹窗直接展示给用户看。
 # 说明：这不是滴水不漏的沙箱（真正的沙箱要上容器/权限隔离），
-# 而是一道"明显危险就别放行"的闸门；开关默认关闭，风险由用户自己权衡。
-_PY_FORBIDDEN = (
-    "shutil.rmtree", "os.removedirs", "os.rmdir", "os.remove", "os.unlink",
-    "format c:", "format d:", "del /f", "del /s", "rmdir /s", "rm -rf",
-    "shutdown", "reg delete", "winreg", "ctypes", "os.system", "subprocess",
-    "os.startfile", "os.exec", "os.fork", "eval(compile", "__import__('os').system",
-    # 顺带把"联网"也关掉 —— 这个功能的定位就是**离线**计算。
-    "import socket", "import urllib", "import requests", "import httpx", "urlopen",
+# 而是一道"明显危险就先问一句"的闸门；开关默认关闭，风险由用户自己权衡。
+_PY_RISKY = (
+    (("shutil.rmtree", "os.removedirs", "os.rmdir", "os.remove", "os.unlink",
+      "del /f", "del /s", "rmdir /s", "rm -rf", "format c:", "format d:"), "会删除文件或目录"),
+    (("subprocess", "os.system", "os.popen", "os.exec", "os.startfile",
+      "os.spawn", "os.fork"), "会启动外部程序"),
+    (("winreg", "reg delete", "reg add"), "会修改 Windows 注册表"),
+    (("shutdown", "reboot"), "可能影响系统开关机"),
+    (("socket", "urllib", "requests", "httpx", "urlopen", "ftplib", "smtplib"),
+     "会联网（这个模块本来是给'离线计算'用的）"),
+    (("ctypes",), "会直接调用系统底层接口"),
+    (("eval(", "exec("), "会动态执行字符串代码"),
 )
 
 
-def _do_run_python(arguments):
-    """在本机真跑一段 Python，把 stdout 拿回来。
+def scan_risky(code: str) -> list:
+    """返回代码里命中的风险项（人话描述）。空列表 = 没发现风险。
 
-    为什么要真跑：模型"心算"很容易出错（数字、日期、正则尤其明显），
-    而代码跑一遍的结果是**确定的**。这也是"离线计算"的落点。
+    注释行先剔掉 —— 免得"注释里提了一句 subprocess"也被当成风险。
     """
-    code = str((arguments or {}).get("code") or "").strip()
-    if not code:
-        return "错误：代码为空。"
-    # 去掉注释行再检查，避免"注释里提了一句 subprocess 就被拦"
-    scanned = "\n".join(ln for ln in code.splitlines() if not ln.strip().startswith("#"))
+    scanned = "\n".join(ln for ln in (code or "").splitlines()
+                         if not ln.strip().startswith("#"))
     low = scanned.lower()
-    for bad in _PY_FORBIDDEN:
-        if bad in low:
-            return ("出于安全考虑，这段代码里含有被禁止的操作「%s」，**没有执行**。\n"
-                    "请改成只做计算、不碰系统与网络的写法（不要用 subprocess / os.system / "
-                    "删除文件 / 联网请求 等）。" % bad)
+    hits = []
+    for pats, label in _PY_RISKY:
+        if any(p in low for p in pats):
+            hits.append(label)
+    return hits
+
+
+def run_code(code: str, allow_risky: bool = False) -> dict:
+    """执行一段 Python，返回**结构化**结果（工具与前端接口共用）。
+
+    字段：needs_confirm / risky / out / err / rc / seconds
+    needs_confirm=True 表示"检测到风险但还没获批准"，**没有执行**。
+    """
+    code = str(code or "").strip()
+    if not code:
+        return {"needs_confirm": False, "risky": [], "out": "", "err": "代码为空",
+                "rc": -1, "seconds": 0}
+    risky = scan_risky(code)
+    if risky and not allow_risky:
+        return {"needs_confirm": True, "risky": risky, "out": "", "err": "",
+                "rc": None, "seconds": 0}
     import tempfile
     import subprocess as _sp
+    t0 = time.time()
     with tempfile.TemporaryDirectory(prefix="mm_run_") as d:
         path = os.path.join(d, "snippet.py")
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(code)
         except Exception as exc:
-            return "错误：无法写入临时文件：%s" % exc
+            return {"needs_confirm": False, "risky": risky, "out": "", "rc": -1,
+                    "seconds": 0, "err": "无法写入临时文件：%s" % exc}
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         # 不让被执行的代码摸到应用的数据目录
-        for k in ("MM_DATA_DIR",):
-            env.pop(k, None)
+        env.pop("MM_DATA_DIR", None)
         try:
             p = _sp.run([sys.executable, "-X", "utf8", "snippet.py"],
                         cwd=d, env=env, capture_output=True, text=True,
                         encoding="utf-8", errors="replace", timeout=RUN_TIMEOUT)
+            out = (p.stdout or "").strip()
+            err = (p.stderr or "").strip()
+            rc = p.returncode
         except _sp.TimeoutExpired:
-            return ("代码执行超过 %d 秒，已强制中止。请减少计算量，或改成更小的输入分步验证。"
-                    % RUN_TIMEOUT)
+            return {"needs_confirm": False, "risky": risky, "out": "", "rc": None,
+                    "seconds": round(time.time() - t0, 2),
+                    "err": "执行超过 %d 秒，已被强制中止。" % RUN_TIMEOUT}
         except Exception as exc:
-            return "代码执行失败：%s: %s" % (type(exc).__name__, exc)
-        out = (p.stdout or "").strip()
-        err = (p.stderr or "").strip()
+            return {"needs_confirm": False, "risky": risky, "out": "", "rc": -1,
+                    "seconds": round(time.time() - t0, 2),
+                    "err": "%s: %s" % (type(exc).__name__, exc)}
+    return {"needs_confirm": False, "risky": risky, "out": out, "err": err,
+            "rc": rc, "seconds": round(time.time() - t0, 2)}
+
+
+def _format_py_result(r: dict) -> str:
+    """把执行结果整理成给模型看的文本。"""
     lines = ["【代码执行结果】"]
+    out = r.get("out") or ""
+    err = r.get("err") or ""
     if out:
         if len(out) > 4000:
             out = "（输出过长，只保留最后 4000 字）\n" + out[-4000:]
         lines.append("标准输出：\n" + out)
     if err:
-        lines.append("报错信息：\n" + err[-1500:])
+        head = "运行提示：\n" if r.get("rc") in (0, None) else "报错信息：\n"
+        lines.append(head + err[-1500:])
     if not out and not err:
         lines.append("（代码没有输出任何内容 —— 别忘了用 print() 把结果打出来）")
-    if p.returncode != 0:
-        lines.append("（退出码 %s，说明代码报错了；请先修正再给出结论）" % p.returncode)
+    if r.get("rc") not in (0, None):
+        lines.append("（退出码 %s，说明代码报错了；请先修正再给出结论）" % r.get("rc"))
+    if r.get("risky"):
+        lines.append("（这次执行包含用户已批准的操作：%s）" % "、".join(r["risky"]))
     lines.append("请**依据上面的真实输出**回答用户；如果代码报错，先说清错在哪并给出修正后的代码。")
     return "\n\n".join(lines)
+
+
+def _do_run_python(arguments, ui_events=None, context=None):
+    """在本机真跑一段 Python，把 stdout 拿回来。
+
+    为什么要真跑：模型"心算"很容易出错（数字、日期、正则尤其明显），
+    而代码跑一遍的结果是**确定的**。这也是"离线计算"的落点。
+
+    ⚠️ 检测到危险操作时**不是直接拒绝，而是先问用户**（用户明确要求）：
+    批准了就执行，拒绝才放弃。没有确认通道时（例如脚本里直接调用）默认**不执行**。
+    """
+    code = str((arguments or {}).get("code") or "").strip()
+    r = run_code(code, allow_risky=False)
+    if r.get("needs_confirm"):
+        ask = (context or {}).get("confirm")
+        risk = "、".join(r.get("risky") or [])
+        if not callable(ask):
+            return ("这段代码里有需要用户确认的操作（%s），但当前没有可用的确认通道，**没有执行**。\n"
+                    "请改成不涉及这些操作的写法。" % risk)
+        allowed = ask({"kind": "python", "code": code,
+                       "risky": r.get("risky") or [],
+                       "reason": "检测到：" + risk})
+        if not allowed:
+            return ("用户**拒绝了**这次执行（原因：%s）。\n"
+                    "请换一种不涉及这些操作的写法；如果确实必须这么做，"
+                    "先把你要做什么、为什么这么做说清楚，等用户同意再试。\n"
+                    "⚠️ **绝对不要编造执行结果或用模拟数据冒充真实输出** ——"
+                    "那会让用户以为结果是真的。如实说明「被拒绝了」即可。" % risk)
+        r = run_code(code, allow_risky=True)
+    # 把这次执行的代码与结果推给前端 → 界面渲染成"可直接编辑重跑"的代码卡片
+    if isinstance(ui_events, list):
+        ui_events.append({"type": "code", "code": code,
+                          "out": r.get("out") or "", "err": r.get("err") or "",
+                          "rc": r.get("rc"), "seconds": r.get("seconds"),
+                          "risky": r.get("risky") or []})
+    return _format_py_result(r)
 
 
 def _do_search_knowledge(arguments):

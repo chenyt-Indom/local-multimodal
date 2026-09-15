@@ -555,6 +555,15 @@ FRONTEND_DIR = config.res("frontend")
 
 
 # ---------- 数据模型 ----------
+class ToolConfirmRequest(BaseModel):
+    id: str
+    allow: bool = False
+
+
+class CodeRunRequest(BaseModel):
+    code: str
+
+
 class ChatRequest(BaseModel):
     messages: list[dict]
     model: str | None = None
@@ -878,6 +887,39 @@ def _route_code_model(cfg: dict, text: str, fallback: str):
     return want, "已切到代码模型 %s（专用代码模型，不思考、写代码更稳）" % want
 
 
+# =====================================================================
+#  工具执行前的"问用户"通道
+# =====================================================================
+# 用户明确要求：模型碰到危险操作时**别直接拒绝，先问一句**，批准了就执行。
+# 难点在于：工具是跑在线程池里的（阻塞），而弹窗必须**立刻**出现在网页上。
+# 做法：把事件塞进一个异步队列（流式生成器边跑边吐出去），
+# 然后**阻塞那个工作线程**，等 /api/tool/confirm 把用户的选择写回来。
+_confirm_pending: dict = {}
+_confirm_lock = threading.Lock()
+
+
+def _make_confirmer(loop, live_ui, timeout: float = 900.0):
+    """生成一个 confirm(payload) -> bool 的通道，交给工具用。"""
+
+    def confirm(payload: dict) -> bool:
+        cid = "cf-" + os.urandom(5).hex()
+        item = {"event": threading.Event(), "allow": False}
+        with _confirm_lock:
+            _confirm_pending[cid] = item
+        try:
+            msg = {"type": "confirm", "id": cid}
+            msg.update(dict(payload or {}))
+            loop.call_soon_threadsafe(live_ui.put_nowait, msg)
+            if not item["event"].wait(timeout):
+                return False          # 用户一直没回应 → 当拒绝处理
+            return bool(item["allow"])
+        finally:
+            with _confirm_lock:
+                _confirm_pending.pop(cid, None)
+
+    return confirm
+
+
 class _SystemPrompt:
     """WorkBuddy 风格系统提示：精简注入分层记忆，给出工具使用引导。"""
 
@@ -1170,6 +1212,9 @@ async def chat(req: ChatRequest):
         # ⚠️ 较早对话摘要**必须并进第一条 system 消息**，不能再加一条 system。
         # 实测：Ollama 的 qwen 系对话模板只取第一条 system，第二条会被**静默丢弃** ——
         # 摘要写进去了、接口也没报错，但模型压根看不到，症状就是"还是说忘记了"。
+        # 工具执行期间要能**实时**把弹窗推给前端，所以单独开一个队列
+        loop = asyncio.get_running_loop()
+        live_ui: asyncio.Queue = asyncio.Queue()
         full_sys = sys_prompt + ("\n\n" + digest if digest else "")
         working = [{"role": "system", "content": full_sys}] + messages
         final_text = ""
@@ -1267,7 +1312,9 @@ async def chat(req: ChatRequest):
             # shown_images：本轮已展示给用户的图，供「保存到图库」工具按序号引用
             # session：记忆按对话隔离，写记忆的工具必须知道当前是哪个对话
             ctx = {"images": images or _recent_image(), "shown_images": [],
-                   "session": session}
+                   "session": session,
+                   # 危险操作（删文件、起进程、联网…）先问用户，批准了再执行
+                   "confirm": _make_confirmer(loop, live_ui)}
 
             # 先把本轮所有工具调用解析出来，并逐个通知前端"开始执行"
             calls = []
@@ -1304,8 +1351,21 @@ async def chat(req: ChatRequest):
 
             if len(calls) > 1:
                 yield json.dumps({"tool_parallel": len(calls)}) + "\n"
-            gathered = await asyncio.gather(
-                *[_run_one(i, n, a) for i, (n, a) in enumerate(calls)])
+            # ⚠️ 不能用裸的 `await asyncio.gather(...)`：
+            # 那样要等**所有工具跑完**才有机会往外吐东西，
+            # 而"询问用户是否继续"的弹窗必须立刻出现在界面上（工具那会儿正阻塞等着答复）。
+            # 所以改成边等工具、边把实时事件推给前端。
+            _tool_task = asyncio.ensure_future(asyncio.gather(
+                *[_run_one(i, n, a) for i, (n, a) in enumerate(calls)]))
+            while not _tool_task.done():
+                try:
+                    _evt = await asyncio.wait_for(live_ui.get(), timeout=0.2)
+                except asyncio.TimeoutError:
+                    continue
+                yield json.dumps({"ui": _evt}) + "\n"
+            gathered = await _tool_task
+            while not live_ui.empty():      # 收尾：把队列里剩下的也吐出去
+                yield json.dumps({"ui": live_ui.get_nowait()}) + "\n"
             for _idx, name, result, ev in sorted(gathered, key=lambda x: x[0]):
                 # 把本次新产生的图片登记下来，后续工具（如保存到图库）可按序号引用
                 for e in ev:
@@ -1345,6 +1405,34 @@ async def chat(req: ChatRequest):
         yield json.dumps({"done": True, "text": final_text, "thinking": final_thinking}) + "\n"
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+
+@app.post("/api/tool/confirm")
+def tool_confirm(req: ToolConfirmRequest):
+    """用户在弹窗里点了「允许」/「拒绝」。
+
+    工具线程正阻塞等待这个结果，所以这里必须**立即**返回，不能有任何耗时操作。
+    """
+    with _confirm_lock:
+        item = _confirm_pending.get(req.id)
+    if not item:
+        raise HTTPException(status_code=404,
+                            detail="这个确认请求已经失效或超时了，请让模型重新发起")
+    item["allow"] = bool(req.allow)
+    item["event"].set()
+    return {"ok": True, "allow": bool(req.allow)}
+
+
+@app.post("/api/code/run")
+def code_run(req: CodeRunRequest):
+    """前端代码卡片里的「▶ 运行」——跑用户自己写的/改过的代码。
+
+    用户点"运行"这个动作本身就是批准，所以这里不再二次弹窗。
+    走的是和模型同一个沙箱（临时目录、超时、拿不到应用数据目录）。
+    """
+    r = tools.run_code(req.code, allow_risky=True)
+    r.pop("needs_confirm", None)
+    return {"ok": True, **r}
 
 
 @app.post("/api/chat/stop")

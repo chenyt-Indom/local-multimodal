@@ -1141,6 +1141,161 @@
       else if (name === "web_search") thinkStatus.textContent = "🌐 正在联网检索…";
       else thinkStatus.textContent = "🔧 正在调用工具：" + (TOOL_LABELS[name] || name);
     };
+
+    // ---------- 代码卡片：模型跑了什么代码、结果怎样，都能直接看、直接改、直接重跑 ----------
+    // 模型在回答里贴的代码块也会用它渲染（见 renderAnswerWithCode）。
+    const makeCodeCard = (ui, title) => {
+      const card = document.createElement("div");
+      card.className = "code-card";
+      const risk = (ui.risky || []).length
+        ? `<span class="code-risk" title="这些操作已经过你批准">⚠ ${escapeHtml((ui.risky || []).join("、"))}</span>`
+        : "";
+      const meta = [];
+      if (ui.seconds) meta.push("⏱ " + ui.seconds + "s");
+      if (ui.rc === 0) meta.push("退出码 0");
+      else if (ui.rc !== null && ui.rc !== undefined) meta.push("退出码 " + ui.rc);
+      card.innerHTML =
+        `<div class="code-head"><span class="code-title">${escapeHtml(title || "🐍 本地执行的代码")}</span>${risk}` +
+        `<span class="code-meta">${escapeHtml(meta.join(" · "))}</span>` +
+        `<span class="code-btns"><button class="btn sm ghost code-edit">✏ 编辑</button>` +
+        `<button class="btn sm ghost code-run">▶ 运行</button>` +
+        `<button class="btn sm ghost code-copy">📋 复制</button></span></div>` +
+        `<pre class="code-body"><code></code></pre><div class="code-out"></div>`;
+      const codeEl = card.querySelector(".code-body code");
+      const editBtn = card.querySelector(".code-edit");
+      const runBtn = card.querySelector(".code-run");
+      const copyBtn = card.querySelector(".code-copy");
+      const outEl = card.querySelector(".code-out");
+      let current = ui.code || "";
+      codeEl.textContent = current;
+
+      const paintOut = (r) => {
+        const bits = [];
+        if (r.out) bits.push(`<div class="code-part"><b>输出</b><pre>${escapeHtml(r.out)}</pre></div>`);
+        if (r.err) bits.push(`<div class="code-part err"><b>${r.rc ? "报错" : "提示"}</b><pre>${escapeHtml(r.err)}</pre></div>`);
+        if (!r.out && !r.err) bits.push('<div class="code-part empty">（没有输出 —— 代码里要用 print() 打印结果）</div>');
+        if (r.seconds !== undefined && r.seconds !== null) bits.push(`<div class="code-time">耗时 ${r.seconds}s</div>`);
+        outEl.innerHTML = bits.join("");
+      };
+      if (ui.out || ui.err) paintOut(ui);
+
+      // 编辑：把 <pre> 换成 textarea（所见即所得，改完直接跑）
+      let editing = false;
+      let area = null;
+      editBtn.onclick = () => {
+        // ⚠️ 替换的父节点要用 card，**不能用 pre 自己**：
+        // `<pre>` 本身就是 .code-body，在它自己身上 querySelector(".code-body")
+        // 只会搜子元素、返回 null，replaceChild(x, null) 会抛异常，
+        // 结果就是"点了编辑按钮毫无反应"（踩过）。
+        const pre = card.querySelector(".code-body");
+        if (!editing) {
+          area = document.createElement("textarea");
+          area.className = "code-edit-area";
+          area.spellcheck = false;
+          area.value = current;
+          card.replaceChild(area, pre);
+          editing = true;
+          editBtn.textContent = "✔ 完成";
+          area.focus();
+        } else {
+          current = area.value;
+          const np = document.createElement("pre");
+          np.className = "code-body";
+          const c = document.createElement("code");
+          c.textContent = current;
+          np.appendChild(c);
+          card.replaceChild(np, area);
+          editing = false;
+          editBtn.textContent = "✏ 编辑";
+        }
+      };
+      const grab = () => (editing && area ? area.value : current);
+      runBtn.onclick = async () => {
+        const code = grab();
+        if (!code.trim()) { showToast("代码是空的", "warn"); return; }
+        current = code;
+        runBtn.disabled = true;
+        const old = runBtn.textContent;
+        runBtn.textContent = "运行中…";
+        outEl.innerHTML = '<div class="code-part">正在运行…</div>';
+        try {
+          const r = await api("/api/code/run", { method: "POST", body: JSON.stringify({ code }) });
+          if (r && r.ok) paintOut(r);
+          else outEl.innerHTML = `<div class="code-part err">运行失败：${escapeHtml(String((r && r.detail) || "未知错误"))}</div>`;
+        } catch (e) {
+          outEl.innerHTML = `<div class="code-part err">运行失败：${escapeHtml(String(e.message || e))}</div>`;
+        } finally {
+          runBtn.disabled = false;
+          runBtn.textContent = old;
+        }
+      };
+      copyBtn.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(grab());
+          showToast("代码已复制", "ok");
+        } catch (e) {
+          showToast("复制失败，请手动选中", "warn");
+        }
+      };
+      return card;
+    };
+
+    // 模型回答里的 ```代码块```：渲染成同样的可编辑卡片（不然只能干看着文本）
+    const renderAnswerWithCode = (bubble, text) => {
+      const parts = [];
+      const re = /```([a-zA-Z0-9_+#.-]*)[ \t]*\n([\s\S]*?)```/g;
+      let last = 0, m;
+      while ((m = re.exec(text)) !== null) {
+        if (m.index > last) parts.push({ t: "text", v: text.slice(last, m.index) });
+        parts.push({ t: "code", lang: m[1] || "", v: m[2].replace(/\n$/, "") });
+        last = m.index + m[0].length;
+      }
+      if (last < text.length) parts.push({ t: "text", v: text.slice(last) });
+      if (!parts.some((p) => p.t === "code")) { bubble.textContent = text; return; }
+      bubble.textContent = "";
+      parts.forEach((p) => {
+        if (p.t === "text") {
+          if (!p.v.trim()) return;
+          const d = document.createElement("div");
+          d.className = "md-text";
+          d.textContent = p.v;
+          bubble.appendChild(d);
+        } else {
+          bubble.appendChild(makeCodeCard({ code: p.v }, "📄 代码（可编辑后直接运行）"));
+        }
+      });
+    };
+
+    // 危险操作确认：模型要删文件/起进程/联网时，**先问一句**而不是直接拒绝
+    const showConfirm = (ui) => {
+      if (document.querySelector(".confirm-layer")) return;   // 同一时刻只弹一个
+      const layer = document.createElement("div");
+      layer.className = "confirm-layer";
+      layer.innerHTML =
+        '<div class="confirm-box">' +
+        '<div class="confirm-title">⚠️ 这次操作需要你确认</div>' +
+        `<div class="confirm-reason">${escapeHtml(ui.reason || "模型请求执行一段有风险的代码")}</div>` +
+        '<pre class="confirm-code"><code></code></pre>' +
+        '<div class="confirm-tip">批准后会在本机真实执行（临时目录、25 秒超时）。不确定就别点允许。</div>' +
+        '<div class="confirm-btns"><button class="btn ghost" data-act="deny">拒绝</button>' +
+        '<button class="btn primary" data-act="allow">允许执行</button></div></div>';
+      layer.querySelector("code").textContent = ui.code || "";
+      document.body.appendChild(layer);
+      const answer = async (allow) => {
+        layer.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+        try {
+          await api("/api/tool/confirm", {
+            method: "POST", body: JSON.stringify({ id: ui.id, allow }) });
+          showToast(allow ? "已允许执行" : "已拒绝", allow ? "ok" : "");
+        } catch (e) {
+          showToast("回复失败：" + String(e.message || e), "warn");
+        } finally {
+          layer.remove();
+        }
+      };
+      layer.querySelector('[data-act="deny"]').onclick = () => answer(false);
+      layer.querySelector('[data-act="allow"]').onclick = () => answer(true);
+    };
     const addMedia = (ui) => {
       const isWeb = ui.origin === "web";
       const card = document.createElement("div");
@@ -1247,7 +1402,11 @@
           }
           if (obj.ui) {
             if (obj.ui.type === "sources") sourcesData = obj.ui;   // 稍后在回答下方渲染
-            else addMedia(obj.ui);
+            else if (obj.ui.type === "confirm") showConfirm(obj.ui);
+            else if (obj.ui.type === "code") {
+              answerWrap.appendChild(makeCodeCard(obj.ui));
+              messagesEl.scrollTop = messagesEl.scrollHeight;
+            } else addMedia(obj.ui);
           }
           if (obj.note) { notes.push(obj.note); showToast(obj.note, "warn"); }
           if (obj.done) break;
@@ -1255,7 +1414,9 @@
         messagesEl.scrollTop = messagesEl.scrollHeight;
       }
       finishThinking();
-      answerBubble.textContent = answer;
+      // 回答里带代码块的话渲染成可编辑卡片；否则维持原来的纯文本（不改变原有观感）
+      if (answer && answer.indexOf("```") >= 0) renderAnswerWithCode(answerBubble, answer);
+      else answerBubble.textContent = answer;
       if (!answer) {
         // 别把空白气泡藏起来让用户一脸茫然——明确说明发生了什么
         answerBubble.textContent = notes.length
