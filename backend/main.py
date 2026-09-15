@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 
 import os
+import re
 import sys
 import base64
 import io
@@ -957,6 +958,37 @@ _ui_pending: dict = {}
 _ui_lock = threading.Lock()
 
 
+# 用户明确要"一个文件"的说法。
+# 命中它却没看到 library 工具被调用 → 大概率是模型"虚假完成"，需要兜底。
+_WANT_FILE_HINTS = (
+    "保存", "存起来", "存到", "存进", "存成", "写成文档", "写成文件", "导出",
+    "生成文件", "放进文库", "另存", "文件形式", "给我一个文件", "存一下", "存档",
+)
+
+
+def _wants_file(text: str) -> bool:
+    t = text or ""
+    return any(k in t for k in _WANT_FILE_HINTS)
+
+
+def _autosave_answer(text: str) -> str:
+    """把模型写好的正文自动存进生成文库，返回相对路径（失败返回空串）。"""
+    try:
+        first = ""
+        for ln in (text or "").splitlines():
+            seg = ln.strip().lstrip("#＃* ").strip()
+            if seg:
+                first = seg
+                break
+        name = (re.sub(r'[\\/:*?"<>|]', "", first)[:24].strip()
+                .rstrip("。，、！？.!? ")) or "未命名"
+        rel = "%s-%s.md" % (time.strftime("%Y%m%d-%H%M"), name)
+        r = doclib.write_file(rel, text)
+        return r.get("rel") if r.get("ok") else ""
+    except Exception:
+        return ""
+
+
 def _make_ui_channel(loop, live_ui, timeout: float = 900.0):
     """生成"问用户"的两个通道：confirm（危险操作确认）与 ask（追问细节）。
 
@@ -1268,6 +1300,8 @@ async def chat(req: ChatRequest):
         "**完整复制过去** —— 不许只写摘要、不许留占位符（如「（在此粘贴正文）」）、不许自己另编一版。"
         "存完如实告诉用户存了哪个文件、多少字。\n"
         "- ⚠️ 描述文件内容时**只能说你真正写进去的东西**，别编造章节、页数或里边根本没有的内容。\n"
+        "- ⚠️ **只有真的调用了 library 工具、并拿到成功回执，才能说「已保存」。"
+        "没调用工具就声称已保存，是最严重的错误** —— 用户去文库一看是空的，白信你一场。\n"
         "- ⚠️ **知识库是用户的资料，只能读、绝不能改**；凡是要写文件一律进生成文库。"
         "两者用途完全不同，不要混为一谈。\n"
         "- 用户要「WPS 格式 / Word 文档」→ 先写进文库，再用 library 的 export_docx 转成 .docx"
@@ -1320,6 +1354,7 @@ async def chat(req: ChatRequest):
         working = [{"role": "system", "content": full_sys}] + messages
         final_text = ""
         final_thinking = ""
+        used_tools = set()          # 本轮真正调用过的工具（用来判断"是不是光嘴上说说"）
         # 换了模型就提前吱一声，免得用户以为"怎么这次回复的口吻变了"
         if model_note:
             yield json.dumps({"note": model_note}) + "\n"
@@ -1469,6 +1504,7 @@ async def chat(req: ChatRequest):
             while not live_ui.empty():      # 收尾：把队列里剩下的也吐出去
                 yield json.dumps({"ui": live_ui.get_nowait()}) + "\n"
             for _idx, name, result, ev in sorted(gathered, key=lambda x: x[0]):
+                used_tools.add(name)
                 # 把本次新产生的图片登记下来，后续工具（如保存到图库）可按序号引用
                 for e in ev:
                     if e.get("type") == "image":
@@ -1494,6 +1530,18 @@ async def chat(req: ChatRequest):
             sessions.prune(session)       # 过长则自动裁剪，避免记录无限膨胀
         except Exception:
             pass
+
+        # ---- 兜底：用户要了文件，模型却只是"嘴上说存好了" ----
+        # 实测会这样：回答里写「已将本文写入生成文库，保存为 xxx.md」，
+        # 但文库目录是空的 —— 它压根没调工具。用户以为存好了，这种"虚假完成"最坑。
+        if (_wants_file(last_user) and "library" not in used_tools
+                and len(final_text.strip()) > 200):
+            _saved = _autosave_answer(final_text)
+            if _saved:
+                yield json.dumps({"ui": {"type": "library", "act": "write",
+                                         "rel": _saved, "auto": True}}) + "\n"
+                yield json.dumps({"note": (
+                    "模型没有真的执行保存，我已把正文自动存进生成文库：%s" % _saved)}) + "\n"
 
         # 自动记忆：把本轮要点提炼进记忆（后台，且**等用户停手再做**，不跟聊天抢显卡）。
         # 每轮都安排，覆盖最近几轮内容；命中信号词（尤其"我做过/参加过"这类经历）则立即做。
