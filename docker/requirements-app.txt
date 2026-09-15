@@ -7,3 +7,7 @@ numpy>=1.24
 python-multipart>=0.0.9
 # video.py 顶层导入 cv2（视频抽帧）。headless 版不依赖 GUI 库，体积更小
 opencv-python-headless>=4.9
+# doc_extract.py 用它读知识库里的 PDF（纯 Python，体积很小）。
+# 不装的话容器里 PDF 会读不出文字，而知识库面板只会显示"读不了"。
+# docx/xlsx/pptx/xls 走标准库解析，不需要额外依赖。
+pypdf>=4.0
