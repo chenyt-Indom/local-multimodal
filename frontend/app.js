@@ -42,8 +42,7 @@
   }
 
   // 轻提示：顶部居中出现，2.6 秒后自动淡出
-  function showToast(msg, kind = "") {
-    let wrap = document.getElementById("toastWrap");
+  function showToast(msg, kind = "") {    let wrap = document.getElementById("toastWrap");
     if (!wrap) {
       wrap = document.createElement("div");
       wrap.id = "toastWrap";
@@ -60,6 +59,8 @@
       setTimeout(() => el.remove(), 280);
     }, 2600);
   }
+  // 给开发台（studio.js，独立 IIFE）复用同一个提示条 —— 否则两套提示风格不一致
+  window.__toast = showToast;
 
   // 输入框弹层（自建，不用原生 prompt）。
   // ⚠️ 为什么不能用 window.prompt：桌面窗口是 WebView2，它**不支持 prompt**
@@ -1767,6 +1768,10 @@
             else if (obj.ui.type === "code") {
               answerWrap.appendChild(makeCodeCard(obj.ui));
               messagesEl.scrollTop = messagesEl.scrollHeight;
+            }
+            else if (obj.ui.type === "workspace") {
+              // 模型改了工作区文件 → 开发台刷新（当前打开的就是它的话会重载内容）
+              if (window.Studio && window.Studio.notify) window.Studio.notify(obj.ui);
             } else addMedia(obj.ui);
           }
           if (obj.note) { notes.push(obj.note); showToast(obj.note, "warn"); }

@@ -29,6 +29,66 @@ from . import docx_write
 # =====================================================================
 #  工具 Schema（发给模型）
 # =====================================================================
+# =====================================================================
+#  开发工作区工具（人机协同开发）
+# =====================================================================
+# 为什么必须单独给"工作区"工具，而不是让模型用 read_file/write_file 传绝对路径：
+# 那样模型得先猜出工作区在哪，实测它猜不准，还会把文件写到应用安装目录里去。
+# 工作区工具的路径一律是**相对路径**，由后端拼，模型不可能写到外面。
+_WS_LIST_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "workspace_list",
+        "description": ("【开发工作区】列出工作区里现有的文件（人机协同开发的项目目录）。"
+                        "要动某个已有文件之前，先用它看清有哪些文件。"),
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
+_WS_READ_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "workspace_read",
+        "description": ("【开发工作区】读取工作区里的一个文件（传**相对路径**，如 app.py）。"
+                        "⚠️ 修改任何已有文件之前**必须先读它**，在真实内容上改 —— "
+                        "用户可能刚在前端的开发台里手改过，凭记忆重写会把他的改动冲掉。"),
+        "parameters": {"type": "object",
+                       "properties": {"rel": {"type": "string",
+                                              "description": "工作区内的相对路径，如 src/app.py"}},
+                       "required": ["rel"]},
+    },
+}
+
+_WS_WRITE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "workspace_write",
+        "description": ("【开发工作区】把内容写进工作区文件（存在则覆盖，旧版自动进回收站）。"
+                        "**要给整份文件内容**，不要只给片段。写完用户会在「开发台」里看到。"),
+        "parameters": {"type": "object",
+                       "properties": {
+                           "rel": {"type": "string", "description": "工作区内的相对路径"},
+                           "text": {"type": "string", "description": "文件的完整内容"}},
+                       "required": ["rel", "text"]},
+    },
+}
+
+
+_WS_RUN_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "workspace_run",
+        "description": ("【开发工作区】运行工作区里的一个 .py 文件，拿到**真实输出与报错**。"
+                        "工作目录就是该文件所在目录，所以脚本里的相对路径是对的。"
+                        "写完文件后**用它验证**，不要凭空猜运行结果。"),
+        "parameters": {"type": "object",
+                       "properties": {"rel": {"type": "string",
+                                              "description": "工作区内的相对路径，如 app.py"}},
+                       "required": ["rel"]},
+    },
+}
+
+
 def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
                  code_exec: bool = False, writing: bool = False) -> list:
     """返回工具 schema 列表。
@@ -254,6 +314,13 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
     # 开关关着，模型连工具都看不到，自然就不会去翻资料。
     schemas.append(_LIBRARY_SCHEMA)
     schemas.append(_ASK_USER_SCHEMA)
+    # 开发工作区：人机协同开发用（多文件项目，相对路径，后端拼绝对路径）
+    schemas.append(_WS_LIST_SCHEMA)
+    schemas.append(_WS_READ_SCHEMA)
+    schemas.append(_WS_WRITE_SCHEMA)
+    if code_exec:
+        # 跑工作区文件同样属于"在本机执行代码"，跟着同一个开关走
+        schemas.append(_WS_RUN_SCHEMA)
     if kb_enabled:
         schemas.append(_KB_SCHEMA)
     if code_exec:
@@ -532,6 +599,14 @@ def json_dumps(o) -> str:
 
 def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
     """执行一个工具调用，返回给模型的文本。ui_events 收集前端副作用。"""
+    if name == "workspace_list":
+        return _do_workspace_list()
+    if name == "workspace_read":
+        return _do_workspace_read(arguments)
+    if name == "workspace_write":
+        return _do_workspace_write(arguments, ui_events)
+    if name == "workspace_run":
+        return _do_workspace_run(arguments, ui_events)
     if name == "web_image_search":
         return _do_web_image_search(arguments, ui_events)
     if name == "get_weather":
@@ -1329,6 +1404,136 @@ def run_code(code: str, allow_risky: bool = False) -> dict:
                     "err": "%s: %s" % (type(exc).__name__, exc)}
     return {"needs_confirm": False, "risky": risky, "out": out, "err": err,
             "rc": rc, "seconds": round(time.time() - t0, 2)}
+
+
+def run_file(path: str, allow_risky: bool = False) -> dict:
+    """运行**磁盘上真实存在的** .py 文件（工作区里的项目文件）。
+
+    和 `run_code` 的区别：这里 **cwd 设成文件所在目录**，并且直接跑原文件 ——
+    这样脚本里的相对路径（`open("data.txt")`）、`__file__` 都是对的。
+    协同开发时"脚本 + 它的输入数据"就摆在同一个目录里，这样才跑得通；
+    以前塞进临时目录跑，一律说"找不到文件"。
+
+    风险扫描同样保留：检测到危险操作先问用户，不静默放行。
+    """
+    p = os.path.abspath(str(path or ""))
+    if not os.path.isfile(p):
+        return {"needs_confirm": False, "risky": [], "out": "", "rc": -1,
+                "seconds": 0, "err": "文件不存在"}
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            code = f.read()
+    except Exception as exc:
+        return {"needs_confirm": False, "risky": [], "out": "", "rc": -1,
+                "seconds": 0, "err": "读取失败：%s" % exc}
+    risky = scan_risky(code)
+    if risky and not allow_risky:
+        return {"needs_confirm": True, "risky": risky, "out": "", "err": "",
+                "rc": None, "seconds": 0}
+    import subprocess as _sp
+    t0 = time.time()
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env.pop("MM_DATA_DIR", None)      # 被跑的代码不该摸到应用数据目录
+    try:
+        pr = _sp.run([sys.executable, "-X", "utf8", os.path.basename(p)],
+                     cwd=os.path.dirname(p) or ".", env=env, capture_output=True,
+                     text=True, encoding="utf-8", errors="replace",
+                     timeout=RUN_TIMEOUT)
+        return {"needs_confirm": False, "risky": risky,
+                "out": (pr.stdout or "").strip(), "err": (pr.stderr or "").strip(),
+                "rc": pr.returncode, "seconds": round(time.time() - t0, 2)}
+    except _sp.TimeoutExpired:
+        return {"needs_confirm": False, "risky": risky, "out": "", "rc": None,
+                "seconds": round(time.time() - t0, 2),
+                "err": "执行超过 %d 秒，已被强制中止。" % RUN_TIMEOUT}
+    except Exception as exc:
+        return {"needs_confirm": False, "risky": risky, "out": "", "rc": -1,
+                "seconds": round(time.time() - t0, 2),
+                "err": "%s: %s" % (type(exc).__name__, exc)}
+
+
+def _do_workspace_list() -> str:
+    from . import workspace as _ws
+    t = _ws.tree()
+    files = t.get("files") or []
+    if not files:
+        return "工作区现在是空的（还没有任何文件）。可以直接用 workspace_write 新建。"
+    lines = ["工作区共 %d 个文件：" % len(files)]
+    lines += ["· %s（%d 字节）" % (f["rel"], f["size"]) for f in files[:200]]
+    if len(files) > 200:
+        lines.append("…（只列了前 200 个）")
+    return "\n".join(lines)
+
+
+def _do_workspace_read(arguments) -> str:
+    from . import workspace as _ws
+    rel = str((arguments or {}).get("rel") or "").strip()
+    r = _ws.read_text(rel)
+    if not r.get("ok"):
+        return "读取失败：%s" % r.get("error")
+    text = r.get("text") or ""
+    tip = "" if len(text) <= 6000 else "\n\n（文件较长，这里只显示前 6000 字）"
+    return "【工作区文件 %s】共 %d 字：\n\n%s%s" % (rel, len(text), text[:6000], tip)
+
+
+def _do_workspace_write(arguments, ui_events=None) -> str:
+    from . import workspace as _ws
+    args = arguments or {}
+    rel = str(args.get("rel") or args.get("name") or "").strip()
+    text = args.get("text")
+    if text is None:
+        text = args.get("content") or ""
+    try:
+        r = _ws.write_text(rel, str(text))
+    except ValueError as e:
+        return "写入失败：%s" % e
+    if not r.get("ok"):
+        return "写入失败：%s" % r.get("error")
+    if isinstance(ui_events, list):
+        # 让前端开发台自动刷新文件树/打开的内容
+        ui_events.append({"type": "workspace", "act": "write", "rel": r["rel"],
+                          "chars": r.get("chars", 0)})
+    return "已写入工作区文件：%s（%d 字）%s" % (
+        r["rel"], r.get("chars", 0),
+        "；旧版已备份进回收站" if r.get("backup") else "")
+
+
+def _do_workspace_run(arguments, ui_events=None) -> str:
+    """跑工作区里的 .py（cwd = 文件所在目录），把真实输出回给模型。"""
+    from . import workspace as _ws
+    rel = str((arguments or {}).get("rel") or "").strip()
+    try:
+        p = _ws.abs_path(rel)
+    except ValueError as e:
+        return "运行失败：%s" % e
+    if not os.path.isfile(p):
+        return "运行失败：工作区里没有这个文件 → %s" % rel
+    if not rel.lower().endswith(".py"):
+        return ("当前只能直接运行 .py 文件。如果你想验证网页，"
+                "写好后让用户点开发台上的「🌐 预览」。")
+    r = run_file(p, allow_risky=False)
+    if r.get("needs_confirm"):
+        ask = (arguments or {}).get("__confirm__")
+        risk = "、".join(r.get("risky") or [])
+        return ("这段代码里有需要用户确认的操作（%s），**没有执行**。"
+                "请换成不涉及这些操作的写法，或先跟用户说明再试。" % risk)
+    if isinstance(ui_events, list):
+        ui_events.append({"type": "code", "code": _read_text_safe(p),
+                          "out": r.get("out") or "", "err": r.get("err") or "",
+                          "rc": r.get("rc"), "seconds": r.get("seconds"),
+                          "risky": r.get("risky") or []})
+    head = "【运行 %s】\n" % rel
+    return head + _format_py_result(r)
+
+
+def _read_text_safe(p: str) -> str:
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except Exception:
+        return ""
 
 
 def _format_py_result(r: dict) -> str:

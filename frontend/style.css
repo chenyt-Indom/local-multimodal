@@ -779,3 +779,41 @@ body.dragging .drop-overlay,
   border-bottom: 1px dashed var(--border);
 }
 .folder-head:first-child { margin-top: 2px; }
+
+/* ---------- 开发台（人机协同开发） ---------- */
+.studio { position: fixed; inset: 0; z-index: 300; background: var(--bg); display: flex; flex-direction: column; }
+.studio[hidden] { display: none; }
+.studio-bar { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--border); }
+.studio-title { font-weight: 600; white-space: nowrap; }
+.studio-path { color: var(--muted); font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.studio-acts { display: flex; gap: 6px; flex-wrap: wrap; }
+.studio-body { flex: 1; display: flex; min-height: 0; }
+.studio-side { width: 250px; min-width: 190px; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+.studio-side-head { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--muted); }
+.studio-tree { flex: 1; overflow: auto; padding: 6px 0; }
+.st-dir, .st-file { display: flex; align-items: center; gap: 6px; padding: 3px 10px; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.st-dir { color: var(--muted); }
+.st-file { cursor: pointer; }
+.st-file:hover { background: var(--panel2); }
+.st-file.on { background: var(--panel2); color: var(--accent); }
+.st-name { overflow: hidden; text-overflow: ellipsis; }
+.st-dot { color: var(--danger); font-size: 10px; }
+.st-empty, .st-rec { padding: 10px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.studio-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.studio-tabs { display: flex; overflow-x: auto; background: var(--panel); border-bottom: 1px solid var(--border); }
+.st-tab { display: flex; align-items: center; gap: 6px; padding: 6px 10px; font-size: 12px; cursor: pointer; border-right: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+.st-tab.on { background: var(--bg); color: var(--text); }
+.st-tab-x { opacity: .5; }
+.st-tab-x:hover { opacity: 1; color: var(--danger); }
+.studio-editor { flex: 1; min-height: 120px; }
+.studio-out { height: 230px; border-top: 1px solid var(--border); background: var(--panel); display: flex; flex-direction: column; }
+.studio-out[hidden] { display: none; }
+.studio-out-head { display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--border); }
+.studio-out pre { flex: 1; overflow: auto; padding: 10px; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+/* 自建输入框：WebView2 没有 window.prompt() */
+.st-dialog-mask { position: fixed; inset: 0; z-index: 500; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; }
+.st-dialog { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; width: 380px; max-width: 90vw; display: flex; flex-direction: column; gap: 10px; }
+.st-dialog-title { font-weight: 600; font-size: 14px; }
+.st-dialog-input { background: var(--panel2); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 8px 10px; font-size: 13px; outline: none; }
+.st-dialog-input:focus { border-color: var(--accent); }
+.st-dialog-acts { display: flex; justify-content: flex-end; gap: 8px; }

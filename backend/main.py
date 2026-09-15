@@ -8,7 +8,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, PlainTextResponse
 from pydantic import BaseModel
 
 import os
@@ -23,7 +23,8 @@ import datetime
 import logging
 import threading
 from . import (config, ollama_client, memory, kb, file_tools, video, web_tools,
-               t2i, tools, voice, sessions, image_library, doclib, docx_write)
+               t2i, tools, voice, sessions, image_library, doclib, docx_write,
+               workspace)
 
 app = FastAPI(title="本地多模态助手", version="1.0.0")
 client = ollama_client.OllamaClient()
@@ -1206,6 +1207,142 @@ def _needs_task_model(text: str, prev_code: bool = False) -> bool:
     return _is_code_task(text)
 
 
+# ---------------------------------------------------------------------------
+# 文本协议工具循环 —— 给"不支持原生 tool_calls"的代码模型补上执行回路
+# ---------------------------------------------------------------------------
+# 背景：qwen2.5-coder 走不了 Ollama 的原生工具通道（带 tools 时**不返回 tool_calls**，
+# 而是把调用当 JSON 文本写进正文）。于是代码模型这一轮的工具被清空，只能一次吐一坨代码。
+# 后果就是：**写 → 跑 → 看报错 → 改** 这条回路断了 —— 而它恰恰是 vibecoding
+# 与"只会写代码"的分水岭。最坑的是模型会顺着话头说"我已经验证过了"，其实根本没跑。
+#
+# 实测探针（3 组提示 × 2 个必须真跑的任务）：模型用**文本协议**时
+# **6/6 都能吐出可解析的工具调用**，把结果喂回去还会接着改。所以回路可以自己搭。
+#
+# 做法：把文本里解析出来的调用**伪装成原生 tool_calls**，
+# 直接复用下面那套「执行 / 前端事件 / 危险操作先问用户」的逻辑，零重复实现。
+_TEXT_TOOL_RE = re.compile(r"```(?:tool|tool_call|json)?[ \t]*\r?\n(.*?)```", re.S)
+
+# 代码轮可用工具的**文本协议说明**（键名同时充当白名单）
+_TEXT_TOOL_DOCS = {
+    "run_python": '真正运行一段 Python 代码，拿到真实输出与报错。'
+                  '参数 {"code": "完整可运行代码（要 print 出结果）"}',
+    "save_file": '把产物存进「生成文库」（覆盖同名文件，用户能在界面上看到）。'
+                 '参数 {"name": "文件名（如 stats.py）", "content": "文件全文"}',
+    "read_saved": '读取「生成文库」里已有的文件。'
+                  '**改一个已有文件之前必须先读它**，不要凭记忆重写。'
+                  '参数 {"name": "文件名，如 stats.py"}',
+    "list_saved": '列出「生成文库」里现在有哪些文件（含子目录）。参数 {}',
+    "read_file": '读取本机的一个文本文件（用户给的绝对路径）。'
+                 '参数 {"path": "文件的绝对路径"}',
+    # 开发工作区（人机协同开发的正路）：路径一律相对，后端拼绝对路径
+    "workspace_list": '列出「开发工作区」里现有的文件。参数 {}',
+    "workspace_read": '读取工作区里的一个文件。**改之前必须先读**，'
+                      '不要凭记忆重写（用户可能刚在前端手改过）。'
+                      '参数 {"rel": "相对路径，如 app.py"}',
+    "workspace_write": '把内容写进工作区文件（存在则覆盖，旧版自动进回收站）。'
+                       '**要给整份内容**。参数 {"rel": "相对路径", "text": "完整内容"}',
+    "workspace_run": '运行工作区里的一个 .py，拿到真实输出与报错（工作目录=文件所在目录）。'
+                     '参数 {"rel": "相对路径，如 app.py"}',
+}
+_TEXT_TOOL_NAMES = set(_TEXT_TOOL_DOCS)
+
+# 文本工具名 → 真实工具名（save_file 其实就是 library 的 write 动作）
+_TEXT_TOOL_ALIAS = {"save_file": "library"}
+
+
+def _code_text_tools(cfg: dict) -> dict:
+    """代码模型这一轮能用哪些文本工具（按设置里的开关裁剪）。"""
+    out = dict(_TEXT_TOOL_DOCS)
+    if not cfg.get("code_exec_enabled", False):
+        out.pop("run_python", None)   # 沙箱没开就不给它执行能力
+    return out
+
+
+def _map_text_tool_args(name: str, args: dict):
+    """把文本工具的参数翻译成真实工具 schema 认识的形状。"""
+    if name == "save_file":
+        rel = str(args.get("name") or args.get("path") or "").strip()
+        return "library", {"action": "write", "name": rel,
+                           "content": args.get("content") or args.get("text") or ""}
+    if name == "read_saved":
+        return "library", {"action": "read",
+                           "name": str(args.get("name") or args.get("path") or "").strip()}
+    if name == "list_saved":
+        return "library", {"action": "list"}
+    return name, args
+
+
+def _as_tool_call_obj(obj):
+    """校验并规整一个候选调用；不是合法调用就返回 None。"""
+    if not isinstance(obj, dict):
+        return None
+    name = obj.get("name") or obj.get("tool") or obj.get("function")
+    if isinstance(name, dict):                      # OpenAI 风格 {"function": {...}}
+        name = name.get("name")
+    args = obj.get("arguments")
+    if args is None:
+        args = obj.get("parameters") or obj.get("args") or obj.get("input")
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            return None
+    if not isinstance(name, str) or not isinstance(args, dict):
+        return None
+    name = name.strip()
+    # ⚠️ 必须走白名单：代码轮里模型会写大段 HTML/JSON，里面本来就带
+    # {"name": ...} 这种字段，不做白名单会把业务数据误当成工具调用去执行。
+    if name not in _TEXT_TOOL_NAMES:
+        return None
+    # 模型偶尔把代码里的换行写成**字面量** \n（探针里 V3 提示词下就出现了），
+    # 那样丢进沙箱必然语法错误 —— 顺手兜一下。
+    code = args.get("code")
+    if isinstance(code, str) and "\n" not in code and "\\n" in code:
+        args = dict(args, code=code.replace("\\n", "\n").replace("\\t", "\t"))
+    return {"name": name, "arguments": args}
+
+
+def _split_text_tool_call(text: str):
+    """从代码模型的正文里拆出「文本协议工具调用」。
+
+    返回 (call, 清理后的正文)：call 为 None 表示本轮不是工具调用；
+    清理后的正文是把那个 ```tool 块整段删掉的版本 —— **用户不该看到那坨 JSON**。
+    """
+    raw = text or ""
+    if not raw or '"name"' not in raw:
+        return None, raw
+
+    # ① 先认代码围栏里的（模型最常这么写）
+    for m in _TEXT_TOOL_RE.finditer(raw):
+        try:
+            obj = json.loads(m.group(1).strip())
+        except Exception:
+            continue
+        call = _as_tool_call_obj(obj)
+        if call:
+            return call, (raw[:m.start()] + raw[m.end():]).strip()
+
+    # ② 退一步：正文里裸的 JSON（平衡括号扫描，只在疑似时做，避免大段 HTML 拖慢）
+    if '"arguments"' in raw or '"parameters"' in raw:
+        for start in (i for i, c in enumerate(raw) if c == "{"):
+            depth = 0
+            for i in range(start, len(raw)):
+                if raw[i] == "{":
+                    depth += 1
+                elif raw[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        seg = raw[start:i + 1]
+                        try:
+                            call = _as_tool_call_obj(json.loads(seg))
+                        except Exception:
+                            call = None
+                        if call:
+                            return call, raw.replace(seg, "").strip()
+                        break
+    return None, raw
+
+
 def _route_code_model(cfg: dict, text: str, fallback: str, prev_code: bool = False):
     """代码类请求换用专用代码模型，返回 (模型名, 给用户看的提示)。"""
     if not cfg.get("code_auto_route", True):
@@ -1775,6 +1912,8 @@ async def chat(req: ChatRequest):
         loop = asyncio.get_running_loop()
         live_ui: asyncio.Queue = asyncio.Queue()
         full_sys = sys_prompt + ("\n\n" + digest if digest else "")
+        # 代码模型走不了原生工具通道 → 改用它能用的"文本协议"（见 _split_text_tool_call）
+        code_text_tools = _code_text_tools(cfg) if code_model_on else {}
         if code_model_on:
             # 代码模型不支持工具调用，得明确告诉它"直接写代码"，
             # 否则它会模仿工具调用的格式吐一堵 JSON（实测）。
@@ -1786,19 +1925,60 @@ async def chat(req: ChatRequest):
             # 「已保存到文件夹 代码/番茄钟/番茄钟.html（4208 字节）」——
             # 文件压根不存在，而且**一个字代码都没给**，用户啥也拿不到。
             # 所以这里要写成**覆盖性**的硬规则，并明确禁止"虚假完成"。
+            _tt_docs = "\n".join("· %s —— %s" % (k, v)
+                                 for k, v in code_text_tools.items())
+            full_sys += "\n\n【本轮最高优先级 · 覆盖上面所有关于工具的说明】\n"
+            if code_text_tools:
+                # 有文本协议工具：**说清怎么调**，并允许它说"跑过了"——
+                # 因为这回是真跑（以前不许它说，是因为它确实做不到）。
+                full_sys += (
+                    "本轮的模型不支持普通的函数调用，所以工具**改用文本协议**给你。\n"
+                    "想用工具时，输出一个以 ```tool 开头的代码块，里面放一段 JSON，例如：\n"
+                    "```tool\n"
+                    '{"name": "run_python", "arguments": {"code": "print(1+1)"}}\n'
+                    "```\n"
+                    "我会**真的执行**它，然后把结果作为下一条消息发给你"
+                    "（以「工具结果：」开头），你接着继续。\n\n"
+                    "本轮可用工具：\n" + _tt_docs + "\n\n"
+                    "【硬性规则】\n"
+                    "1. 想验证代码对不对，就**真的调用 run_python 跑一遍**看真实输出，"
+                    "**绝对不要**凭空猜输出。\n"
+                    "2. **一次只调用一个工具**；调用时除了那个 ```tool 块"
+                    "**不要输出任何其他文字**。\n"
+                    "3. **一路调到真的跑通为止**：报错就照真实报错改、再跑，最多来回 4 次。"
+                    "**缺文件、缺数据时不要叫用户去准备** —— 你自己在代码里造一份样例数据"
+                    "（临时文件或直接用内置字符串），把流程跑顺；"
+                    "用户要的是「能跑的东西」，不是「还得他自己补条件的代码」。\n"
+                    "4. 要改「生成文库」里已有的文件，**先用 read_saved 读一遍**，"
+                    "在真实内容上改；不要凭记忆重写。\n"
+                    "5. 除了通过工具，**绝对不要说**「已保存到…」「已经写入…」"
+                    "「文件已生成」「我运行过了」—— 没调用工具就等于没做。\n"
+                    "6. **要交付出文件**（脚本 / 网页 / 配置…）：用 workspace_write 写进"
+                    "**开发工作区**（传相对路径，如 hello.py / src/app.py），"
+                    "再按需用 workspace_run 跑它验证。用户会在界面的「开发台」里看到、"
+                    "并且可以自己改。**只在 run_python 里跑一遍、不在工作区留下文件，"
+                    "等于没有交付。**\n"
+                    "7. 全部做完后，把**完整代码**（放在 ``` 代码块里、标注语言）"
+                    "和**真实运行结果**一起给我。\n")
+            else:
+                full_sys += (
+                    "本轮**一个工具都没有**（工具清单已被移除），所以：\n"
+                    "· 上面提到的 library / 生成文库 / 保存文件 / 运行代码 **一律不适用**。\n"
+                    "  **绝对不要说**「已保存到…」「已经写入…」「文件已生成」"
+                    "「我已经运行并验证」——\n"
+                    "  你做不到这些，说了就是骗人。\n")
             full_sys += (
-                "\n\n【本轮最高优先级 · 覆盖上面所有关于工具的说明】\n"
-                "本轮**一个工具都没有**（工具清单已被移除），所以：\n"
-                "· 上面提到的 library / 生成文库 / 保存文件 / 运行代码 **一律不适用**。\n"
-                "  **绝对不要说**「已保存到…」「已经写入…」「文件已生成」「我已经运行并验证」——\n"
-                "  你做不到这些，说了就是骗人。\n"
                 "· **必须把完整代码重新写一遍**放在 ``` 代码块里（标注语言）。\n"
                 "  哪怕是改一个小地方，也要给出改完之后的**整份代码**，\n"
-                "  不能只说「我改了 A、加了 B」——那样用户手上没有可用的东西。\n"
-                "· 需要用户自己做的动作，就直说：「请点卡片上的 ▶ 运行」「请点 💾 存到文库」。\n"
-                "· **不要**输出形如 {\"name\": \"...\", \"arguments\": {...}} 的 JSON —— "
-                "那是工具调用的内部格式，写出来用户看到的是一堆乱码。"
-                "\n【代码要能直接跑】用户会在界面上点「▶ 运行」执行你的代码："
+                "  不能只说「我改了 A、加了 B」——那样用户手上没有可用的东西。\n")
+            if not code_text_tools:
+                full_sys += (
+                    "· 需要用户自己做的动作，就直说：「请点卡片上的 ▶ 运行」"
+                    "「请点 💾 存到文库」。\n"
+                    "· **不要**输出形如 {\"name\": \"...\", \"arguments\": {...}} 的 JSON —— "
+                    "那是工具调用的内部格式，写出来用户看到的是一堆乱码。\n")
+            full_sys += (
+                "【代码要能直接跑】用户会在界面上点「▶ 运行」执行你的代码："
                 "\n· **不要用 input() 等交互输入** —— 运行环境没有键盘，会直接报 EOFError。"
                 "需要参数就写成模块顶部的变量，或从 sys.argv 取并给默认值。"
                 "\n· 结尾要有 print() 把结果打出来，否则界面上只会显示「没有输出」。"
@@ -1860,9 +2040,16 @@ async def chat(req: ChatRequest):
                     yield json.dumps({"message": {"thinking": m["thinking"]}}) + "\n"
                 if m.get("content"):
                     round_msg["content"] += m["content"]
-                    final_text += m["content"]
-                    # 仅把用户可见的文本增量透出
-                    yield json.dumps({"message": {"content": m["content"]}}) + "\n"
+                    if code_model_on:
+                        # 代码轮**先缓冲、不即时透出**：正文里可能夹着文本协议
+                        # 工具调用（```tool + JSON），那坨东西不能给用户看。
+                        # 等这轮结束、摘干净之后再整段吐出去。代码模型很快
+                        # （3~15 秒），这点缓冲代价远小于"界面上闪出一堆 JSON"。
+                        pass
+                    else:
+                        final_text += m["content"]
+                        # 仅把用户可见的文本增量透出
+                        yield json.dumps({"message": {"content": m["content"]}}) + "\n"
                 if "message" in obj:
                     tc = m.get("tool_calls")
                     if tc:
@@ -1873,6 +2060,21 @@ async def chat(req: ChatRequest):
                 # 这是判断"回答是否被思考吃光"的**可靠信号**，比猜正文长不长准得多。
                 if obj.get("done"):
                     done_reason = obj.get("done_reason") or ""
+
+            # ---- 代码轮：把缓冲的正文摘掉文本协议调用后，整段吐给用户 ----
+            # 放在 `if not tool_calls` 之前 —— 解析出来的调用要能接进下面同一套执行逻辑。
+            text_protocol = False
+            if code_model_on and round_msg["content"]:
+                _call, _clean = _split_text_tool_call(round_msg["content"])
+                round_msg["content"] = _clean
+                if _clean:
+                    final_text += _clean
+                    yield json.dumps({"message": {"content": _clean}}) + "\n"
+                # 再校验一次白名单与开关：设置里关掉了「本地算代码」就不许执行
+                if _call and _call["name"] in code_text_tools:
+                    text_protocol = True
+                    tool_calls = [{"function": {"name": _call["name"],
+                                                "arguments": _call["arguments"]}}]
 
             if not tool_calls:
                 # 被思考吃光配额：Ollama 明确告诉我们 done_reason=length，
@@ -1900,8 +2102,13 @@ async def chat(req: ChatRequest):
 
             # ---------- 执行工具（Agent loop）----------
             # 1) 把 assistant 的 tool_calls 加入工作序列
-            working.append({"role": "assistant", "content": round_msg["content"] or "",
-                            "tool_calls": tool_calls})
+            #    文本协议下**不能**带 tool_calls 字段 —— 它本来就没按原生格式调用，
+            #    塞进去会让对话模板对不上（那是原生通道的结构）。
+            if text_protocol:
+                working.append({"role": "assistant", "content": round_msg["content"] or ""})
+            else:
+                working.append({"role": "assistant", "content": round_msg["content"] or "",
+                                "tool_calls": tool_calls})
             # 2) 逐个执行
             ui_events = []
             # images：本轮拖入的图（否则复用最近一张）
@@ -1926,6 +2133,8 @@ async def chat(req: ChatRequest):
                         args = {}
                 if not isinstance(args, dict):
                     args = {}
+                # 文本工具名/参数 → 真实工具（save_file 其实就是 library 的 write 动作）
+                name, args = _map_text_tool_args(name, args)
                 calls.append((name, args))
                 yield json.dumps({"tool_start": {"name": name, "args": args}}) + "\n"
 
@@ -1970,9 +2179,15 @@ async def chat(req: ChatRequest):
                     if e.get("type") == "image":
                         ctx["shown_images"].append(e)
                 ui_events.extend(ev)
-                # 注意：Ollama 的 tool 消息用 tool_name 关联调用，不是 tool_calls/tool_call_id，
-                # 否则模型读不到工具返回内容（会误答"没查到/无法联网"）。
-                working.append({"role": "tool", "content": result, "tool_name": name})
+                if text_protocol:
+                    # 文本协议没有 tool_call_id 可关联。实测用 user 消息 +
+                    # 「工具结果：」前缀，模型能正确接着改（探针里全部收敛）。
+                    working.append({"role": "user", "content": "工具结果：\n" + result})
+                else:
+                    # 注意：Ollama 的 tool 消息用 tool_name 关联调用，
+                    # 不是 tool_calls/tool_call_id，否则模型读不到工具返回内容
+                    # （会误答"没查到/无法联网"）。
+                    working.append({"role": "tool", "content": result, "tool_name": name})
             # 3) 把前端副作用事件透出
             for ui in ui_events:
                 yield json.dumps({"ui": ui}) + "\n"
@@ -2052,6 +2267,106 @@ def tool_answer(req: ToolAnswerRequest):
 # =====================================================================
 #  生成文库（模型产出物；与只读的知识库分开）
 # =====================================================================
+# =====================================================================
+#  开发工作区（人机协同开发 / vibecoding 的载体）
+# =====================================================================
+# 和「生成文库」的分工：文库放**成品**（一份一份归档），
+# 工作区放**开发中的项目**（多文件、反复读改写、要能跑）。
+# 前端把它渲染成「文件树 + 真编辑器(Monaco) + 运行/保存」的开发台。
+@app.get("/api/ws/tree")
+def ws_tree():
+    return workspace.tree()
+
+
+@app.get("/api/ws/file")
+def ws_read(rel: str = ""):
+    try:
+        return workspace.read_text(rel)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/ws/file")
+def ws_write(body: dict):
+    b = body or {}
+    try:
+        return workspace.write_text(str(b.get("rel") or ""), str(b.get("text") or ""))
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/ws/new")
+def ws_new(body: dict):
+    b = body or {}
+    rel, kind = str(b.get("rel") or "").strip(), str(b.get("kind") or "file")
+    try:
+        if kind == "dir":
+            return workspace.mkdir(rel)
+        return workspace.write_text(rel, str(b.get("text") or ""))
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/ws/rename")
+def ws_rename(body: dict):
+    b = body or {}
+    try:
+        return workspace.rename(str(b.get("rel") or ""), str(b.get("to") or ""))
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/ws/delete")
+def ws_delete(body: dict):
+    try:
+        return workspace.remove(str((body or {}).get("rel") or ""))
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/ws/run")
+def ws_run(body: dict):
+    """在**工作区里**运行一个 .py —— cwd 设成它所在目录，脚本里的相对路径才找得到文件。"""
+    rel = str((body or {}).get("rel") or "").strip()
+    if not rel.lower().endswith(".py"):
+        return {"ok": False, "error": "当前只能直接运行 .py 文件"}
+    try:
+        p = workspace.abs_path(rel)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    r = tools.run_file(p, allow_risky=False)
+    if r.get("needs_confirm"):
+        return {"ok": False, "needs_confirm": True, "risky": r.get("risky") or [],
+                "error": "检测到需要确认的操作：" + "、".join(r.get("risky") or [])}
+    return {"ok": True, "rel": rel, "rc": r.get("rc"), "out": r.get("out") or "",
+            "err": r.get("err") or "", "seconds": r.get("seconds")}
+
+
+@app.post("/api/ws/confirm_run")
+def ws_confirm_run(body: dict):
+    """用户批准了风险操作 → 放行重跑。"""
+    rel = str((body or {}).get("rel") or "").strip()
+    try:
+        p = workspace.abs_path(rel)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    r = tools.run_file(p, allow_risky=True)
+    return {"ok": True, "rel": rel, "rc": r.get("rc"), "out": r.get("out") or "",
+            "err": r.get("err") or "", "seconds": r.get("seconds")}
+
+
+@app.get("/api/ws/raw")
+def ws_raw(rel: str = ""):
+    """原样返回工作区文件（HTML 预览用）。"""
+    try:
+        r = workspace.read_text(rel)
+    except ValueError as e:
+        return PlainTextResponse(str(e), status_code=400)
+    if not r.get("ok"):
+        return PlainTextResponse(r.get("error") or "读取失败", status_code=404)
+    return PlainTextResponse(r["text"])
+
+
 @app.get("/api/doclib/files")
 def library_files():
     return {"ok": True, "files": doclib.list_files(), "stats": doclib.stats()}

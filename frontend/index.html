@@ -153,6 +153,8 @@
       <button class="icon-btn" id="toggleSidebar">☰</button>
       <h2>智能体对话</h2>
       <span class="privacy">🤖 自主规划 · 调用工具 · 完全本地</span>
+      <!-- 开发台：人机协同写代码（文件树 + 真编辑器 + 运行） -->
+      <button class="btn sm" id="openStudioBtn" title="打开开发台：和工作区文件一起改、一起跑">🛠 开发台</button>
       <!-- 计算设备徽标：点一下即可切换 CPU / GPU，切换后会做真实校验 -->
       <div class="device-wrap">
         <button class="device-badge" id="deviceBadge" title="绘图（文生图 / 图片微改）使用的计算设备，点击切换">
@@ -233,6 +235,47 @@
     </div>
   </div>
 
+  <!-- 开发台（人机协同开发）：文件树 + 离线 Monaco 编辑器 + 运行 + 交给 AI 改 -->
+  <div class="studio" id="studio" hidden>
+    <div class="studio-bar">
+      <span class="studio-title">🛠 开发台</span>
+      <span class="studio-path" id="stPath"></span>
+      <span class="studio-acts">
+        <button class="btn sm ghost" id="stNewFile">＋ 文件</button>
+        <button class="btn sm ghost" id="stNewDir">＋ 文件夹</button>
+        <button class="btn sm ghost" id="stSave" title="保存（Ctrl+S）">💾 保存</button>
+        <button class="btn sm ghost" id="stRun" title="运行当前 .py（Ctrl+Enter）">▶ 运行</button>
+        <button class="btn sm ghost" id="stPreview" title="预览当前 HTML">🌐 预览</button>
+        <button class="btn sm" id="stAskAi" title="把当前文件交给模型，让它读最新内容后再改">🤖 让 AI 改这个文件</button>
+        <button class="btn sm ghost" id="stClose">✕</button>
+      </span>
+    </div>
+    <div class="studio-body">
+      <div class="studio-side">
+        <div class="studio-side-head">
+          <span>工作区</span>
+          <button class="btn sm ghost" id="stRefresh" title="刷新文件树">⟳</button>
+        </div>
+        <div class="studio-tree" id="stTree"></div>
+      </div>
+      <div class="studio-main">
+        <div class="studio-tabs" id="stTabs"></div>
+        <div class="studio-editor" id="stEditor"></div>
+        <div class="studio-out" id="stOut" hidden>
+          <div class="studio-out-head">
+            <span id="stOutTitle">运行结果</span>
+            <span class="head-acts">
+              <button class="btn sm ghost" id="stOutClear">清空</button>
+              <button class="btn sm ghost" id="stOutClose">收起</button>
+            </span>
+          </div>
+          <pre id="stOutBody"></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/studio.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>
