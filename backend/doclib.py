@@ -46,7 +46,13 @@ def _safe_rel(name: str) -> str:
     raw = str(name or "").strip().replace("\\", "/")
     if not raw:
         raise ValueError("文件名不能为空")
-    raw = re.sub(r"^[A-Za-z]:", "", raw).lstrip("/")
+    # ⚠️ 带盘符要**明确拒绝**，不能悄悄剥掉。
+    # 原来是把 `D:/笔记.md` 的 "D:" 静默删掉、存成库里的 `笔记.md` ——
+    # 用户会以为文件写到了 D 盘，实际落在库里且改了名，这种"静默改写输入"
+    # 比直接报错危险得多。
+    if re.match(r"^[A-Za-z]:", raw):
+        raise ValueError("不要写盘符（如 D:）—— 只能填生成文库内的相对路径")
+    raw = raw.lstrip("/")
     parts = []
     for p in raw.split("/"):
         p = p.strip()
@@ -215,6 +221,14 @@ def copy_file(rel: str, new_rel: str) -> dict:
     src, dst = _abs(rel), _abs(new_rel)
     if not os.path.exists(src):
         return {"ok": False, "error": "源文件不存在：%s" % rel}
+    if os.path.isdir(src):
+        return {"ok": False, "error": "只能复制文件，不能复制文件夹：%s" % rel}
+    # ⚠️ 不覆盖同名文件。复制本来是"留个后路"的动作，允许静默覆盖的话，
+    # 用户输入一个已存在的名字就会把那份文件**直接冲掉** ——
+    # 而 write_file 覆盖前是会自动备份的，两者必须同样"不让人丢东西"。
+    if os.path.exists(dst):
+        return {"ok": False,
+                "error": "已存在同名文件：%s（换个名字，或先去删掉它）" % new_rel}
     os.makedirs(os.path.dirname(dst) or LIB_DIR, exist_ok=True)
     try:
         shutil.copy2(src, dst)

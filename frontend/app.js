@@ -60,6 +60,53 @@
       setTimeout(() => el.remove(), 280);
     }, 2600);
   }
+
+  // 输入框弹层（自建，不用原生 prompt）。
+  // ⚠️ 为什么不能用 window.prompt：桌面窗口是 WebView2，它**不支持 prompt**
+  // （静默返回 null，表现成"点了按钮什么都没发生"）。alert / confirm 是支持的，
+  // 所以本项目里 confirm 可以照常用，prompt 一律用这个替代。
+  // ⚠️ 必须放在**最外层**作用域：文库面板是一段独立的 IIFE，
+  // 把这个函数定义在别处它访问不到（实测报 `showInputDialog is not defined`）。
+  function showInputDialog(opts) {
+    const o = opts || {};
+    const escHtml = (s) => String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    return new Promise((resolve) => {
+      if (document.querySelector(".confirm-layer")) return resolve(null);
+      const layer = document.createElement("div");
+      layer.className = "confirm-layer";
+      layer.innerHTML =
+        '<div class="confirm-box">' +
+        `<div class="confirm-title">${escHtml(o.title || "请输入")}</div>` +
+        (o.tip ? `<div class="confirm-reason">${escHtml(o.tip)}</div>` : "") +
+        `<input class="ask-free input-dialog" spellcheck="false" placeholder="${escHtml(o.placeholder || "")}" />` +
+        '<div class="confirm-btns"><button class="btn ghost" data-act="cancel">取消</button>' +
+        `<button class="btn primary" data-act="ok">${escHtml(o.okText || "确定")}</button></div></div>`;
+      const input = layer.querySelector(".input-dialog");
+      input.value = o.value || "";
+      document.body.appendChild(layer);
+      input.focus();
+      input.select();
+      const done = (val) => { layer.remove(); resolve(val); };
+      layer.querySelector('[data-act="cancel"]').onclick = () => done(null);
+      layer.querySelector('[data-act="ok"]').onclick = () => done((input.value || "").trim() || null);
+      input.onkeydown = (e) => {
+        if (e.key === "Enter") { e.preventDefault(); done((input.value || "").trim() || null); }
+        else if (e.key === "Escape") { e.preventDefault(); done(null); }
+      };
+    });
+  }
+
+  // 兜底：api() 失败时抛出的错误，如果某个调用点忘了 try/catch，
+  // 也要让用户看见原因，绝不静默 —— 静默失败比报错难查得多。
+  window.addEventListener("unhandledrejection", (e) => {
+    const r = e.reason;
+    if (r && r.status) {
+      e.preventDefault();
+      showToast("操作失败：" + (r.message || r), "warn");
+    }
+  });
   // 复制文本到剪贴板。127.0.0.1 属于安全上下文，clipboard API 可直接用；
   // 另留一层 execCommand 兜底，兼容个别浏览器。
   async function copyText(text) {
@@ -125,7 +172,19 @@
       headers: { "Content-Type": "application/json" }
     }, opts));
     const t = await r.text();
-    try { return JSON.parse(t); } catch { return { raw: t }; }
+    let data;
+    try { data = JSON.parse(t); } catch { data = { raw: t }; }
+    // ⚠️ 必须检查状态码。不检查的话，后端返回 400 / 500 时会把
+    // `{detail: "已存在同名文件：xxx"}` 当成正常结果交给调用方，
+    // 界面就会出现「已复制为：undefined」这种**把失败当成功**的提示 ——
+    // 用户以为成了，其实什么都没做（实测踩到，这是最坑的一类 bug）。
+    if (!r.ok) {
+      const m = (data && (data.detail || data.error || data.message)) || ("HTTP " + r.status);
+      const err = new Error(typeof m === "string" ? m : JSON.stringify(m));
+      err.status = r.status;
+      throw err;
+    }
+    return data;
   }
 
   // ---------- 状态检测 ----------
@@ -574,7 +633,10 @@
         const r = await api("/api/doclib/export_docx", { method: "POST",
           body: JSON.stringify({ rel: dlCurrent }) });
         showToast("已导出：" + r.rel + "（WPS / Word 都能打开）", "ok");
-        loadDoclib(r.rel);
+        // ⚠️ 这里**不能**传 r.rel：loadDoclib 会把 dlCurrent 指到那个新 .docx 上，
+        // 下次点「保存」就会把文本正文写进 .docx 文件、把刚导出的 Word 冲掉。
+        // 保持 dlCurrent 仍指向原文本文件，新文件靠列表按时间倒序自然置顶。
+        loadDoclib();
       } catch (e) { showToast("导出失败：" + String(e.message || e), "warn"); }
       finally { docx.disabled = false; }
     };
@@ -582,6 +644,36 @@
     if (dl) dl.onclick = () => {
       if (!dlCurrent) return;
       window.open("/api/doclib/download?rel=" + encodeURIComponent(dlCurrent), "_blank");
+    };
+    const cp = $("#dlCopyBtn");
+    if (cp) cp.onclick = async () => {
+      if (!dlCurrent) return;
+      // 预填「原名-副本」：想改名就改，直接回车也能用
+      const dot = dlCurrent.lastIndexOf(".");
+      const guess = dot > 0
+        ? dlCurrent.slice(0, dot) + "-副本" + dlCurrent.slice(dot)
+        : dlCurrent + "-副本";
+      const name = await showInputDialog({
+        title: "复制为",
+        tip: "会在原位置生成一份新文件，原文件不动。名字可以改，也可带子目录（如 草稿/第二版.md）。",
+        value: guess,
+        okText: "复制",
+        placeholder: "新文件名",
+      });
+      if (!name || name === dlCurrent) return;
+      cp.disabled = true;
+      try {
+        const r = await api("/api/doclib/copy", { method: "POST",
+          body: JSON.stringify({ rel: dlCurrent, new_rel: name }) });
+        showToast("已复制为：" + r.to, "ok");
+        await loadDoclib();
+        // 文本类直接打开新文件（复制完通常就是要接着改它）；
+        // Word/表格这类读不出正文，只刷新列表，免得弹一句"读不出正文"扫兴。
+        if (/\.(md|markdown|txt|json|csv|log|ini|cfg|ya?ml|py|js|ts|html?|css|sql|sh|bat)$/i.test(r.to)) {
+          await openDoclibFile(r.to);
+        }
+      } catch (e) { showToast("复制失败：" + String(e.message || e), "warn"); }
+      finally { cp.disabled = false; }
     };
     const del = $("#dlDelBtn");
     if (del) del.onclick = async () => {
@@ -1412,6 +1504,9 @@
       layer.querySelector('[data-act="deny"]').onclick = () => answer(false);
       layer.querySelector('[data-act="allow"]').onclick = () => answer(true);
     };
+
+    // 输入框弹层在文件顶部（最外层作用域）—— 文库面板要用它，
+    // 而那段代码在独立的 IIFE 里，放到这里它访问不到（踩过）。
 
     // 问答框：材料不足时模型可以在这里问细节。用户填完它接着做，
     // 不用把需求重新描述一遍 —— 这是"写得像你要的"和"瞎猜一篇"的区别。

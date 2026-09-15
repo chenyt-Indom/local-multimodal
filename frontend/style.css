@@ -768,3 +768,6 @@ body.dragging .drop-overlay,
   font-size: 12.5px; line-height: 1.6; outline: none;
 }
 #dlText:focus { border-color: var(--accent); }
+
+/* ---------- 输入弹层（复制/改名等；不用原生 prompt，WebView2 不支持它）---------- */
+.input-dialog { margin-top: 10px; font-size: 13px; padding: 9px 11px; }

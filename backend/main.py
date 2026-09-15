@@ -1640,6 +1640,25 @@ def library_export_docx(body: dict):
     return {"ok": True, "rel": out, "bytes": w.get("bytes", 0)}
 
 
+@app.post("/api/doclib/copy")
+def library_copy(body: dict):
+    """复制库内文件（用户在界面上「另存一份」）。
+
+    没给新名字就自动加「-副本」后缀 —— 让按钮点一下就能用，
+    不用强迫用户先想一个名字。
+    """
+    b = body or {}
+    rel = str(b.get("rel") or "").strip()
+    new_rel = str(b.get("new_rel") or "").strip()
+    if not new_rel:
+        stem, ext = os.path.splitext(rel)
+        new_rel = "%s-副本%s" % (stem, ext)
+    r = doclib.copy_file(rel, new_rel)
+    if not r.get("ok"):
+        raise HTTPException(status_code=400, detail=r.get("error") or "复制失败")
+    return r
+
+
 @app.post("/api/doclib/backup")
 def library_backup():
     r = doclib.backup_all()
