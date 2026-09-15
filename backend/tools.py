@@ -1150,10 +1150,19 @@ def _do_search_files(arguments):
 
 
 def _do_write_file(arguments):
-    path = arguments.get("path") or ""
+    path = str(arguments.get("path") or "").strip()
     content = arguments.get("content") or ""
     if not path:
         return "错误：未提供文件路径。"
+    # ⚠️ **必须绝对路径**。实测模型会传相对路径（"番茄钟/自定义时长深色模式.html"），
+    # 而相对路径是按**进程当前目录**解析的 —— 结果文件被扔进应用的安装目录里
+    # （实测：直接在源码仓库根目录下建了个「番茄钟/」文件夹）。
+    # 更坑的是工具还回了「已写入文件：…（3580 字节）」，看起来像保存成功了，
+    # 用户却根本找不着这个文件。宁可直接拒绝并告诉他该用哪个工具。
+    if not os.path.isabs(path):
+        return ("错误：write_file 只接受**绝对路径**（例如 D:\\项目\\out.py）。"
+                "如果用户是想让你把内容存进「生成文库」，"
+                "请改用 library 工具（action=write, name=文件名）。")
     try:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
@@ -1165,10 +1174,14 @@ def _do_write_file(arguments):
 
 
 def _do_append_file(arguments):
-    path = arguments.get("path") or ""
+    path = str(arguments.get("path") or "").strip()
     content = arguments.get("content") or ""
     if not path:
         return "错误：未提供文件路径。"
+    # 同 write_file：相对路径会落到进程 CWD（应用安装目录）去，必须挡掉
+    if not os.path.isabs(path):
+        return ("错误：append_file 只接受**绝对路径**（例如 D:\\项目\\log.txt）。"
+                "想写进「生成文库」请改用 library 工具（action=append）。")
     try:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
