@@ -400,6 +400,14 @@
         if (it.kind === "file") { const f = it.getAsFile(); if (f) files.push(f); }
       }
     }
+    // 拖到「开发台」里 → 当成"导入到项目"，不要塞进聊天附件
+    // （在开发台里拖文件，用户的意图显然是"把这个文件加进项目"）
+    const tgt = e.target;
+    if (tgt && tgt.closest && tgt.closest(".studio") &&
+        window.Studio && window.Studio.onDropFiles) {
+      window.Studio.onDropFiles(files);
+      return;
+    }
     onDropFiles(files);
   }, true);
 

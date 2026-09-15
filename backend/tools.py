@@ -89,6 +89,42 @@ _WS_RUN_SCHEMA = {
 }
 
 
+_WEB_READ_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "web_read",
+        "description": ("【联网读页】把某个网址的**正文**抓下来读（搜索结果只给摘要，"
+                        "需要细节时用它点进去看）。可以一次给多个网址。"
+                        "查官方文档、看报错讨论、核对版本差异时用它。"),
+        "parameters": {"type": "object",
+                       "properties": {
+                           "urls": {"type": "array", "items": {"type": "string"},
+                                    "description": "要读的网址，1~5 个"},
+                           "limit": {"type": "integer",
+                                     "description": "每个页面最多取多少字，默认 1800"}},
+                       "required": ["urls"]},
+    },
+}
+
+_GITHUB_PUSH_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "github_push",
+        "description": ("【上传到代码托管平台】把当前开发项目提交并推送到 GitHub / Gitee / "
+                        "自建 Git。仓库地址由用户提供（如 git@github.com:user/repo.git）。"
+                        "认证使用本机已配置的 git 凭据，应用不保存任何 token。"
+                        "**这是把代码发到外网的操作，必须先获得用户同意。**"),
+        "parameters": {"type": "object",
+                       "properties": {
+                           "repo": {"type": "string",
+                                    "description": "远端仓库地址（留空则沿用已有的 origin）"},
+                           "message": {"type": "string", "description": "本次提交说明"},
+                           "branch": {"type": "string", "description": "分支，默认 main"}},
+                       "required": []},
+    },
+}
+
+
 def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
                  code_exec: bool = False, writing: bool = False) -> list:
     """返回工具 schema 列表。
@@ -328,11 +364,14 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
     if web_enabled:
         schemas.append(_WEATHER_SCHEMA)   # 天气走数据 API，比搜索可靠得多
         schemas.append(_WEB_SEARCH_SCHEMA)
+        schemas.append(_WEB_READ_SCHEMA)  # 搜到之后点进去读正文
     else:
         # ⚠️ 联网搜图走的是外网，必须跟着「联网」开关一起关。
         # 之前它写死在基础列表里，关着联网也能搜图 —— 与"关着不联网"的约定矛盾。
         schemas = [s for s in schemas
                    if s["function"]["name"] != "web_image_search"]
+    # 上传到代码托管平台：属于"对外发布"，始终暴露但执行前必须问用户
+    schemas.append(_GITHUB_PUSH_SCHEMA)
     return schemas
 
 
@@ -607,6 +646,10 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
         return _do_workspace_write(arguments, ui_events)
     if name == "workspace_run":
         return _do_workspace_run(arguments, ui_events)
+    if name == "web_read":
+        return _do_web_read(arguments)
+    if name == "github_push":
+        return _do_github_push(arguments, context)
     if name == "web_image_search":
         return _do_web_image_search(arguments, ui_events)
     if name == "get_weather":
@@ -1458,9 +1501,10 @@ def _do_workspace_list() -> str:
     from . import workspace as _ws
     t = _ws.tree()
     files = t.get("files") or []
+    head = "【当前项目：%s】" % t.get("project")
     if not files:
-        return "工作区现在是空的（还没有任何文件）。可以直接用 workspace_write 新建。"
-    lines = ["工作区共 %d 个文件：" % len(files)]
+        return head + "\n项目里还没有任何文件。可以直接用 workspace_write 新建。"
+    lines = [head + "共 %d 个文件：" % len(files)]
     lines += ["· %s（%d 字节）" % (f["rel"], f["size"]) for f in files[:200]]
     if len(files) > 200:
         lines.append("…（只列了前 200 个）")
@@ -1486,15 +1530,18 @@ def _do_workspace_write(arguments, ui_events=None) -> str:
     if text is None:
         text = args.get("content") or ""
     try:
-        r = _ws.write_text(rel, str(text))
+        # by="ai" → 前端只把"AI 的改动"列进待审阅，可一键撤销
+        r = _ws.write_text(rel, str(text), by="ai")
     except ValueError as e:
         return "写入失败：%s" % e
     if not r.get("ok"):
         return "写入失败：%s" % r.get("error")
     if isinstance(ui_events, list):
-        # 让前端开发台自动刷新文件树/打开的内容
+        # 让前端开发台刷新文件树/打开的内容，并把这条改动标成"待审阅"
         ui_events.append({"type": "workspace", "act": "write", "rel": r["rel"],
-                          "chars": r.get("chars", 0)})
+                          "chars": r.get("chars", 0),
+                          "change_id": r.get("change_id") or "",
+                          "project": _ws.active_project()})
     return "已写入工作区文件：%s（%d 字）%s" % (
         r["rel"], r.get("chars", 0),
         "；旧版已备份进回收站" if r.get("backup") else "")
@@ -1526,6 +1573,54 @@ def _do_workspace_run(arguments, ui_events=None) -> str:
                           "risky": r.get("risky") or []})
     head = "【运行 %s】\n" % rel
     return head + _format_py_result(r)
+
+
+def _do_web_read(arguments) -> str:
+    """联网读网页**正文**（搜索结果只给摘要，这一步才是"点进去看"）。"""
+    from . import web_tools
+    args = arguments or {}
+    urls = args.get("urls") or args.get("url") or []
+    if isinstance(urls, str):
+        urls = [urls]
+    urls = [str(u).strip() for u in urls if str(u).strip()][:5]
+    if not urls:
+        return "错误：没有给网址（urls）。"
+    try:
+        limit = int(args.get("limit") or 1800)
+    except Exception:
+        limit = 1800
+    try:
+        pages = web_tools.fetch_pages(urls, limit=limit)
+    except Exception as e:
+        return "抓取失败：%s" % e
+    if not pages:
+        return ("这些网址都没抓到正文（可能需要登录、纯 JS 渲染，或被反爬拦了）。"
+                "换别的来源再试。")
+    return "\n\n".join("【%s】\n%s" % (u, t) for u, t in pages.items())[:9000]
+
+
+def _do_github_push(arguments, context=None) -> str:
+    """把项目上传到代码托管平台 —— **对外发布，必须先经用户同意**。"""
+    from . import workspace as _ws
+    args = arguments or {}
+    repo = str(args.get("repo") or "").strip()
+    message = str(args.get("message") or "").strip()
+    branch = str(args.get("branch") or "main").strip() or "main"
+    ask = (context or {}).get("confirm")
+    if not callable(ask):
+        return ("上传到代码托管平台需要用户确认，但当前没有确认通道，**没有上传**。"
+                "请让用户点开发台上的「⬆ 上传」按钮。")
+    allowed = ask({"kind": "git_push",
+                   "reason": "把当前项目上传到 %s（分支 %s）"
+                             % (repo or "已有的 origin", branch)})
+    if not allowed:
+        return ("用户**拒绝了**这次上传，没有推送任何内容。"
+                "如实说明即可，**不要**假装已经上传。")
+    r = _ws.git_push(repo=repo, message=message, branch=branch)
+    if not r.get("ok"):
+        return "上传失败：\n%s" % r.get("error")
+    return "上传成功（分支 %s）：\n%s" % (r.get("branch"),
+                                        "\n".join(r.get("logs") or [])[-900:])
 
 
 def _read_text_safe(p: str) -> str:

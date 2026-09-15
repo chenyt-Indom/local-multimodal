@@ -1,60 +1,214 @@
 # -*- coding: utf-8 -*-
-"""开发工作区（Dev Workspace）—— 人机协同开发用的多文件目录。
+"""开发工作区（Dev Workspace）—— 人机协同开发用的多项目目录。
 
 为什么**不**复用「生成文库」（data/library）：
-  · 生成文库是**成品归档**：一次任务产出一份，命名带语义，以"存"为主；
+  · 生成文库是**成品归档**：一次任务产出一份，以"存"为主；
   · 工作区是**开发中的项目**：多文件、多级目录、会被反复读改写、要能跑。
-两者语义不同。混在一起会出现"改一个文件变成存了新的一份"这种事，
-协同开发就无从谈起。所以单开 data/workspace。
+两者语义不同。混在一起会出现"改一个文件变成存了新的一份"，协同开发就无从谈起。
 
-路径安全：所有对外接口都走 `safe_rel`，只允许工作区内的**相对路径**，
-拒绝盘符、`..`、绝对路径 —— 否则模型一句 "../../config.json" 就能改到别处。
+目录结构：
+    data/workspace/
+        <项目名>/            ← 每个项目一个独立子目录，互不干扰
+            app.py
+            static/...
+        _回收站/             ← 覆盖/删除的东西都进这里，不真删
+
+**多项目**：模型工具跟随"当前项目"（记在 config.json 的 active_project），
+前端可以随时切换 —— 切过去就是另一套完全独立的文件。
+
+路径安全：所有对外接口都走 `safe_rel`，只允许**项目内的相对路径**，
+拒绝盘符、`..`、`/` 开头、`~` 开头 —— 否则模型一句 "../../config.json" 就能改到别处。
 """
+import io
 import os
+import re
 import shutil
 import time
+import zipfile
 
 from . import config
 
 # 单文件大小上限（协同开发里没有大文件，超过多半是模型写飞了）
 MAX_TEXT = 2 * 1024 * 1024
-# 首页/入口文件的候选名，供"预览"用
-ENTRY_NAMES = ("index.html", "main.py", "app.py", "app.js", "index.js", "README.md")
-
+# 导入文件的上限（用户拖进来的素材可能有点大，但也不该无限）
+MAX_IMPORT = 64 * 1024 * 1024
 _RECYCLE = "_回收站"
+DEFAULT_PROJECT = "default"
+_NAME_RE = re.compile(r"^[^\\/:*?\"<>|\r\n]{1,48}$")
+# 新建项目时忽略的目录名
+_RESERVED = {_RECYCLE}
 
 
-def root() -> str:
-    """工作区根目录。
-
-    位置跟着「知识库 / 生成文库 / 记忆」一起走（`<数据根>/data/workspace`）——
-    这样备份、迁移、Docker 挂载都只要盯一个目录，不会多出一处散落的数据。
-    """
+# --------------------------------------------------------------------- 基础
+def base() -> str:
+    """工作区总根（所有项目都在它下面）。"""
     d = config.data("data", "workspace")
     os.makedirs(d, exist_ok=True)
     return d
 
 
+def safe_project(name: str) -> str:
+    """校验项目名（它就是一级目录名，必须干净）。"""
+    n = str(name or "").strip()
+    if not n:
+        raise ValueError("项目名不能为空")
+    if n in _RESERVED or n.startswith("."):
+        raise ValueError("这个项目名是保留名")
+    if not _NAME_RE.match(n) or n in (".", ".."):
+        raise ValueError("项目名不能包含 \\ / : * ? \" < > | 等字符")
+    return n
+
+
+# 当前项目。**必须用内存变量做权威**：
+# 实测过——只靠 config.json 的话，config.load_config() 是带缓存的，
+# 切换项目写进去了、读回来还是启动时那份，表现为"切了没反应、文件串项目"。
+_ACTIVE = ""
+
+
+def active_project() -> str:
+    """当前项目（模型工具默认作用在这个项目上）。"""
+    global _ACTIVE
+    if _ACTIVE and os.path.isdir(os.path.join(base(), _ACTIVE)):
+        return _ACTIVE
+    try:
+        cfg = config.load_config() or {}
+        n = str(cfg.get("active_project") or "").strip()
+        if n and os.path.isdir(os.path.join(base(), n)):
+            _ACTIVE = n
+            return n
+    except Exception:
+        pass
+    # 没设置 / 目录不在 → 退到第一个存在的项目，都没有就用默认名
+    ps = [p["name"] for p in projects()]
+    _ACTIVE = ps[0] if ps else DEFAULT_PROJECT
+    return _ACTIVE
+
+
+def set_active_project(name: str) -> str:
+    global _ACTIVE
+    n = safe_project(name)
+    os.makedirs(os.path.join(base(), n), exist_ok=True)
+    _ACTIVE = n                       # 先认内存，config 只是持久化副本
+    try:
+        cfg = config.load_config() or {}
+        cfg["active_project"] = n
+        config.save_config(cfg)
+    except Exception:
+        pass
+    return n
+
+
+def projects() -> list:
+    """列出所有项目。"""
+    out = []
+    rootd = base()
+    for name in sorted(os.listdir(rootd)):
+        d = os.path.join(rootd, name)
+        if not os.path.isdir(d) or name in _RESERVED or name.startswith("."):
+            continue
+        cnt, size, newest = 0, 0, 0
+        for dirpath, dirnames, filenames in os.walk(d):
+            dirnames[:] = [x for x in dirnames
+                           if x != _RECYCLE and not x.startswith(".")]
+            for fn in filenames:
+                if fn.startswith("."):
+                    continue
+                try:
+                    st = os.stat(os.path.join(dirpath, fn))
+                except OSError:
+                    continue
+                cnt += 1
+                size += st.st_size
+                newest = max(newest, int(st.st_mtime))
+        out.append({"name": name, "files": cnt, "size": size, "mtime": newest})
+    return out
+
+
+def create_project(name: str) -> dict:
+    try:
+        n = safe_project(name)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    d = os.path.join(base(), n)
+    if os.path.isdir(d):
+        return {"ok": False, "error": "同名项目已存在：%s" % n}
+    os.makedirs(d, exist_ok=True)
+    return {"ok": True, "name": n}
+
+
+def delete_project(name: str) -> dict:
+    """删项目 → 进回收站（不真删；协同开发里手滑是常态）。"""
+    try:
+        n = safe_project(name)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    d = os.path.join(base(), n)
+    if not os.path.isdir(d):
+        return {"ok": False, "error": "项目不存在：%s" % n}
+    dst = os.path.join(base(), _RECYCLE, time.strftime("%Y%m%d"),
+                       "%d_%s" % (int(time.time()), n))
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    try:
+        shutil.move(d, dst)
+    except Exception as e:
+        return {"ok": False, "error": "删除失败：%s" % e}
+    if active_project() == n:
+        ps = [p["name"] for p in projects()]
+        set_active_project(ps[0] if ps else DEFAULT_PROJECT)
+    return {"ok": True, "name": n}
+
+
+def rename_project(old: str, new: str) -> dict:
+    try:
+        o, n = safe_project(old), safe_project(new)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    src, dst = os.path.join(base(), o), os.path.join(base(), n)
+    if not os.path.isdir(src):
+        return {"ok": False, "error": "项目不存在：%s" % o}
+    if os.path.exists(dst):
+        return {"ok": False, "error": "目标项目名已存在：%s" % n}
+    try:
+        os.rename(src, dst)
+    except Exception as e:
+        return {"ok": False, "error": "重命名失败：%s" % e}
+    if active_project() == o:
+        set_active_project(n)
+    return {"ok": True, "name": n}
+
+
+def root(proj: str = "") -> str:
+    """某个项目的根目录；proj 为空则用当前项目。"""
+    try:
+        p = safe_project(proj) if str(proj or "").strip() else active_project()
+    except ValueError:
+        p = active_project()          # 名字不合法就退回当前项目，别把接口打成 500
+    d = os.path.join(base(), p)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+# --------------------------------------------------------------------- 路径
 def safe_rel(rel: str) -> str:
-    """把外部传入的路径规范化成工作区内的相对路径；越界就抛 ValueError。"""
+    """把外部传入的路径规范化成项目内的相对路径；越界就抛 ValueError。"""
     r = str(rel or "").strip().replace("\\", "/")
     if not r:
         raise ValueError("路径不能为空")
     # ⚠️ 必须先挡掉开头的 / —— 实测 Windows 上 `os.path.isabs("/etc/passwd")`
     # 返回的是 **False**（新版 ntpath 要求"盘符+根"才算绝对），
-    # 于是 "/etc/passwd" 会被 lstrip 成 "etc/passwd" 当成合法相对路径写进工作区。
+    # 于是 "/etc/passwd" 会被 lstrip 成 "etc/passwd" 当成合法相对路径写进去。
     # 虽然没跳出工作区、不算越权，但"传绝对路径"这件事本身就该被明确拒绝。
     if r.startswith("/") or r.startswith("~"):
-        raise ValueError("只接受工作区内的相对路径，不要以 / 或 ~ 开头")
+        raise ValueError("只接受项目内的相对路径，不要以 / 或 ~ 开头")
     if os.path.isabs(r) or (len(r) > 1 and r[1] == ":"):
-        raise ValueError("只接受工作区内的相对路径，不要传盘符或绝对路径")
+        raise ValueError("只接受项目内的相对路径，不要传盘符或绝对路径")
     r = r.lstrip("/")
     parts = []
     for seg in r.split("/"):
         if seg in ("", "."):
             continue
         if seg == "..":
-            raise ValueError("路径不能包含 ..（不许跳出工作区）")
+            raise ValueError("路径不能包含 ..（不许跳出项目）")
         parts.append(seg)
     if not parts:
         raise ValueError("路径不能为空")
@@ -63,16 +217,20 @@ def safe_rel(rel: str) -> str:
     return "/".join(parts)
 
 
-def abs_path(rel: str) -> str:
-    return os.path.join(root(), safe_rel(rel).replace("/", os.sep))
+def abs_path(rel: str, proj: str = "") -> str:
+    return os.path.join(root(proj), safe_rel(rel).replace("/", os.sep))
 
 
-def tree(max_files: int = 800) -> dict:
-    """列出工作区里的全部文件（多级目录），按目录树返回。"""
-    base = root()
+# --------------------------------------------------------------------- 文件
+def tree(proj: str = "", max_files: int = 1200) -> dict:
+    """列出项目里的全部文件（多级目录）。"""
+    try:
+        p = safe_project(proj) if str(proj or "").strip() else active_project()
+    except ValueError:
+        p = active_project()
+    base_dir = root(p)
     files = []
-    for dirpath, dirnames, filenames in os.walk(base):
-        # 回收站不展示；隐藏目录也跳过（.git 之类）
+    for dirpath, dirnames, filenames in os.walk(base_dir):
         dirnames[:] = [d for d in dirnames
                        if d != _RECYCLE and not d.startswith(".")]
         for fn in filenames:
@@ -83,7 +241,7 @@ def tree(max_files: int = 800) -> dict:
                 st = os.stat(full)
             except OSError:
                 continue
-            rel = os.path.relpath(full, base).replace(os.sep, "/")
+            rel = os.path.relpath(full, base_dir).replace(os.sep, "/")
             files.append({"rel": rel, "size": st.st_size,
                           "mtime": int(st.st_mtime),
                           "ext": os.path.splitext(fn)[1].lower().lstrip(".")})
@@ -92,15 +250,16 @@ def tree(max_files: int = 800) -> dict:
         if len(files) >= max_files:
             break
     files.sort(key=lambda f: f["rel"])
-    return {"ok": True, "root": base, "files": files, "count": len(files)}
+    return {"ok": True, "project": p, "root": base_dir,
+            "files": files, "count": len(files)}
 
 
-def read_text(rel: str) -> dict:
-    p = abs_path(rel)
+def read_text(rel: str, proj: str = "") -> dict:
+    p = abs_path(rel, proj)
     if not os.path.isfile(p):
         return {"ok": False, "error": "文件不存在：%s" % rel}
     if os.path.getsize(p) > MAX_TEXT:
-        return {"ok": False, "error": "文件过大（>2MB），工作区不支持打开"}
+        return {"ok": False, "error": "文件过大（>2MB），开发台不支持打开"}
     try:
         with open(p, "r", encoding="utf-8", errors="replace") as f:
             text = f.read()
@@ -109,21 +268,32 @@ def read_text(rel: str) -> dict:
     return {"ok": True, "rel": safe_rel(rel), "text": text, "chars": len(text)}
 
 
-def write_text(rel: str, text: str) -> dict:
-    """写入文件；覆盖前把旧版备份进回收站（协同开发里误覆盖代价很高）。"""
+def write_text(rel: str, text: str, proj: str = "", by: str = "user") -> dict:
+    """写入文件；覆盖前把旧版备份进回收站，并把这次改动记进"待审阅"。
+
+    `by` 区分是谁改的（"ai" / "user"）—— 前端据此只看 AI 的改动、逐个审阅。
+    """
     r = safe_rel(rel)
-    p = abs_path(r)
-    os.makedirs(os.path.dirname(p) or root(), exist_ok=True)
-    backup = ""
-    if os.path.exists(p):
+    p = abs_path(r, proj)
+    os.makedirs(os.path.dirname(p) or root(proj), exist_ok=True)
+    before = ""
+    existed = os.path.exists(p)
+    if existed:
         try:
-            _dir = os.path.join(root(), _RECYCLE, time.strftime("%Y%m%d"))
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                before = f.read()
+        except Exception:
+            before = ""
+    backup = ""
+    if existed:
+        try:
+            _dir = os.path.join(base(), _RECYCLE, time.strftime("%Y%m%d"))
             os.makedirs(_dir, exist_ok=True)
             dst = os.path.join(_dir, "%s_%s%s" % (
                 os.path.splitext(os.path.basename(p))[0],
                 time.strftime("%H%M%S"), os.path.splitext(p)[1]))
             shutil.copy2(p, dst)
-            backup = os.path.relpath(dst, root()).replace(os.sep, "/")
+            backup = os.path.relpath(dst, base()).replace(os.sep, "/")
         except Exception:
             backup = ""
     try:
@@ -131,46 +301,259 @@ def write_text(rel: str, text: str) -> dict:
             f.write(text or "")
     except Exception as e:
         return {"ok": False, "error": "写入失败：%s" % e}
-    return {"ok": True, "rel": r, "chars": len(text or ""), "backup": backup}
+    rec = record_change(r, before, text or "", by=by, project=proj)
+    return {"ok": True, "rel": r, "chars": len(text or ""), "backup": backup,
+            "change_id": rec.get("id")}
 
 
-def mkdir(rel: str) -> dict:
+# ----------------------------------------------------- 改动记录（可审阅/可撤销）
+# 为什么不做"先弹 diff、批准才落盘"：那样模型写完就没法立刻跑验证，
+# **写→跑→看报错→改** 的回路会断掉（实测过：它必须能跑才能自己修对）。
+# 所以采用"先落盘 + 全程留痕 + 一键撤销"—— 等价于 Trae 的接受/拒绝，
+# 但不牺牲自动迭代能力。
+_CHANGES = []          # [{id, rel, before, after, ts, by, project}]
+_CHANGE_CAP = 200
+
+
+def record_change(rel: str, before: str, after: str, by: str = "user",
+                  project: str = "") -> dict:
+    if before == after:
+        return {}
+    rec = {"id": "c%d" % (int(time.time() * 1000) % 100000000),
+           "rel": rel, "before": before[:200000], "after": after[:200000],
+           "ts": int(time.time()), "by": by,
+           "project": project or active_project(),
+           "created": not before}
+    _CHANGES.append(rec)
+    del _CHANGES[:-_CHANGE_CAP]
+    return rec
+
+
+def changes(limit: int = 50) -> list:
+    """最近的改动，新的在前（不带全文，省得前端被大文件噎住）。"""
+    out = []
+    for c in reversed(_CHANGES[-limit:]):
+        out.append({"id": c["id"], "rel": c["rel"], "ts": c["ts"], "by": c["by"],
+                    "project": c["project"], "created": c.get("created", False),
+                    "before_chars": len(c["before"]), "after_chars": len(c["after"])})
+    return out
+
+
+def change_detail(cid: str) -> dict:
+    for c in _CHANGES:
+        if c["id"] == cid:
+            return {"ok": True, **c}
+    return {"ok": False, "error": "找不到这条改动（可能已被清理）"}
+
+
+def revert(cid: str) -> dict:
+    """撤销一条改动：把文件恢复到改动前。"""
+    for c in _CHANGES:
+        if c["id"] != cid:
+            continue
+        try:
+            p = abs_path(c["rel"], c.get("project") or "")
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        try:
+            if c.get("created"):
+                # 这条改动是"新建文件" → 撤销就是删掉它（进回收站）
+                return remove(c["rel"], c.get("project") or "")
+            with open(p, "w", encoding="utf-8", newline="\n") as f:
+                f.write(c["before"])
+        except Exception as e:
+            return {"ok": False, "error": "撤销失败：%s" % e}
+        _CHANGES.remove(c)
+        return {"ok": True, "rel": c["rel"], "chars": len(c["before"])}
+    return {"ok": False, "error": "找不到这条改动"}
+
+
+def clear_changes(only_project: str = "") -> int:
+    """把记录标记为已读过（保留记录本身，只影响前端的"未读"计数）。"""
+    keep = [c for c in _CHANGES
+            if only_project and c.get("project") != only_project]
+    dropped = len(_CHANGES) - len(keep)
+    _CHANGES[:] = keep
+    return dropped
+
+
+def mkdir(rel: str, proj: str = "") -> dict:
     try:
-        d = abs_path(rel.rstrip("/"))
+        d = abs_path(rel.rstrip("/"), proj)
     except ValueError as e:
         return {"ok": False, "error": str(e)}
     os.makedirs(d, exist_ok=True)
     return {"ok": True, "rel": safe_rel(rel.rstrip("/"))}
 
 
-def remove(rel: str) -> dict:
-    """删除 → 进回收站（**不真删**，协同开发里手滑是常态）。"""
+def remove(rel: str, proj: str = "") -> dict:
+    """删除 → 进回收站（**不真删**）。"""
     r = safe_rel(rel)
-    p = abs_path(r)
+    p = abs_path(r, proj)
     if not os.path.exists(p):
         return {"ok": False, "error": "不存在：%s" % r}
-    dst = os.path.join(root(), _RECYCLE, time.strftime("%Y%m%d"),
+    dst = os.path.join(base(), _RECYCLE, time.strftime("%Y%m%d"),
                        "%d_%s" % (int(time.time()), os.path.basename(p)))
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     try:
         shutil.move(p, dst)
     except Exception as e:
         return {"ok": False, "error": "删除失败：%s" % e}
-    return {"ok": True, "rel": r, "moved_to": os.path.relpath(dst, root()).replace(os.sep, "/")}
+    return {"ok": True, "rel": r,
+            "moved_to": os.path.relpath(dst, base()).replace(os.sep, "/")}
 
 
-def rename(rel: str, to: str) -> dict:
+def rename(rel: str, to: str, proj: str = "") -> dict:
     try:
-        src, dst = abs_path(rel), abs_path(to)
+        src, dst = abs_path(rel, proj), abs_path(to, proj)
     except ValueError as e:
         return {"ok": False, "error": str(e)}
     if not os.path.exists(src):
         return {"ok": False, "error": "不存在：%s" % rel}
     if os.path.exists(dst):
         return {"ok": False, "error": "目标已存在：%s" % to}
-    os.makedirs(os.path.dirname(dst) or root(), exist_ok=True)
+    os.makedirs(os.path.dirname(dst) or root(proj), exist_ok=True)
     try:
         shutil.move(src, dst)
     except Exception as e:
         return {"ok": False, "error": "重命名失败：%s" % e}
     return {"ok": True, "rel": safe_rel(to)}
+
+
+def import_bytes(rel: str, data: bytes, proj: str = "") -> dict:
+    """把上传/拖进来的文件写进项目（**二进制安全**，图片/压缩包也能进）。"""
+    r = safe_rel(rel)
+    if len(data) > MAX_IMPORT:
+        return {"ok": False, "error": "文件太大（>64MB）"}
+    p = abs_path(r, proj)
+    os.makedirs(os.path.dirname(p) or root(proj), exist_ok=True)
+    try:
+        with open(p, "wb") as f:
+            f.write(data)
+    except Exception as e:
+        return {"ok": False, "error": "写入失败：%s" % e}
+    return {"ok": True, "rel": r, "bytes": len(data)}
+
+
+def norm_upload_name(filename: str) -> str:
+    """把浏览器给的原始文件名收敛成安全的相对路径（只留基本名）。"""
+    n = os.path.basename(str(filename or "").replace("\\", "/")).strip()
+    n = re.sub(r'[\\/:*?"<>|\r\n]+', "_", n).strip(". ")
+    return n or ("file_%d" % int(time.time()))
+
+
+# --------------------------------------------------------------- 语法检查（调试）
+def check_py(rel: str, proj: str = "") -> dict:
+    """对 .py 做**语法检查**，返回可直接喂给编辑器的诊断。
+
+    这是"调试能力"里最省事也最有用的一环：写错了当场在编辑器里标红，
+    不用等到点运行才看到报错。
+    """
+    r = read_text(rel, proj)
+    if not r.get("ok"):
+        return {"ok": False, "error": r.get("error"), "diagnostics": []}
+    code = r.get("text") or ""
+    try:
+        compile(code, rel, "exec")
+        return {"ok": True, "diagnostics": []}
+    except SyntaxError as e:
+        return {"ok": True, "diagnostics": [{
+            "line": int(e.lineno or 1), "col": int(e.offset or 1),
+            "message": str(e.msg or "语法错误"), "severity": "error"}]}
+    except (ValueError, MemoryError) as e:
+        # 源码里含 NUL 之类：也算语法问题
+        return {"ok": True, "diagnostics": [{
+            "line": 1, "col": 1, "message": "无法编译：%s" % e, "severity": "error"}]}
+
+
+# --------------------------------------------------------------- 上传到代码托管平台
+def _git(args: list, cwd: str, timeout: int = 120) -> tuple:
+    import subprocess
+    try:
+        p = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
+        return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+    except FileNotFoundError:
+        return 127, "", "找不到 git（请确认已安装并加入 PATH）"
+    except Exception as e:
+        return -1, "", "%s: %s" % (type(e).__name__, e)
+
+
+def git_push(proj: str = "", repo: str = "", message: str = "",
+             branch: str = "main") -> dict:
+    """把当前项目提交并推送到代码托管平台（GitHub / Gitee / 自建 Git 都行）。
+
+    · 项目还没有 .git 就 `git init`；
+    · 有改动就提交（没改动也能推，用于首次推送）；
+    · 远端用 `repo` 覆盖（空则沿用已有的 origin）；
+    · **认证交给系统里的 git 凭据**（SSH key / credential helper），
+      本项目不保存、也不经手任何密码或 token。
+    """
+    p = safe_project(proj) if str(proj or "").strip() else active_project()
+    d = root(p)
+    branch = (str(branch or "").strip() or "main")
+    repo = str(repo or "").strip()
+    message = str(message or "").strip() or ("更新 %s" % time.strftime("%Y-%m-%d %H:%M"))
+
+    logs = []
+    if not os.path.isdir(os.path.join(d, ".git")):
+        rc, out, err = _git(["init"], d)
+        logs.append("git init: " + (out or err or "ok"))
+        if rc != 0:
+            return {"ok": False, "error": err, "logs": logs}
+    # 首次使用 git 的机器可能没配 user.name/email，提交会直接失败 —— 兜一个默认值
+    rc, nm, _ = _git(["config", "user.name"], d)
+    if rc != 0 or not nm:
+        _git(["config", "user.name", "local-multimodal"], d)
+        _git(["config", "user.email", "local@localhost"], d)
+        logs.append("已补默认 git 身份（仅本项目）")
+
+    if repo:
+        rc, out, err = _git(["remote", "get-url", "origin"], d)
+        if rc == 0:
+            _git(["remote", "set-url", "origin", repo], d)
+            logs.append("origin 已更新为 " + repo)
+        else:
+            _git(["remote", "add", "origin", repo], d)
+            logs.append("origin 已设为 " + repo)
+
+    _git(["add", "-A"], d)
+    rc, out, err = _git(["commit", "-m", message], d)
+    if rc == 0:
+        logs.append("已提交：" + (out.splitlines()[0] if out else message))
+    else:
+        logs.append("无需提交（" + (err.splitlines()[0] if err else "工作区干净") + "）")
+
+    _git(["branch", "-M", branch], d)
+    rc, out, err = _git(["push", "-u", "origin", branch], d, timeout=300)
+    if out:
+        logs.append(out[-800:])
+    if rc != 0:
+        tip = err or out
+        if "couldn't find remote ref" in tip or "has no commits" in tip:
+            tip += "\n（远端仓库还是空的？先推一次就行）"
+        if "Authentication failed" in tip or "Permission denied" in tip:
+            tip += "\n（认证失败：请确认这台机器的 git 凭据/SSH key 已配好）"
+        return {"ok": False, "error": tip, "logs": logs, "branch": branch}
+    return {"ok": True, "branch": branch, "logs": logs}
+
+
+def export_zip(proj: str = "") -> tuple:
+    """把整个项目打成 zip，返回 (bytes, 文件名)。"""
+    p = safe_project(proj) if str(proj or "").strip() else active_project()
+    buf = io.BytesIO()
+    base_dir = root(p)
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for dirpath, dirnames, filenames in os.walk(base_dir):
+            dirnames[:] = [d for d in dirnames
+                           if d != _RECYCLE and not d.startswith(".")]
+            for fn in filenames:
+                if fn.startswith("."):
+                    continue
+                full = os.path.join(dirpath, fn)
+                rel = os.path.relpath(full, base_dir).replace(os.sep, "/")
+                try:
+                    z.write(full, rel)
+                except Exception:
+                    continue
+    return buf.getvalue(), "%s.zip" % p

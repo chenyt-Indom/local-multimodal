@@ -5,7 +5,8 @@
 或直接:
     py -3 run.py
 """
-from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, Response
+from fastapi import (FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect,
+                     Response, File)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse, FileResponse, PlainTextResponse
@@ -1243,6 +1244,17 @@ _TEXT_TOOL_DOCS = {
                        '**要给整份内容**。参数 {"rel": "相对路径", "text": "完整内容"}',
     "workspace_run": '运行工作区里的一个 .py，拿到真实输出与报错（工作目录=文件所在目录）。'
                      '参数 {"rel": "相对路径，如 app.py"}',
+    # 编程时同样用得上：查新用法 / 查资料 / 生图当素材 / 拿当前时间
+    "web_search": '联网搜索最新资料（库的新用法、报错原因、版本差异…）。'
+                  '参数 {"query": "搜索词"}',
+    "web_read": '联网读某个网页的**正文**（搜索只给摘要，要细节就用它点进去）。'
+                '参数 {"urls": ["https://…"]}',
+    "github_push": '把当前项目上传到代码托管平台（GitHub / Gitee / 自建 Git）。'
+                   '参数 {"repo": "git@github.com:user/repo.git", "message": "提交说明"}',
+    "search_knowledge": '在用户的知识库里检索资料。参数 {"query": "检索词"}',
+    "generate_image": '生成一张图片并展示（可以直接当网页 / 应用的素材）。'
+                      '参数 {"prompt": "画面描述", "size": 512}',
+    "get_time": '获取当前日期与时间。参数 {}',
 }
 _TEXT_TOOL_NAMES = set(_TEXT_TOOL_DOCS)
 
@@ -1251,10 +1263,19 @@ _TEXT_TOOL_ALIAS = {"save_file": "library"}
 
 
 def _code_text_tools(cfg: dict) -> dict:
-    """代码模型这一轮能用哪些文本工具（按设置里的开关裁剪）。"""
+    """代码模型这一轮能用哪些文本工具（按设置里的开关裁剪）。
+
+    开关语义与聊天轮**完全一致**：关着联网就不给 web_search，
+    关着知识库就不给 search_knowledge，关着本地算代码就不给 run_python。
+    """
     out = dict(_TEXT_TOOL_DOCS)
     if not cfg.get("code_exec_enabled", False):
-        out.pop("run_python", None)   # 沙箱没开就不给它执行能力
+        out.pop("run_python", None)          # 沙箱没开就不给执行能力
+    if not cfg.get("web_enabled", False):
+        out.pop("web_search", None)
+        out.pop("web_read", None)
+    if not cfg.get("rag_enabled", False):
+        out.pop("search_knowledge", None)
     return out
 
 
@@ -1302,25 +1323,30 @@ def _as_tool_call_obj(obj):
     return {"name": name, "arguments": args}
 
 
-def _split_text_tool_call(text: str):
-    """从代码模型的正文里拆出「文本协议工具调用」。
+def _split_text_tool_calls(text: str):
+    """从代码模型的正文里拆出**所有**「文本协议工具调用」。
 
-    返回 (call, 清理后的正文)：call 为 None 表示本轮不是工具调用；
-    清理后的正文是把那个 ```tool 块整段删掉的版本 —— **用户不该看到那坨 JSON**。
+    返回 (calls, 清理后的正文)。清理后的正文里，**所有** ```tool 块都被删掉了 ——
+    ⚠️ 只删第一个是不够的：实测模型一轮里会连着输出两个块（比如先 write 再 run），
+    第二个会被原样留在正文里显示成一坨 JSON 给用户看，而且还会被静默丢掉不执行。
     """
     raw = text or ""
     if not raw or '"name"' not in raw:
-        return None, raw
+        return [], raw
 
-    # ① 先认代码围栏里的（模型最常这么写）
-    for m in _TEXT_TOOL_RE.finditer(raw):
+    calls, cleaned = [], raw
+    # ① 代码围栏里的（模型最常这么写）
+    for m in list(_TEXT_TOOL_RE.finditer(raw)):
         try:
             obj = json.loads(m.group(1).strip())
         except Exception:
             continue
         call = _as_tool_call_obj(obj)
         if call:
-            return call, (raw[:m.start()] + raw[m.end():]).strip()
+            calls.append(call)
+            cleaned = cleaned.replace(m.group(0), "")
+    if calls:
+        return calls, cleaned.strip()
 
     # ② 退一步：正文里裸的 JSON（平衡括号扫描，只在疑似时做，避免大段 HTML 拖慢）
     if '"arguments"' in raw or '"parameters"' in raw:
@@ -1338,9 +1364,10 @@ def _split_text_tool_call(text: str):
                         except Exception:
                             call = None
                         if call:
-                            return call, raw.replace(seg, "").strip()
+                            calls.append(call)
+                            cleaned = cleaned.replace(seg, "")
                         break
-    return None, raw
+    return calls, cleaned.strip()
 
 
 def _route_code_model(cfg: dict, text: str, fallback: str, prev_code: bool = False):
@@ -1939,7 +1966,10 @@ async def chat(req: ChatRequest):
                     "```\n"
                     "我会**真的执行**它，然后把结果作为下一条消息发给你"
                     "（以「工具结果：」开头），你接着继续。\n\n"
-                    "本轮可用工具：\n" + _tt_docs + "\n\n"
+                    "**当前开发项目：%s**（工作区工具都作用在它身上；"
+                    "用户可以在界面上切换项目，切过来就是另一套完全独立的文件）。\n\n"
+                    "本轮可用工具：\n" % workspace.active_project()
+                    + _tt_docs + "\n\n"
                     "【硬性规则】\n"
                     "1. 想验证代码对不对，就**真的调用 run_python 跑一遍**看真实输出，"
                     "**绝对不要**凭空猜输出。\n"
@@ -1954,11 +1984,16 @@ async def chat(req: ChatRequest):
                     "5. 除了通过工具，**绝对不要说**「已保存到…」「已经写入…」"
                     "「文件已生成」「我运行过了」—— 没调用工具就等于没做。\n"
                     "6. **要交付出文件**（脚本 / 网页 / 配置…）：用 workspace_write 写进"
-                    "**开发工作区**（传相对路径，如 hello.py / src/app.py），"
+                    "**开发工作区**（传相对路径，如 hello.py / static/app.js），"
                     "再按需用 workspace_run 跑它验证。用户会在界面的「开发台」里看到、"
                     "并且可以自己改。**只在 run_python 里跑一遍、不在工作区留下文件，"
                     "等于没有交付。**\n"
-                    "7. 全部做完后，把**完整代码**（放在 ``` 代码块里、标注语言）"
+                    "7. **多文件项目**：需要 css/js/图片就分别 workspace_write 到子目录"
+                    "（static/、src/ 等），HTML 里用**相对路径**引用它们；"
+                    "写完后可以用 workspace_list 核对文件齐不齐。\n"
+                    "8. **拿不准的新用法**（某个库的新版本、报错含义）就先 web_search 查，"
+                    "别凭印象编 API。\n"
+                    "9. 全部做完后，把**完整代码**（放在 ``` 代码块里、标注语言）"
                     "和**真实运行结果**一起给我。\n")
             else:
                 full_sys += (
@@ -2065,16 +2100,18 @@ async def chat(req: ChatRequest):
             # 放在 `if not tool_calls` 之前 —— 解析出来的调用要能接进下面同一套执行逻辑。
             text_protocol = False
             if code_model_on and round_msg["content"]:
-                _call, _clean = _split_text_tool_call(round_msg["content"])
+                _calls, _clean = _split_text_tool_calls(round_msg["content"])
                 round_msg["content"] = _clean
                 if _clean:
                     final_text += _clean
                     yield json.dumps({"message": {"content": _clean}}) + "\n"
                 # 再校验一次白名单与开关：设置里关掉了「本地算代码」就不许执行
-                if _call and _call["name"] in code_text_tools:
+                _calls = [c for c in _calls if c["name"] in code_text_tools]
+                if _calls:
                     text_protocol = True
-                    tool_calls = [{"function": {"name": _call["name"],
-                                                "arguments": _call["arguments"]}}]
+                    tool_calls = [{"function": {"name": c["name"],
+                                                "arguments": c["arguments"]}}
+                                  for c in _calls]
 
             if not tool_calls:
                 # 被思考吃光配额：Ollama 明确告诉我们 done_reason=length，
@@ -2172,6 +2209,7 @@ async def chat(req: ChatRequest):
             gathered = await _tool_task
             while not live_ui.empty():      # 收尾：把队列里剩下的也吐出去
                 yield json.dumps({"ui": live_ui.get_nowait()}) + "\n"
+            text_results = []
             for _idx, name, result, ev in sorted(gathered, key=lambda x: x[0]):
                 used_tools.add(name)
                 # 把本次新产生的图片登记下来，后续工具（如保存到图库）可按序号引用
@@ -2182,12 +2220,17 @@ async def chat(req: ChatRequest):
                 if text_protocol:
                     # 文本协议没有 tool_call_id 可关联。实测用 user 消息 +
                     # 「工具结果：」前缀，模型能正确接着改（探针里全部收敛）。
-                    working.append({"role": "user", "content": "工具结果：\n" + result})
+                    # 一轮可能有多个调用 → 先攒起来，最后合成**一条**消息发回去
+                    # （连着发多条 user 消息会让对话模板看着很怪）。
+                    text_results.append("【%s】\n%s" % (name, result))
                 else:
                     # 注意：Ollama 的 tool 消息用 tool_name 关联调用，
                     # 不是 tool_calls/tool_call_id，否则模型读不到工具返回内容
                     # （会误答"没查到/无法联网"）。
                     working.append({"role": "tool", "content": result, "tool_name": name})
+            if text_protocol and text_results:
+                working.append({"role": "user",
+                                "content": "工具结果：\n" + "\n\n".join(text_results)})
             # 3) 把前端副作用事件透出
             for ui in ui_events:
                 yield json.dumps({"ui": ui}) + "\n"
@@ -2365,6 +2408,216 @@ def ws_raw(rel: str = ""):
     if not r.get("ok"):
         return PlainTextResponse(r.get("error") or "读取失败", status_code=404)
     return PlainTextResponse(r["text"])
+
+
+# ---------- 多项目：各项目完全独立，可自由切换 ----------
+@app.get("/api/ws/projects")
+def ws_projects():
+    return {"ok": True, "active": workspace.active_project(),
+            "projects": workspace.projects()}
+
+
+@app.post("/api/ws/projects/new")
+def ws_project_new(body: dict):
+    r = workspace.create_project(str((body or {}).get("name") or ""))
+    if r.get("ok"):
+        r["active"] = workspace.set_active_project(r["name"])
+    return r
+
+
+@app.post("/api/ws/projects/use")
+def ws_project_use(body: dict):
+    try:
+        return {"ok": True,
+                "active": workspace.set_active_project(str((body or {}).get("name") or ""))}
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/ws/projects/rename")
+def ws_project_rename(body: dict):
+    b = body or {}
+    return workspace.rename_project(str(b.get("old") or ""), str(b.get("new") or ""))
+
+
+@app.post("/api/ws/projects/delete")
+def ws_project_delete(body: dict):
+    return workspace.delete_project(str((body or {}).get("name") or ""))
+
+
+# ---------- 导入代码 / 素材（上传、拖拽都走这里） ----------
+@app.post("/api/ws/upload")
+async def ws_upload(files: list[UploadFile] = File(...), dir: str = ""):
+    """把本地文件传进当前项目。
+
+    **按原始字节存**（图片、压缩包都是二进制，不能解码）。
+    支持多选、支持拖进来一批；目录部分由前端用相对路径带过来（切掉盘符）。
+    """
+    try:
+        sub = str(dir or "").strip().strip("/")
+        if sub:
+            workspace.safe_rel(sub)          # 借它做一次校验
+    except ValueError:
+        sub = ""
+    saved, failed = [], []
+    for f in files or []:
+        # 浏览器在拖**整个文件夹**时会给出 "myproj/static/app.js" 这样的相对路径，
+        # 要保留目录结构（"上传代码"十有八九是拖一个项目文件夹）。
+        # 但**只剥掉盘符**那种第一段（C:/…），其余原样保留。
+        raw = str(getattr(f, "filename", "") or "").replace("\\", "/")
+        parts = [p for p in raw.split("/") if p not in ("", ".")]
+        if len(parts) > 1 and re.match(r"^[A-Za-z]:$", parts[0]):
+            parts = parts[1:]
+        rel = "/".join(parts) if parts else workspace.norm_upload_name(raw)
+        if sub:
+            rel = "%s/%s" % (sub, rel)
+        try:
+            data = await f.read()
+            r = workspace.import_bytes(rel, data)
+            (saved if r.get("ok") else failed).append(
+                r.get("rel") or rel if r.get("ok") else
+                {"rel": rel, "error": r.get("error")})
+        except Exception as e:
+            failed.append({"rel": rel, "error": str(e)})
+    return {"ok": True, "saved": saved, "failed": failed,
+            "project": workspace.active_project()}
+
+
+@app.get("/api/ws/zip")
+def ws_zip(proj: str = ""):
+    """把项目打包成 zip 下载（"拿走整个项目"用）。"""
+    data, name = workspace.export_zip(proj)
+    return Response(content=data, media_type="application/zip",
+                    headers={"Content-Disposition":
+                             'attachment; filename="%s"' % name})
+
+
+# ---------- 本地部署 / 预览：为项目起一个静态服务 ----------
+# 多文件前端（有 css/js/图片相对引用）用 file:// 或 iframe 单文件预览都不对，
+# 起个真正的静态服务最省事，且**完全在本机**（127.0.0.1），不联网。
+_serve = {"proc": None, "port": 0, "project": ""}
+
+
+def _stop_serve() -> None:
+    p = _serve.get("proc")
+    if p is not None:
+        try:
+            p.terminate()
+            p.wait(timeout=5)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+    _serve.update({"proc": None, "port": 0, "project": ""})
+
+
+def _port_free(port: int) -> bool:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+@app.post("/api/ws/serve")
+def ws_serve(body: dict):
+    """给当前项目起静态服务，返回可访问地址。"""
+    import subprocess
+    b = body or {}
+    proj = workspace.active_project()
+    want = int(b.get("port") or 8808)
+    _stop_serve()
+    port = 0
+    for cand in [want] + [want + i for i in range(1, 20)]:
+        if _port_free(cand):
+            port = cand
+            break
+    if not port:
+        return {"ok": False, "error": "8808~8827 都被占用了，换个端口再试"}
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1"],
+            cwd=workspace.root(proj),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        return {"ok": False, "error": "启动失败：%s" % e}
+    # 给它一点时间起来，别返回一个还没监听的地址
+    import socket as _s
+    for _ in range(30):
+        time.sleep(0.15)
+        with _s.socket(_s.AF_INET, _s.SOCK_STREAM) as sk:
+            sk.settimeout(0.4)
+            if sk.connect_ex(("127.0.0.1", port)) == 0:
+                break
+        if proc.poll() is not None:
+            return {"ok": False, "error": "服务进程异常退出"}
+    _serve.update({"proc": proc, "port": port, "project": proj})
+    return {"ok": True, "url": "http://127.0.0.1:%d/" % port, "port": port,
+            "project": proj}
+
+
+@app.post("/api/ws/serve/stop")
+def ws_serve_stop():
+    was = _serve.get("port") or 0
+    _stop_serve()
+    return {"ok": True, "stopped": was}
+
+
+@app.get("/api/ws/serve/status")
+def ws_serve_status():
+    p = _serve.get("proc")
+    alive = bool(p is not None and p.poll() is None)
+    return {"ok": True, "running": alive, "port": _serve.get("port") or 0,
+            "project": _serve.get("project") or "",
+            "url": ("http://127.0.0.1:%d/" % _serve["port"]) if alive else ""}
+
+
+# ---------- 改动审阅：AI 改了什么、一键撤销 ----------
+@app.get("/api/ws/changes")
+def ws_changes(limit: int = 50):
+    return {"ok": True, "active": workspace.active_project(),
+            "changes": workspace.changes(limit)}
+
+
+@app.get("/api/ws/change")
+def ws_change_detail(id: str = ""):
+    return workspace.change_detail(id)
+
+
+@app.post("/api/ws/changes/revert")
+def ws_change_revert(body: dict):
+    return workspace.revert(str((body or {}).get("id") or ""))
+
+
+@app.post("/api/ws/changes/clear")
+def ws_changes_clear(body: dict):
+    n = workspace.clear_changes(str((body or {}).get("project") or ""))
+    return {"ok": True, "dropped": n}
+
+
+@app.get("/api/ws/check")
+def ws_check(rel: str = ""):
+    """语法检查（编辑器里当场标红，不用等运行才看到报错）。"""
+    return workspace.check_py(rel)
+
+
+@app.post("/api/ws/git/push")
+def ws_git_push(body: dict):
+    """把项目上传到代码托管平台（GitHub / Gitee / 自建 Git）。
+
+    认证走**系统里已有的 git 凭据**（SSH key / credential helper）——
+    应用本身不存 token，也不经手密码。
+    """
+    b = body or {}
+    return workspace.git_push(
+        proj=str(b.get("project") or ""),
+        repo=str(b.get("repo") or ""),
+        message=str(b.get("message") or ""),
+        branch=str(b.get("branch") or "main"))
 
 
 @app.get("/api/doclib/files")

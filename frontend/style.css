@@ -780,9 +780,35 @@ body.dragging .drop-overlay,
 }
 .folder-head:first-child { margin-top: 2px; }
 
-/* ---------- 开发台（人机协同开发） ---------- */
-.studio { position: fixed; inset: 0; z-index: 300; background: var(--bg); display: flex; flex-direction: column; }
+/* ---------- 开发台（人机协同开发）----------
+   整页全屏（**不是**分屏小窗）：打开就相当于换了一页，
+   聊天区被搬进右侧那一栏，所以“对话框”始终在，拖图/拖文件/流式输出都照旧。 */
+.studio { position: fixed; inset: 0; z-index: 300; background: var(--bg);
+  display: flex; flex-direction: column; }
 .studio[hidden] { display: none; }
+.studio-chat { width: min(42%, 560px); min-width: 330px; display: flex; flex-direction: column;
+  border-left: 1px solid var(--border); background: var(--panel); }
+.studio-chat .main { flex: 1; min-width: 0; }
+.studio-proj { background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 6px; font-size: 12px; max-width: 150px; outline: none; }
+.st-count { color: var(--accent); }
+.studio-changes { border-top: 1px solid var(--border); max-height: 38%; display: flex; flex-direction: column; }
+.st-change-list { overflow: auto; }
+.st-change { padding: 6px 10px; font-size: 12px; cursor: pointer; border-bottom: 1px solid var(--border); }
+.st-change:hover { background: var(--panel2); }
+.st-change .st-c-rel { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.st-change .st-c-meta { color: var(--muted); font-size: 11px; }
+.st-change .st-c-new { color: var(--green); }
+.st-change-empty { padding: 10px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+/* 改动对比弹层（Monaco diff） */
+.st-diff-mask { position: fixed; inset: 0; z-index: 400; background: rgba(0,0,0,.6);
+  display: flex; align-items: center; justify-content: center; }
+.st-diff-mask[hidden] { display: none; }
+.st-diff { width: min(1180px, 94vw); height: min(760px, 88vh); background: var(--panel);
+  border: 1px solid var(--border); border-radius: 10px; display: flex; flex-direction: column; overflow: hidden; }
+.st-diff-head { display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 13px; }
+.st-diff-body { flex: 1; min-height: 0; }
 .studio-bar { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--border); }
 .studio-title { font-weight: 600; white-space: nowrap; }
 .studio-path { color: var(--muted); font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -817,3 +843,4 @@ body.dragging .drop-overlay,
 .st-dialog-input { background: var(--panel2); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 8px 10px; font-size: 13px; outline: none; }
 .st-dialog-input:focus { border-color: var(--accent); }
 .st-dialog-acts { display: flex; justify-content: flex-end; gap: 8px; }
+.studio-tabs .st-askai { margin-left: auto; border: none; }
