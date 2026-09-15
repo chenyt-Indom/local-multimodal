@@ -296,6 +296,7 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 /* （旧的分区式记忆编辑器样式已移除：记忆改成"每个对话一块"后不再使用） */
 
 /* ---------- 拖拽导入提示 ---------- */
+/* 旧的小提示条（还在文档里但已不用，留着以防有别的引用） */
 .drop-hint {
   display: none; position: absolute; left: 20px; right: 20px;
   padding: 14px; text-align: center; font-size: 14px; color: var(--text);
@@ -304,6 +305,27 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 }
 .drop-hint.show { display: block; }
 .composer { position: relative; }
+
+/* 整窗拖放提示：只要把文件拖进窗口，无论落在哪个角落都会亮起来。
+   以前的提示只在输入框附近，拖到侧边栏时根本没有任何反馈，
+   用户会以为"拖拽功能坏了"。 */
+.drop-overlay {
+  display: none; position: fixed; inset: 0; z-index: 9999;
+  pointer-events: none;                      /* 绝不能挡住 drop 事件 */
+  background: rgba(15, 17, 21, .72);
+  backdrop-filter: blur(2px);
+  align-items: center; justify-content: center;
+}
+body.dragging .drop-overlay,
+.drop-overlay.show { display: flex; }
+.drop-overlay-box {
+  padding: 32px 44px; text-align: center;
+  background: var(--panel); border: 2px dashed var(--accent); border-radius: 18px;
+  box-shadow: 0 18px 48px rgba(0,0,0,.45);
+}
+.drop-overlay-icon { font-size: 40px; line-height: 1; }
+.drop-overlay-title { margin-top: 12px; font-size: 18px; font-weight: 600; color: var(--text); }
+.drop-overlay-sub { margin-top: 6px; font-size: 12px; color: var(--muted); }
 
 /* ---------- 语音输入状态条 ---------- */
 .voice-hint {

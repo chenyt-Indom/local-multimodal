@@ -168,6 +168,8 @@
       rag_enabled: $('.pill[data-cfg="rag_enabled"]').classList.contains("on"),
       web_enabled: $('.pill[data-cfg="web_enabled"]').classList.contains("on"),
       auto_memorize: $('.pill[data-cfg="auto_memorize"]').classList.contains("on"),
+      code_auto_route: $('.pill[data-cfg="code_auto_route"]').classList.contains("on"),
+      code_exec_enabled: $('.pill[data-cfg="code_exec_enabled"]').classList.contains("on"),
     };
     await api("/api/config", { method: "POST", body: JSON.stringify(body) });
   }
@@ -202,6 +204,23 @@
       if (key === "web_enabled") {
         showToast(p.classList.contains("on") ? "已开启联网模式" : "已关闭联网模式",
                   p.classList.contains("on") ? "ok" : "");
+      }
+      // 开启"本地算代码"是**有风险的操作**，必须明确说清而不是默默打开
+      if (key === "code_exec_enabled" && p.classList.contains("on")) {
+        showToast("已开启：模型写的 Python 会在你电脑上真实执行（有 25 秒超时，会拦截删除/联网类操作）", "warn");
+      }
+      // 开了代码模型但本机没装时，别让用户以为坏了
+      if (key === "code_auto_route" && p.classList.contains("on")) {
+        try {
+          const r = await fetch("/api/models");
+          const d = await r.json();
+          const names = (d.models || []).map((m) => m.name || "");
+          const cfg = (await (await fetch("/api/config")).json()).config || {};
+          const want = cfg.code_model || "";
+          if (want && !names.some((n) => n === want || n.split(":")[0] === want.split(":")[0])) {
+            showToast(`本机还没下载 ${want}，现在仍用默认模型；下载后会自动生效`, "warn");
+          }
+        } catch (e) {}
       }
     };
   });
@@ -274,16 +293,45 @@
       }
     });
   }
-  const dropHint = $("#dropHint");
-  ["dragover", "dragenter"].forEach((ev) => mainEl.addEventListener(ev, (e) => {
+  // ---------- 拖拽导入：**整个窗口**都是拖放区 ----------
+  // 为什么不绑在 #main 上（踩过）：只绑 #main 的话，拖到左侧边栏、顶部空白、
+  // 底部提示这些**不在 #main 里的区域**就完全没人接事件，用户看到的
+  // 就是"拖了半天一点反应都没有"。现在改成绑 document、并且用**捕获阶段** ——
+  // 事件还没轮到别的元素处理就先被我们接住。
+  const dropOverlay = $("#dropOverlay");
+  let dragDepth = 0;            // dragenter/dragleave 会在子元素间反复触发，用计数收敛
+
+  function dragHasFiles(e) {
+    const dt = e.dataTransfer;
+    if (!dt) return false;
+    if (dt.types && [...dt.types].includes("Files")) return true;
+    return !!(dt.items && [...dt.items].some((it) => it.kind === "file"));
+  }
+  function setDragging(on) {
+    document.body.classList.toggle("dragging", !!on);
+    if (dropOverlay) dropOverlay.classList.toggle("show", !!on);
+  }
+  document.addEventListener("dragenter", (e) => {
+    if (!dragHasFiles(e)) return;
     e.preventDefault();
-    if (dropHint) dropHint.classList.add("show");
-  }));
-  ["dragleave", "drop"].forEach((ev) => mainEl.addEventListener(ev, (e) => {
+    dragDepth++;
+    setDragging(true);
+  }, true);
+  document.addEventListener("dragover", (e) => {
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();                    // 不 preventDefault 就永远等不到 drop
+    e.dataTransfer.dropEffect = "copy";
+  }, true);
+  document.addEventListener("dragleave", (e) => {
+    if (!dragHasFiles(e)) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) setDragging(false);
+  }, true);
+  document.addEventListener("drop", (e) => {
+    dragDepth = 0;
+    setDragging(false);
+    if (!dragHasFiles(e)) return;
     e.preventDefault();
-    if (dropHint) dropHint.classList.remove("show");
-  }));
-  mainEl.addEventListener("drop", (e) => {
     const dt = e.dataTransfer;
     let files = (dt && dt.files) ? [...dt.files] : [];
     if (!files.length && dt && dt.items) {
@@ -293,12 +341,31 @@
       }
     }
     onDropFiles(files);
-  });
+  }, true);
 
-  // 拖到窗口任意位置都不要让浏览器"直接打开"这个文件 ——
+  // 再兜一层：拖到窗口任意位置都不要让浏览器"直接打开"这个文件 ——
   // 否则整个界面会被替换成文件内容，看起来像把应用弄坏了。
   window.addEventListener("dragover", (e) => e.preventDefault());
   window.addEventListener("drop", (e) => e.preventDefault());
+
+  // ---------- 粘贴导入（万一拖放被宿主窗口吞掉，还有这条路）----------
+  // 支持：复制文件后 Ctrl+V、截图后 Ctrl+V、复制图片后 Ctrl+V。
+  document.addEventListener("paste", (e) => {
+    const items = (e.clipboardData && e.clipboardData.items) || [];
+    const files = [];
+    for (const it of items) {
+      if (it.kind === "file") { const f = it.getAsFile(); if (f) files.push(f); }
+    }
+    const text = (e.clipboardData && e.clipboardData.getData("text")) || "";
+    if (files.length) {
+      e.preventDefault();
+      onDropFiles(files);
+    } else if (text && /^file:\/\/\/.+\.\w{1,6}$/i.test(text.trim())) {
+      // 从资源管理器"复制文件"拿到的是路径，浏览器读不了 → 如实告知，别装作成功
+      e.preventDefault();
+      showToast("读到的是文件路径，浏览器打不开。请用输入框左边的 📎 选择文件，或直接把文件拖进来。", "warn");
+    }
+  });
 
   // ---------- 图片库 ----------
   // 搜到的图 / 生成的图保存后集中在这里，可随时查看、放大、删除。
@@ -758,9 +825,18 @@
     };
   })();
 
-  // ---------- 附件：图片 / 视频 ----------
+  // ---------- 附件：图片 / 文档 / 视频 ----------
   $("#attachBtn").onclick = () => $("#fileInput").click();
   $("#fileInput").onchange = (e) => {
+    onDropFiles(e.target.files);
+    e.target.value = "";
+  };
+
+  // 文档走独立入口：**不设 accept 白名单**（设了就只能在对话框里选到那几种）。
+  // 这条路的必要性：拖放依赖宿主窗口把事件交给网页，万一被吞掉，
+  // 用户就彻底没办法导入文档了 —— 有这个按钮至少永远有条走得通的路。
+  $("#docBtn").onclick = () => $("#docInput").click();
+  $("#docInput").onchange = (e) => {
     onDropFiles(e.target.files);
     e.target.value = "";
   };

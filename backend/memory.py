@@ -225,6 +225,136 @@ def delete_short(sid: str) -> bool:
 
 
 # =====================================================================
+#  改写已有条目（目标的进展更新 / 作废旧信息）
+# =====================================================================
+# 为什么需要这一层：原来只有 merge_*（**只会追加**，遇到重复就整条丢掉）。
+# 但"目标/计划"这类信息天生是要变化的 ——
+#   3 月记下「打算考四级」，6 月用户说「四级过了」，12 月又说「准备考六级」。
+# 只会追加的话，档案里会堆出互相矛盾的几句（"打算考四级"和"四级已过"并存），
+# 模型读到就不知道该信哪句。所以必须支持**原地改**和**删除**。
+def _grams(text: str, n: int = 2) -> set:
+    """中文短句的 n 元字符组（去掉空白）。"""
+    t = "".join(ch for ch in (text or "") if not ch.isspace())
+    if len(t) < n:
+        return {t} if t else set()
+    return {t[i:i + n] for i in range(len(t) - n + 1)}
+
+
+def _overlap(a: str, b: str) -> float:
+    """两条要点的相似度（0~1）：互相包含 → 1.0，否则取「字符序列比例」和「2元组覆盖度」的较大值。
+
+    为什么不能只用 SequenceMatcher（踩过）：
+    模型改写措辞时字序会变，SequenceMatcher 会明显低估 ——
+    实测「考网络工程师」与「已报名网络工程师考试，2027年3月开班，正在看教材」
+    的序列比例只有 **0.40**，刚好卡在匹配阈值下方，导致改写失败、变成新增一条。
+    换成 2 元组覆盖度后同一对比是 0.80，能正确认出"说的是同一件事"。
+    """
+    a, b = _norm_point(a), _norm_point(b)
+    if not a or not b:
+        return 0.0
+    if a in b or b in a:
+        return 1.0
+    from difflib import SequenceMatcher
+    ratio = SequenceMatcher(None, a, b).ratio()
+    ga, gb = _grams(a), _grams(b)
+    # 分母取**较短**那一侧：问的是"较短的那句有多少能在另一句里找到"。
+    # 取较长一侧会把长条目稀释掉（实测同一条对比 0.17 vs 0.80）。
+    cov = len(ga & gb) / max(1, min(len(ga), len(gb)))
+    return max(ratio, cov)
+
+
+def _locate(body: str, hint: str):
+    """在记忆正文里找与 hint 最像的那一条，返回 (下标, 条目列表, 相似度)。"""
+    items = _split_items(body)
+    best_i, best_s = -1, 0.0
+    for i, e in enumerate(items):
+        sc = _overlap(e, hint)
+        if sc > best_s:
+            best_i, best_s = i, sc
+    return best_i, items, best_s
+
+
+MATCH_THRESHOLD = 0.5           # 低于它就认为"不是同一条"，宁可不改也不乱改
+
+
+def update_long(old_hint: str, new_point: str, threshold: float = MATCH_THRESHOLD,
+                append_missing: bool = True) -> str:
+    """把长期记忆里的某一条**改成新内容**。
+
+    返回：replaced（改成功）/ added（没找到旧条目，改为追加）/ skipped（没变化或内容为空）
+    append_missing=False 时，找不到旧条目就返回 "missing"（不追加）——
+    调用方想"先在这里改，改不到再换别处"时用得上。
+    """
+    new_point = _norm_point(new_point)
+    if not new_point:
+        return "skipped"
+    cur = get_long()
+    if not cur.strip():
+        return ("added" if merge_long(new_point) else "skipped") if append_missing else "missing"
+    i, items, score = _locate(cur, old_hint)
+    if i < 0 or score < threshold:
+        if not append_missing:
+            return "missing"
+        return "added" if merge_long(new_point) else "skipped"
+    if _norm_point(items[i]) == new_point:
+        return "skipped"                     # 和原句一样，不用动
+    items[i] = new_point
+    set_long("；".join(items))
+    return "replaced"
+
+
+def update_short(sid: str, old_hint: str, new_point: str,
+                 threshold: float = MATCH_THRESHOLD,
+                 append_missing: bool = True) -> str:
+    """短期记忆版的 update_long。"""
+    sid = _safe_sid(sid)
+    new_point = _norm_point(new_point)
+    if not sid or not new_point:
+        return "skipped"
+    cur = get_short(sid)
+    if not cur.strip():
+        return ("added" if merge_short(sid, new_point) else "skipped") if append_missing else "missing"
+    i, items, score = _locate(cur, old_hint)
+    if i < 0 or score < threshold:
+        if not append_missing:
+            return "missing"
+        return "added" if merge_short(sid, new_point) else "skipped"
+    if _norm_point(items[i]) == new_point:
+        return "skipped"
+    items[i] = new_point
+    set_short(sid, "；".join(items))
+    return "replaced"
+
+
+def drop_long(point: str, threshold: float = 0.5) -> bool:
+    """删掉长期记忆里最像 point 的那一条（用户明确说"不做了/弄错了"时用）。"""
+    cur = get_long()
+    if not cur.strip():
+        return False
+    i, items, score = _locate(cur, point)
+    if i < 0 or score < threshold:
+        return False
+    items.pop(i)
+    set_long("；".join(items))
+    return True
+
+
+def drop_short(sid: str, point: str, threshold: float = 0.5) -> bool:
+    sid = _safe_sid(sid)
+    if not sid:
+        return False
+    cur = get_short(sid)
+    if not cur.strip():
+        return False
+    i, items, score = _locate(cur, point)
+    if i < 0 or score < threshold:
+        return False
+    items.pop(i)
+    set_short(sid, "；".join(items))
+    return True
+
+
+# =====================================================================
 #  注入上下文
 # =====================================================================
 def build_context(sid: str, query: str = "") -> str:

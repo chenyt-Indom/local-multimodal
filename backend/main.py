@@ -238,6 +238,13 @@ _MEMORY_SIGNALS = (
     # 项目 / 工作
     "我的项目", "我在做", "我们在做", "正在开发", "技术栈", "用的是什么",
     "环境是", "部署在", "服务器", "版本是",
+    # 经历 / 成果 —— 这类信息**天然不带任何标记词**，是漏记最多的一类：
+    # 用户讲自己的经历时不会说"记住"，只会平铺直叙"我做过…"。
+    "做过", "搞过", "写过", "参加过", "拿过", "获过", "得过", "考过", "学过",
+    "我用过", "我熟悉", "我负责", "我参与", "我曾经", "我以前", "以前在",
+    "比赛", "获奖", "拿奖", "证书", "实习", "兼职", "项目经验", "实验室",
+    # 技能 / 工具
+    "我会用", "我会写", "熟练", "习惯用", "常用",
 )
 
 
@@ -245,90 +252,298 @@ def _looks_memorable(text: str) -> bool:
     return any(k in (text or "") for k in _MEMORY_SIGNALS)
 
 
-# 每个会话的轮次计数，用于"周期性兜底提炼"
-_mem_turn_counter: dict = {}
-_MEM_EVERY_N = 4
+# ---------------------------------------------------------------
+#  后台记忆提炼的调度（防抖）
+# ---------------------------------------------------------------
+# 以前是"命中信号词才提炼 + 每 4 轮兜底一次"，两个毛病：
+#   · 只分析**最后一条用户消息**，前面几轮讲的重要信息（尤其经历类）永远轮不到；
+#   · 兜底要等满 4 轮，聊天一停就再也不会提炼了。
+#
+# 现在改成：**每轮结束都安排一次提炼**，但做防抖 ——
+# 提炼要占用同一个 Ollama 模型（实测约 25 秒），立刻跑会把紧接着的下一条消息堵在队列里。
+# 所以：用户停手 6 秒后再提炼；若一直不停嘴，最迟 45 秒也强制提炼一次。
+# 每次带上**最近几轮**对话，前几轮讲的事不会漏。
+_MEM_DEBOUNCE_SEC = 6.0        # 停手这么久才动
+_MEM_FORCE_AFTER_SEC = 45.0    # 连续聊天时，最迟这么久必须提炼一次
+_MEM_WINDOW_TURNS = 8          # 每次最多带上最近 8 条消息（约 4 轮）
+
+_mem_pending: dict = {}
+_mem_lock = threading.Lock()
 
 
-def _should_extract(session: str, text: str) -> bool:
-    """判断本轮是否值得做后台记忆提炼。
-
-    两条触发路径：
-      1. 命中信号词（用户明确说了偏好/身份/约定）→ 立刻提炼；
-      2. **兜底：每 4 轮抽一次** —— 有些重要信息本身不含任何关键词
-         （例如「我们用的是飞书」「部署在 8.12 那台」），
-         只靠信号词必然漏记，这是"该记的没记住"的第二大来源。
-    """
-    if _looks_memorable(text):
-        return True
-    n = int(_mem_turn_counter.get(session, 0)) + 1
-    _mem_turn_counter[session] = n
-    return n % _MEM_EVERY_N == 0
-
-
-def _auto_extract_memory(session: str, last_user: str, answer: str,
-                         model: str, cfg: dict) -> None:
-    """把本轮要点提炼进**当前对话**的记忆（后台线程，不阻塞回复）。
-
-    长期记忆是"久远对话可被清理"的前提——要点沉淀下来后，
-    老的聊天记录才可以安全裁剪或清除。**所以下面释放归档前，
-    必须先跑一遍这个沉淀，否则还没提炼的内容会跟着归档一起消失。**
-
-    ⚠️ **num_ctx 必须与聊天保持一致**（因此这里直接复用 cfg）。
-    Ollama 只要发现 num_ctx 与已加载的不同，就会**卸载并重载模型**
-    （实测 5 秒左右），而且**重载会中断正在进行的生成**。
-    此前这里写死 4096 而聊天用 8192，导致：
-      聊天 → 后台记忆(4096，重载) → 用户再发消息(8192，又重载) → 生成被打断
-    表现就是「模型加载一半、思考一半、没有回答」。这个坑很容易踩，
-    新增任何模型调用时都要复用同一个 num_ctx。
-    """
-    try:
-        prompt = (
-            "从下面这轮对话里提取值得记住的信息。只提取**稳定、可复用**的内容：\n"
-            "· 身份/背景：职业、专业、所在单位\n"
-            "· 偏好/习惯：喜欢什么、讨厌什么、希望回答怎么写\n"
-            "· 重要约定：以后都要遵守的规则、称呼、格式\n"
-            "· 正在做的事：项目、技术栈、环境、结论\n"
-            "**不要**提取：寒暄、临时问答、一次性的具体问题、助手自己的回答内容。\n\n"
-            "输出格式（每行一条，最多 3 条）：\n"
-            "类别|要点\n"
-            "类别只能是这两个之一：\n"
-            "  · 长期 —— 换任何对话都成立的信息：身份、姓名、职业、长期偏好、约定、习惯\n"
-            "  · 短期 —— 只跟当前这件事有关：正在做的项目、本次讨论的结论、临时设定\n"
-            "要点写**具体事实**（保留名称、数字、技术栈），一条不超过 60 字。\n"
-            "没有值得记的就只输出两个字：无\n\n"
-            f"用户：{last_user}\n助手：{(answer or '')[:300]}"
-        )
-        params = dict(cfg)
-        params["temperature"] = 0.2
-        params["max_tokens"] = 300          # 要输出多行要点，但 num_ctx 必须与聊天一致
-        resp = client.chat([{"role": "user", "content": prompt}], model=model,
-                           stream=False, params=params)
-        data = resp.json() if hasattr(resp, "json") else resp
-        text = ((data.get("message") or {}).get("content") or "").strip()
-        if not text or text.startswith("无"):
+def _schedule_memory_extract(session: str, turns: list, model: str, cfg: dict,
+                             urgent: bool = False) -> None:
+    """安排一次后台记忆提炼（防抖 + 串行，详见上面的说明）。"""
+    now = time.time()
+    with _mem_lock:
+        st = _mem_pending.get(session) or {}
+        old_timer = st.get("timer")
+        if old_timer:
+            old_timer.cancel()
+        first_ts = float(st.get("first_ts") or now)
+        buf = (list(st.get("turns") or []) + list(turns or []))[-_MEM_WINDOW_TURNS:]
+        st["turns"] = buf
+        st["first_ts"] = first_ts
+        st["timer"] = None
+        if st.get("running"):
+            # 上一轮提炼还没跑完：这次的内容已经并入缓冲区，等它跑完再来
+            _mem_pending[session] = st
             return
-        kept = 0
-        for line in text.splitlines():
-            line = line.strip().lstrip("-•* ").strip()
-            if not line or "|" not in line:
-                continue
-            kind, val = line.split("|", 1)
-            kind = kind.strip().strip("【】[]")
-            val = val.strip()
-            if not val or len(val) > 120:
-                continue
-            if "短期" in kind or "对话" in kind or "项目" in kind:
-                # 跟"这件事"绑定的 → 短期记忆（只在这个对话里生效）
-                memory.merge_short(session, val)
-            else:
-                # 身份/偏好/约定 → 长期记忆（所有对话都通用）
-                memory.merge_long(val)
-            kept += 1
-            if kept >= 3:
-                break
+        delay = 0.0 if (urgent or (now - first_ts) >= _MEM_FORCE_AFTER_SEC) else _MEM_DEBOUNCE_SEC
+        t = threading.Timer(delay, _run_memory_extract, args=(session, model, cfg))
+        t.daemon = True
+        st["timer"] = t
+        _mem_pending[session] = st
+        t.start()
+
+
+def _run_memory_extract(session: str, model: str, cfg: dict) -> None:
+    with _mem_lock:
+        st = _mem_pending.get(session) or {}
+        turns = list(st.get("turns") or [])
+        st["turns"] = []
+        st["first_ts"] = time.time()
+        st["running"] = True
+        _mem_pending[session] = st
+    try:
+        _auto_extract_memory(session, turns, model, cfg)
     except Exception:
         pass
+    finally:
+        with _mem_lock:
+            st = _mem_pending.get(session) or {}
+            st["running"] = False
+            _mem_pending[session] = st
+
+
+# 抽取调用的输出预算。
+# ⚠️ **这里是"该记的没记住"的真正原因，务必看清**：
+# qwen3 系列是思考型模型，做这类抽取时会**先思考 2400~2600 字**才动笔。
+# 实测（qwen3-vl:8b，同一段输入）：
+#     num_predict = 300  → done_reason=length，content **一个字都没有**
+#     num_predict = 500  → 同上（_sweep_one 原来是这个值）
+#     num_predict = 1500 → 同上
+#     num_predict = 4000 → done_reason=stop，要点正常输出
+# 老代码给 300，于是**每一次自动提炼都在"空结果"上静默 return** ——
+# 只有用户明确说"记住"时走的 remember 工具（聊天路径预算大）才写得进去。
+# 试过 /no_think、系统提示写"不要思考"、把指令写得极简：**全都压不住它**，
+# 唯一的解法就是把思考的额度给够。
+_EXTRACT_TOKENS = 3000
+_EXTRACT_TOKENS_RETRY = 6000
+
+
+def _llm_extract(prompt: str, model: str, cfg: dict,
+                 budget: int = _EXTRACT_TOKENS) -> str:
+    """跑一次"要点抽取"调用，返回模型正文；拿不到就返回空串。
+
+    两个必须守住的点：
+    1. **num_ctx 必须与聊天一致**（所以直接复用 cfg）—— Ollama 一旦发现
+       num_ctx 与已加载的不同，就会卸载并重载模型（约 5 秒），
+       而**重载会中断正在进行的生成**。老代码写死 4096 就是这么把回答打断的。
+    2. 预算要够思考用（见 _EXTRACT_TOKENS）；万一还是被截断又没出正文，
+       自动把预算翻倍重试一次 —— **绝不能静默失败**。
+    """
+    params = dict(cfg)
+    params["temperature"] = 0.2
+    params["max_tokens"] = budget
+    for _ in range(2):
+        try:
+            resp = client.chat([{"role": "user", "content": prompt}], model=model,
+                               stream=False, params=params)
+            data = resp.json() if hasattr(resp, "json") else resp
+            msg = data.get("message") or {}
+            text = (msg.get("content") or "").strip()
+            if text:
+                return text
+            # 正文为空：多半是思考把额度吃光了 → 加预算再来一次
+            if data.get("done_reason") != "length":
+                return ""
+        except Exception:
+            return ""
+        params["max_tokens"] = _EXTRACT_TOKENS_RETRY
+    return ""
+
+
+# 判定"该不该记"的标准。要点是**把判断权交给模型**，而不是靠关键词 ——
+# 关键词必然漏（"我做过一个考勤系统"里没有任何"记住/我是"）。
+_EXTRACT_PROMPT = """你是"用户档案整理员"。阅读下面的对话，挑出值得**长期留存**的用户信息。
+
+【必须提取】（只要出现就写下来）
+· 身份背景：姓名、年龄、职业、学校/单位、专业、居住地、家庭情况
+· 经历成果：做过什么项目、参加过什么比赛或活动、干过什么工作、拿过什么奖
+· 技能工具：会哪些编程语言、用过什么软件/框架/硬件、熟练程度
+· 偏好习惯：喜欢/讨厌什么、希望怎么回答、惯用工作方式
+· 约定规则：要求以后都遵守的规则、称呼、格式、语气
+· 目标计划：想学什么、打算做什么、正在准备什么、答应过要做的事
+· 目标进展：之前提过的目标/计划有了新进展（做完了、没做成、改主意了、放弃了）
+
+【绝对不要提取】
+· 寒暄闲聊（你好、谢谢、哈哈）和临时指令（"再短一点""换个说法"）
+· 一次性的具体提问（"帮我查天气""这段代码哪错了"）
+· 助手自己说的话、搜索结果、知识库资料
+· 【已知信息】里已经有的内容 —— **绝对不要重复记**
+
+【记成长期还是短期】问自己一句话：换个话题还成立吗？
+· 成立 → 长期（跨所有对话通用）
+· 只在当前这件事里成立 → 短期（只服务这个对话）
+
+【输出格式】每行一条，**只写有变化的内容**：
+· 新信息 → `长期|具体事实` 或 `短期|具体事实`
+· 已有信息要改动 → `更新|旧要点|新要点`
+  ↳「旧要点」**必须照抄**【已知信息】里的原句（至少前 10 个字），照抄才能改到它
+· 已有信息作废 → `删除|旧要点`（同样是照抄原句）
+
+【目标与计划 · 特别重要】
+· 用户说「想/打算/准备/计划/以后要…」→ 记成目标，写清 **做什么 + 大致时间 + 当前状态**：
+  例 `长期|计划2027年6月考网络工程师，目前还没开始`
+· 用户后来提到同一件事的进展 → **必须用 `更新|` 改写原来那条，绝对不要新增一条**：
+  例 `更新|计划2027年6月考网络工程师|已报名，2027年3月开班，正在看教材`
+· 只有改写，档案才不会自相矛盾 —— 「打算考」和「已经考完」并存会让模型答错话
+· 用户没说不做了，就别因为"还没做"而删掉目标；那正是需要被记住的事
+
+【怎么算值得记】问自己：这句话**三个月后**还用得上吗？
+· 用得上 → 记；只是一次性问答、闲聊、临时要求 → 不记
+· 一条不超过 50 字，第三人称陈述句，**保留姓名、数字、名称、技术栈**
+· 确实没有任何变化，就只输出两个字：无
+
+【已知信息】（不要重复这些）
+{long}
+
+{short}
+
+【本轮对话】
+{convo}"""
+
+
+# 提炼结果里的"动词"：模型除了新增，还可以改已有条目、删掉作废条目。
+# 这三个词决定了**目标类信息能不能跟着进展走**（见 memory.py 里 update_long 的说明）。
+_VERB_REVISE = ("更新", "修改", "修正", "改为", "调整", "推进")
+_VERB_FORGET = ("删除", "作废", "取消", "遗忘", "移除", "无效")
+_KIND_LONG = ("长期", "全局")
+_KIND_SHORT = ("短期", "当前对话", "本对话", "本会话", "本次")
+
+
+def _clean_extract_line(raw: str) -> str:
+    line = raw.strip().lstrip("-*• ").strip("`").strip()
+    while line[:1].isdigit():
+        line = line[1:].lstrip("、.)． ").strip()
+    if line.startswith("【") and "】" in line:
+        inner = line.split("】", 1)
+        if inner[1].strip():
+            line = inner[1].strip()
+    return line
+
+
+def _split_extract_line(line: str) -> list:
+    # 竖线优先（标准格式），其次容忍「长期：xxx」这种中文冒号写法
+    for sep in ("|", "｜", "：", ":"):
+        if sep in line:
+            return [p.strip() for p in line.split(sep)]
+    return [line]
+
+
+def _forget_point(old: str, kind: str, session: str) -> bool:
+    if kind in _KIND_LONG:
+        return memory.drop_long(old)
+    if kind in _KIND_SHORT:
+        return memory.drop_short(session, old)
+    return memory.drop_long(old) or memory.drop_short(session, old)
+
+
+def _revise_point(old: str, new: str, kind: str, session: str) -> bool:
+    new = (new or "").strip()
+    if not new:
+        return False
+    if kind in _KIND_LONG:
+        return memory.update_long(old, new) != "skipped"
+    if kind in _KIND_SHORT:
+        return memory.update_short(session, old, new) != "skipped"
+    # 没写类别：先在长期里找、再在短期里找；两处都没有就按新信息追加（进短期，更安全）
+    if memory.update_long(old, new, append_missing=False) == "replaced":
+        return True
+    if memory.update_short(session, old, new, append_missing=False) == "replaced":
+        return True
+    return memory.merge_short(session, new)
+
+
+def _apply_extract(text: str, session: str, limit: int = 4) -> int:
+    """把提炼结果按行并入记忆，返回真正生效的条数。
+
+    支持三种指令（模型写法可能不规范，这里尽量宽容）：
+      长期|要点 / 短期|要点      → 新增
+      更新|旧要点|新要点         → 改写已有条目（**目标的进展就靠这个**）
+      删除|旧要点                → 作废已有条目
+    没写类别的新信息一律进**短期** —— 宁可少进一点长期记忆，
+    也不要让乱七八糟的东西污染跨所有对话生效的全局档案。
+    """
+    if not text:
+        return 0
+    kept = 0
+    for raw in text.splitlines():
+        line = _clean_extract_line(raw)
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("无") and len(line) <= 8:
+            continue
+        parts = _split_extract_line(line)
+        verb = parts[0].strip().strip("【】[]（）() ")
+        rest = [p.strip().strip("【】[]（）() ") for p in parts[1:]]
+        kind = ""
+        if rest and (rest[0] in _KIND_LONG or rest[0] in _KIND_SHORT):
+            kind = rest.pop(0)          # 容忍 "更新|长期|旧|新" 这种多写一层的写法
+        if verb in _KIND_LONG or verb in _KIND_SHORT:
+            verb, kind = "", verb       # "长期|要点"：第一段写的其实是类别
+        try:
+            if any(v in verb for v in _VERB_FORGET) and rest:
+                if _forget_point(rest[0], kind, session):
+                    kept += 1
+            elif any(v in verb for v in _VERB_REVISE) and len(rest) >= 2:
+                if _revise_point(rest[0], " ".join(rest[1:]), kind, session):
+                    kept += 1
+            else:
+                val = (" ".join(rest) if rest else verb).strip().strip("，。；;、 ")
+                if len(val) < 3:
+                    continue
+                val = val[:120]
+                ok = memory.merge_long(val) if kind in _KIND_LONG else memory.merge_short(session, val)
+                if ok:
+                    kept += 1
+        except Exception:
+            continue
+        if kept >= limit:
+            break
+    return kept
+
+
+def _auto_extract_memory(session: str, turns: list, model: str, cfg: dict) -> None:
+    """把**最近几轮**对话里的要点提炼进记忆（后台线程，不阻塞回复）。
+
+    长期记忆是"久远对话可被清理"的前提 —— 要点沉淀下来后，
+    老的聊天记录才可以安全裁剪或清除。**所以释放归档前必须先跑一遍这个沉淀**，
+    否则还没提炼的内容会跟着归档一起消失。
+
+    为什么带"最近几轮"而不是只看最后一条消息：
+    用户常常在闲聊中顺口讲出自己的经历（"我之前做过一个考勤系统…"），
+    紧接着又聊别的。只看最后一条，这类信息必然漏掉。
+
+    为什么要把【已知信息】喂给模型：不然它会把同一件事反复写成不同措辞，
+    长期记忆里堆出一串"同义句"（实测见过同一个人被记了三遍），白白吃掉 15000 字上限。
+    """
+    if not turns:
+        return
+    convo = "\n".join(
+        "%s：%s" % ("用户" if m.get("role") == "user" else "助手",
+                    str(m.get("content") or "")[:300])
+        for m in turns if (m.get("content") or "").strip())
+    if not convo:
+        return
+    known_long = memory.get_long().strip() or "（暂无）"
+    known_short = memory.get_short(session).strip() or "（暂无）"
+    prompt = _EXTRACT_PROMPT.format(long=known_long[-2500:], short=known_short[-800:],
+                                    convo=convo)
+    text = _llm_extract(prompt, model, cfg)
+    _apply_extract(text, session, limit=4)
+
 
 
 # 允许本地界面跨域访问（浏览器 debug 时用）
@@ -594,6 +809,75 @@ def pull_model(body: dict):
 MAX_TOOL_ROUNDS = 10  # 单次对话内最多连续调用工具轮次，防止死循环
 
 
+# =====================================================================
+#  代码能力：专用代码模型的路由
+# =====================================================================
+# 为什么要换模型（实测数据）：默认的 qwen3-vl:8b 是**视觉**模型，
+# 写代码时"思考"会失控 —— 同一道 LRU 缓存的题，有时 9 秒正常出代码，
+# 有时陷入原地重复的思考死循环（"但是，题目没有说明，所以我们可以不处理"反复刷屏），
+# 121 秒后 done_reason=length、正文一个字都没有；3 道题只过 1 道。
+# qwen2.5-coder 是**非思考型**的代码专用模型，不存在这个问题。
+#
+# 路由是**按轮**的：这一轮像写代码就用代码模型，下一轮闲聊自动回到视觉模型。
+# 代价是切换模型要重新加载（12GB 显存放不下两个模型），所以只在真需要时才切。
+_CODE_HINTS = (
+    "写代码", "代码", "脚本", "函数", "程序", "报错", "bug", "调试", "跑一下",
+    "正则", "sql", "算法", "数据结构", "排序", "递归", "爬虫", "接口", "重构",
+    "python", "javascript", "typescript", "java", "c++", "c#", "golang", "rust",
+    "html", "css", "shell", "bash", "bat", "powershell", "json", "api",
+    "帮我实现", "实现一个", "写一段", "写个", "单元测试", "帮我改这段",
+)
+
+_model_tags_cache = {"t": 0.0, "names": set()}
+
+
+def _installed_models() -> set:
+    """本机已下载的 Ollama 模型名（缓存 60 秒，别每轮都去问一次）。"""
+    now = time.time()
+    if _model_tags_cache["names"] and now - _model_tags_cache["t"] < 60:
+        return _model_tags_cache["names"]
+    names = set()
+    try:
+        import urllib.request
+        url = str(config.load_config().get("ollama_url")
+                  or "http://127.0.0.1:11434").rstrip("/")
+        with urllib.request.urlopen(url + "/api/tags", timeout=5) as r:
+            for m in (json.loads(r.read().decode()).get("models") or []):
+                n = str(m.get("name") or "").strip()
+                if n:
+                    names.add(n)
+                    if ":" not in n:
+                        names.add(n + ":latest")
+    except Exception:
+        return _model_tags_cache["names"]
+    _model_tags_cache.update(t=now, names=names)
+    return names
+
+
+def _is_code_task(text: str) -> bool:
+    t = (text or "").lower()
+    if not t:
+        return False
+    if "```" in t:
+        return True
+    return any(k in t for k in _CODE_HINTS)
+
+
+def _route_code_model(cfg: dict, text: str, fallback: str):
+    """代码类请求换用专用代码模型，返回 (模型名, 给用户看的提示)。"""
+    if not cfg.get("code_auto_route", True):
+        return fallback, ""
+    want = str(cfg.get("code_model") or "").strip()
+    if not want or want == fallback:
+        return fallback, ""
+    if not _is_code_task(text):
+        return fallback, ""
+    if want not in _installed_models():
+        # 还没下载 → 静默用回默认模型。配置名留着，用户下载后自动生效，不用改设置。
+        return fallback, ""
+    return want, "已切到代码模型 %s（专用代码模型，不思考、写代码更稳）" % want
+
+
 class _SystemPrompt:
     """WorkBuddy 风格系统提示：精简注入分层记忆，给出工具使用引导。"""
 
@@ -664,6 +948,18 @@ class _SystemPrompt:
             ctx = memory.build_context(session, query=last_user_text)
             if ctx:
                 parts.append(ctx)
+                # 目标/计划类记忆的用法：当背景用，别当催命符；有进展就更新。
+                parts.append(
+                    "【关于记忆里的目标与计划】\n"
+                    "- 记忆里可能有用户的目标、计划、答应过要做的事。把它们当**已知背景**，\n"
+                    "  不要每轮都追问进展，也不要每次回答都提一遍。\n"
+                    "- 但话题相关时可以自然地关心一句，或提醒关键时间点（临近报名/考试/截止）。\n"
+                    "- 用户说「做完了 / 没做成 / 改主意了 / 不打算做了」时，**立刻更新记忆**：\n"
+                    "  用 remember 工具，action=\"update\"，old 填记忆里的原句，content 填最新状态；\n"
+                    "  彻底放弃的用 action=\"forget\" 删掉。**别让档案里留着过期目标。**\n"
+                    "- 用户透露**新目标**时，除了记进记忆，还要给**可执行的规划建议**：\n"
+                    "  拆成几步、每步做什么、大致什么时间做，并指出最容易卡住的地方。\n"
+                    "  不要只说「加油」「坚持就是胜利」这种空话。")
         # 用户拖进来的文档：正文直接给模型，让它能针对内容回答
         if docs:
             blocks, budget = [], 60000      # 总字数上限，避免把上下文撑爆
@@ -796,8 +1092,9 @@ def _stop_streams(session: str = "") -> int:
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
-    model = req.model or config.load_config()["default_model"]
     cfg = config.load_config()
+    model = req.model or cfg["default_model"]
+    model_note = ""
     images = list(req.images_b64 or [])
     _remember_image(images)          # 记住本轮图片，供后续「把这张图改成…」直接引用
     messages = list(req.messages)
@@ -809,6 +1106,10 @@ async def chat(req: ChatRequest):
     # 条数上限由 _trim_history_to_budget 内部统一处理。
 
     last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+
+    # 本轮像写代码 → 换专用代码模型（只影响这一轮，下一轮自动回默认模型）
+    if not req.model:
+        model, model_note = _route_code_model(cfg, last_user, model)
 
     # 简单问题收紧生成长度：把"先思考很久"压到几秒（qwen3-vl 无法真正关闭思考）。
     # 但以下情况**绝不能**收紧，否则模型来不及输出工具调用或总结（表现为"思考中断、没有回答"）：
@@ -828,8 +1129,17 @@ async def chat(req: ChatRequest):
     # session 必须提前取到：记忆是按对话隔离的，注入时必须知道是哪个对话。
     session = req.session_id or ""
     sys_prompt = _SystemPrompt.build(last_user, session, req.docs)
+    if cfg.get("code_exec_enabled"):
+        sys_prompt += (
+            "\n\n【本地执行代码】你有一个 run_python 工具，可以在用户电脑上**真跑** Python。\n"
+            "- 凡是要精确计算、处理数据、验证算法、换算日期/单位、测试正则的，"
+            "**都要先跑一遍再回答**，不要靠心算（心算很容易错，尤其是数字和日期）。\n"
+            "- 拿到的输出是真实结果，请依据它作答；如果代码报错，先说明错在哪、"
+            "给出修正后的代码并**再跑一次**。\n"
+            "- 回答里保留代码（用户要的是代码），但结论必须来自真实运行结果。")
     tool_schemas = tools.make_schemas(cfg.get("web_enabled", False),
-                                      cfg.get("rag_enabled", False))
+                                      cfg.get("rag_enabled", False),
+                                      cfg.get("code_exec_enabled", False))
 
     # ---------- 上下文预算：按剩余空间裁剪历史 ----------
     # 工具定义本身就有 3000~4500 token，系统提示约 1000；
@@ -864,6 +1174,9 @@ async def chat(req: ChatRequest):
         working = [{"role": "system", "content": full_sys}] + messages
         final_text = ""
         final_thinking = ""
+        # 换了模型就提前吱一声，免得用户以为"怎么这次回复的口吻变了"
+        if model_note:
+            yield json.dumps({"note": model_note}) + "\n"
         # session 已在上面定义（记忆按对话隔离，需要提前拿到）
 
         # 空回答重试：qwen3-vl 的思考会吃掉大量 token，偶尔会「想完了但没来得及写正文」，
@@ -1020,14 +1333,13 @@ async def chat(req: ChatRequest):
         except Exception:
             pass
 
-        # 自动记忆：后台提炼要点写入长期记忆（不阻塞回复）。
-        # 命中信号词立刻提炼；否则每 4 轮兜底提炼一次（见 _should_extract）。
-        # 有了长期记忆兜底，久远的聊天记录才能安全清理。
-        if cfg.get("auto_memorize", True) and _should_extract(session, last_user):
+        # 自动记忆：把本轮要点提炼进记忆（后台，且**等用户停手再做**，不跟聊天抢显卡）。
+        # 每轮都安排，覆盖最近几轮内容；命中信号词（尤其"我做过/参加过"这类经历）则立即做。
+        # 有了这层沉淀，久远的聊天记录才能安全清理。
+        if cfg.get("auto_memorize", True):
             try:
-                threading.Thread(target=_auto_extract_memory,
-                                 args=(session, last_user, final_text, model, cfg),
-                                 daemon=True).start()
+                _schedule_memory_extract(session, full[-_MEM_WINDOW_TURNS:], model, cfg,
+                                         urgent=_looks_memorable(last_user))
             except Exception:
                 pass
         yield json.dumps({"done": True, "text": final_text, "thinking": final_thinking}) + "\n"
@@ -1337,39 +1649,16 @@ def _sweep_one(session: str, cfg: dict = None, model: str = None) -> int:
         "    长期 —— 换任何对话都成立（身份、姓名、职业、长期偏好、约定）\n"
         "    短期 —— 只跟这件事有关（当前项目、本次结论、临时设定）\n"
         "· 要点直接写事实（含名称/数字/技术栈），每条不超过 60 字\n"
-        "· 最多 6 条；确实没有值得留存的内容就只输出：无\n\n"
-        + convo
+        "· 最多 6 条；确实没有值得留存的内容就只输出：无\n"
+        "· 下面【已知信息】里已经有的，不要再重复提取\n\n"
+        "【已知信息】\n长期记忆：" + (memory.get_long().strip()[-2500:] or "（暂无）")
+        + "\n短期记忆：" + (memory.get_short(session).strip()[-800:] or "（暂无）")
+        + "\n\n【对话】\n" + convo
     )
-    params = dict(cfg)
-    params["temperature"] = 0.2
-    params["max_tokens"] = 500      # num_ctx 必须与聊天一致（见 _auto_extract_memory）
-    resp = client.chat([{"role": "user", "content": prompt}], model=model,
-                       stream=False, params=params)
-    data = resp.json() if hasattr(resp, "json") else resp
-    text = ((data.get("message") or {}).get("content") or "").strip()
-    if not text or text.startswith("无"):
-        return 0
-    kept = 0
-    for line in text.splitlines():
-        line = line.strip().lstrip("-•* ").strip()
-        if not line or len(line) < 4:
-            continue
-        if "|" in line:
-            kind, val = line.split("|", 1)
-            kind, val = kind.strip(), val.strip()
-        else:
-            kind, val = "短期", line        # 模型没按格式来：按对话内容处理更安全
-        if not val:
-            continue
-        if "长期" in kind:
-            ok = memory.merge_long(val[:120])
-        else:
-            ok = memory.merge_short(session, val[:120])
-        if ok:
-            kept += 1
-        if kept >= 6:
-            break
-    return kept
+    # 输出预算不足会让提炼静默失败（见 _EXTRACT_TOKENS），
+    # 所以这里统一走 _llm_extract（它会自动在截断时加预算重试）。
+    text = _llm_extract(prompt, model, cfg)
+    return _apply_extract(text, session, limit=6)
 
 
 def _sweep_all(known_sids=None) -> int:

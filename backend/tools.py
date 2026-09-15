@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 import os
+import sys
 import time
 import glob
 import urllib.parse
@@ -25,12 +26,14 @@ from . import memory as memory_mod
 # =====================================================================
 #  工具 Schema（发给模型）
 # =====================================================================
-def make_schemas(web_enabled: bool = False, kb_enabled: bool = False) -> list:
+def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
+                 code_exec: bool = False) -> list:
     """返回工具 schema 列表。
 
     web_enabled=True 时才暴露联网搜索工具——保证"开关不开不联网"的约定：
     关着的时候模型连工具都看不到，自然不会去联网。
     kb_enabled 同理：关着就不给知识库工具。
+    code_exec 同理：关着就不给"本地跑代码"的工具（默认关，避免模型擅自执行代码）。
     """
     schemas = [
         {
@@ -187,17 +190,24 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False) -> list:
             "type": "function",
             "function": {
                 "name": "remember",
-                "description": "把值得记住的信息写入记忆。**长期记忆**跨所有对话共享（身份、姓名、职业、长期偏好、约定）；**短期记忆**只在当前对话生效（正在做的项目、本次讨论的结论、临时设定）。寒暄、临时问答、一次性的提问不要存。content 写**一条**具体事实（保留名称、数字、技术栈），系统会自动追加并去重，**不需要你重写旧内容**。",
+                "description": "写入或**修改**记忆。**长期记忆**跨所有对话共享（身份、姓名、职业、长期偏好、约定、目标计划）；**短期记忆**只在当前对话生效（正在做的项目、本次讨论的结论、临时设定）。寒暄、临时问答、一次性的提问不要存。系统会自动去重，不需要你重写旧内容。\n特别注意 action：add=新增（默认）；update=**改写已有条目**（目标有进展、计划变了、之前记错了，必须用这个而不是 add，否则档案里会留下互相矛盾的两句）；forget=作废删除（用户明确说不做了/弄错了）。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "content": {
                             "type": "string",
-                            "description": "要记住的一条具体事实（第三人称、直接、可读，60 字以内）"},
+                            "description": "要记住的一条具体事实（第三人称、直接、可读，60 字以内）。action=update 时填**修改后**的新内容"},
                         "scope": {
                             "type": "string",
                             "enum": ["long", "short"],
-                            "description": "long=长期记忆（跨对话通用，放身份/偏好/约定）；short（默认）=短期记忆（只在这个对话用，放当前项目/本次结论）"},
+                            "description": "long=长期记忆（跨对话通用，放身份/偏好/约定/目标计划）；short（默认）=短期记忆（只在这个对话用，放当前项目/本次结论）"},
+                        "action": {
+                            "type": "string",
+                            "enum": ["add", "update", "forget"],
+                            "description": "add（默认）=新增；update=改写已有条目；forget=删除已有条目"},
+                        "old": {
+                            "type": "string",
+                            "description": "action=update/forget 时必填：要改动的那条记忆的**原句**（照抄，至少前 10 个字），用来定位是哪一条"},
                     },
                     "required": ["content"],
                 },
@@ -230,6 +240,8 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False) -> list:
     # 开关关着，模型连工具都看不到，自然就不会去翻资料。
     if kb_enabled:
         schemas.append(_KB_SCHEMA)
+    if code_exec:
+        schemas.append(_RUN_PY_SCHEMA)
     if web_enabled:
         schemas.append(_WEATHER_SCHEMA)   # 天气走数据 API，比搜索可靠得多
         schemas.append(_WEB_SEARCH_SCHEMA)
@@ -239,6 +251,35 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False) -> list:
         schemas = [s for s in schemas
                    if s["function"]["name"] != "web_image_search"]
     return schemas
+
+
+# ---------- 本地代码执行（"离线计算"）：受「本地算代码」开关控制 ----------
+# 为什么要它：模型写代码不难，难的是**算对**。让它把代码真跑一遍，
+# 数字、日期、正则匹配结果都是真算出来的，而不是"看着像"。
+# 默认关闭 —— 打开后模型写的代码会在用户电脑上执行，风险由用户判断。
+_RUN_PY_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "run_python",
+        "description": (
+            "【本地执行 Python】在用户电脑上**真跑**一段 Python 代码并返回输出。\n"
+            "什么时候用：需要精确计算、处理数据、验证自己写的算法对不对、"
+            "做日期/单位换算、正则匹配测试等 —— 凡是「算出来比想出来更可靠」的场景都用它。\n"
+            "怎么用：把完整可运行的代码放进去，用 print() 输出你要看的结果；\n"
+            "**不要**用 input()（没人能输入），不要写文件以外的东西到磁盘（会在临时目录里执行）。\n"
+            "可用库：标准库 + numpy / scipy / matplotlib / sympy。\n"
+            "拿到输出后**依据真实结果**回答用户，不要把输出原样贴给用户就完事。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string",
+                         "description": "完整可运行的 Python 代码，用 print() 打印要看的中间结果"},
+            },
+            "required": ["code"],
+        },
+    },
+}
 
 
 # 知识库检索工具（受「知识库」开关控制）
@@ -384,6 +425,8 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
         return _do_search_memory(arguments)
     if name == "search_knowledge":
         return _do_search_knowledge(arguments)
+    if name == "run_python":
+        return _do_run_python(arguments)
     if name == "get_time":
         return time.strftime("%Y-%m-%d %H:%M:%S (%A)")
     if name == "web_search":
@@ -1000,24 +1043,130 @@ def _do_append_file(arguments):
 
 # ---------- 记忆工具 ----------
 def _do_remember(arguments, context=None):
-    """写入记忆。scope=long 写长期记忆（跨对话），否则写当前对话的短期记忆。
+    """写入 / 改写 / 删除记忆。
 
+    scope=long 动长期记忆（跨对话共享），否则动当前对话的短期记忆。
     短期记忆按对话隔离，所以必须从 context 拿 session —— 拿不到就拒绝，
     免得内容写进了不知道哪个对话（等于丢失）。
+
+    action 三种：
+      add（默认）—— 新增一条
+      update      —— 把已有条目改成新内容（**目标的进展就靠它**）
+      forget      —— 删掉已有条目
+    update/forget 必须给 old（原句），用来定位是哪一条；
+    old 可以少写几个字（匹配是模糊的，见 memory._locate）。
     """
     content = (arguments.get("content") or arguments.get("section") or "").strip()
-    if not content:
+    action = (arguments.get("action") or "add").strip().lower()
+    old = (arguments.get("old") or "").strip()
+    scope = (arguments.get("scope") or "").strip().lower()
+    if action in ("update", "forget") and not old:
+        # 没给原句就没法定位 —— 直接把新内容当新条目存，总比丢掉强
+        action, old = "add", ""
+    if not content and action != "forget":
         return "错误：内容为空。"
-    scope = (arguments.get("scope") or "short").strip().lower()
-    if scope in ("long", "global"):
+    is_long = scope in ("long", "global")
+
+    if is_long:
+        if action == "update":
+            r = memory_mod.update_long(old, content)
+            return {"replaced": "已更新长期记忆里的那条。",
+                    "added": "长期记忆里没找到那条，已作为新内容记下。",
+                    "skipped": "内容和原来一样，没有改动。"}.get(r, "已处理。")
+        if action == "forget":
+            return ("已从长期记忆里删除那条。" if memory_mod.drop_long(old)
+                    else "长期记忆里没找到那条，未改动。")
         ok = memory_mod.merge_long(content)
         return ("已记入长期记忆（所有对话都通用）。" if ok
                 else "这条已经在长期记忆里了，没有重复记。")
+
     session = str(((context or {}).get("session")) or "").strip()
     if not session:
         return "错误：无法确定当前对话，记忆未写入。"
+    if action == "update":
+        r = memory_mod.update_short(session, old, content)
+        return {"replaced": "已更新本对话记忆里的那条。",
+                "added": "本对话记忆里没找到那条，已作为新内容记下。",
+                "skipped": "内容和原来一样，没有改动。"}.get(r, "已处理。")
+    if action == "forget":
+        return ("已从本对话记忆里删除那条。" if memory_mod.drop_short(session, old)
+                else "本对话记忆里没找到那条，未改动。")
     ok = memory_mod.merge_short(session, content)
     return ("已记入本次对话的短期记忆。" if ok else "这条已经在本对话记忆里了，没有重复记。")
+
+
+# ---------- 本地代码执行（"离线计算"）----------
+RUN_TIMEOUT = 25          # 秒。计算题够用，也避免死循环把机器占住
+
+# 出现这些字样就**不执行** —— 目标是"只算数"，不是"让模型操作你的电脑"。
+# 说明：这不是滴水不漏的沙箱（真正的沙箱要上容器/权限隔离），
+# 而是一道"明显危险就别放行"的闸门；开关默认关闭，风险由用户自己权衡。
+_PY_FORBIDDEN = (
+    "shutil.rmtree", "os.removedirs", "os.rmdir", "os.remove", "os.unlink",
+    "format c:", "format d:", "del /f", "del /s", "rmdir /s", "rm -rf",
+    "shutdown", "reg delete", "winreg", "ctypes", "os.system", "subprocess",
+    "os.startfile", "os.exec", "os.fork", "eval(compile", "__import__('os').system",
+    # 顺带把"联网"也关掉 —— 这个功能的定位就是**离线**计算。
+    "import socket", "import urllib", "import requests", "import httpx", "urlopen",
+)
+
+
+def _do_run_python(arguments):
+    """在本机真跑一段 Python，把 stdout 拿回来。
+
+    为什么要真跑：模型"心算"很容易出错（数字、日期、正则尤其明显），
+    而代码跑一遍的结果是**确定的**。这也是"离线计算"的落点。
+    """
+    code = str((arguments or {}).get("code") or "").strip()
+    if not code:
+        return "错误：代码为空。"
+    # 去掉注释行再检查，避免"注释里提了一句 subprocess 就被拦"
+    scanned = "\n".join(ln for ln in code.splitlines() if not ln.strip().startswith("#"))
+    low = scanned.lower()
+    for bad in _PY_FORBIDDEN:
+        if bad in low:
+            return ("出于安全考虑，这段代码里含有被禁止的操作「%s」，**没有执行**。\n"
+                    "请改成只做计算、不碰系统与网络的写法（不要用 subprocess / os.system / "
+                    "删除文件 / 联网请求 等）。" % bad)
+    import tempfile
+    import subprocess as _sp
+    with tempfile.TemporaryDirectory(prefix="mm_run_") as d:
+        path = os.path.join(d, "snippet.py")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(code)
+        except Exception as exc:
+            return "错误：无法写入临时文件：%s" % exc
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        # 不让被执行的代码摸到应用的数据目录
+        for k in ("MM_DATA_DIR",):
+            env.pop(k, None)
+        try:
+            p = _sp.run([sys.executable, "-X", "utf8", "snippet.py"],
+                        cwd=d, env=env, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=RUN_TIMEOUT)
+        except _sp.TimeoutExpired:
+            return ("代码执行超过 %d 秒，已强制中止。请减少计算量，或改成更小的输入分步验证。"
+                    % RUN_TIMEOUT)
+        except Exception as exc:
+            return "代码执行失败：%s: %s" % (type(exc).__name__, exc)
+        out = (p.stdout or "").strip()
+        err = (p.stderr or "").strip()
+    lines = ["【代码执行结果】"]
+    if out:
+        if len(out) > 4000:
+            out = "（输出过长，只保留最后 4000 字）\n" + out[-4000:]
+        lines.append("标准输出：\n" + out)
+    if err:
+        lines.append("报错信息：\n" + err[-1500:])
+    if not out and not err:
+        lines.append("（代码没有输出任何内容 —— 别忘了用 print() 把结果打出来）")
+    if p.returncode != 0:
+        lines.append("（退出码 %s，说明代码报错了；请先修正再给出结论）" % p.returncode)
+    lines.append("请**依据上面的真实输出**回答用户；如果代码报错，先说清错在哪并给出修正后的代码。")
+    return "\n\n".join(lines)
 
 
 def _do_search_knowledge(arguments):

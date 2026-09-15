@@ -155,6 +155,8 @@
       <label class="pill" data-cfg="rag_enabled"><i class="sw"></i>知识库</label>
       <label class="pill" data-cfg="web_enabled"><i class="sw"></i>联网</label>
       <label class="pill" data-cfg="auto_memorize"><i class="sw"></i>自动记忆</label>
+      <label class="pill" data-cfg="code_auto_route" title="遇到写代码的需求自动换用专用代码模型（qwen2.5-coder，不思考、更稳）"><i class="sw"></i>代码模型</label>
+      <label class="pill" data-cfg="code_exec_enabled" title="让模型在本机真跑 Python 把结果算出来（默认关闭；开启后模型写的代码会在你电脑上执行）"><i class="sw"></i>本地算代码</label>
     </div>
 
     <div class="messages" id="messages">
@@ -172,15 +174,16 @@
 
     <div class="composer">
       <div class="attachments" id="attachments"></div>
-      <div class="drop-hint" id="dropHint">松开鼠标导入图片/文件</div>
       <div class="voice-hint" id="voiceHint">
         <span class="v-dot"></span><span id="voiceText">语音未开启 · 点 🎤 后说「小千小千」唤醒</span>
       </div>
       <div class="input-row">
         <button class="icon-btn" id="attachBtn" title="上传图片">🖼</button>
+        <button class="icon-btn" id="docBtn" title="上传文档（PDF / Word / Excel / PPT / txt 等，也可以直接拖进来）">📎</button>
         <button class="icon-btn" id="videoBtn" title="上传视频">🎬</button>
         <button class="icon-btn" id="voiceBtn" title="语音输入：说「小千小千」唤醒，停顿 2 秒自动发送">🎤</button>
         <input type="file" id="fileInput" accept="image/*" multiple hidden />
+        <input type="file" id="docInput" multiple hidden />
         <input type="file" id="videoInput" accept="video/*" hidden />
         <textarea id="input" rows="1" placeholder="描述需求：画一只机器人 · 读取报告.txt 并改错别字 · 记住我喜欢中文交流 · （拖图/拖文档进来都可以）"></textarea>
         <button class="btn ghost danger stop" id="stopBtn" hidden title="终止当前任务（生成会立刻停下）">■ 终止</button>
@@ -189,6 +192,15 @@
       <p class="tip">智能体模式：直接说指令，AI 自主规划并调用工具完成任务。数据均在本机处理。</p>
     </div>
   </main>
+
+  <!-- 全局拖放提示：拖文件到窗口任意位置都会亮起来（不只是聊天区） -->
+  <div class="drop-overlay" id="dropOverlay">
+    <div class="drop-overlay-box">
+      <div class="drop-overlay-icon">📄</div>
+      <div class="drop-overlay-title">松开鼠标即可导入</div>
+      <div class="drop-overlay-sub">图片直接当图看，文档会抽取正文当资料，视频走视频分析</div>
+    </div>
+  </div>
 
   <script src="/static/app.js"></script>
 </body>
