@@ -52,7 +52,7 @@ CONFIG_FILE = data("config.json")
 
 DEFAULT_CONFIG = {
     # Ollama 本地服务地址（请保证 ollama serve 已启动）
-    "ollama_url": "http://localhost:11434",
+    "ollama_url": "http://127.0.0.1:11434",
     # 默认模型，需先用 ollama pull qwen3-vl:8b 下载
     "default_model": "qwen3-vl:8b",
     # 推理参数
@@ -88,6 +88,9 @@ DEFAULT_CONFIG = {
     #   "cpu"  = 强制 CPU
     #   "gpu"  = 强制显卡（无显卡时切换会被拒绝，不会静默回退）
     "t2i_device": "auto",
+    # 程序启动时自动打开麦克风监听（说「小千小千」唤醒）。
+    # 容器里没有麦克风，会自动跳过并提示，不影响其它功能。
+    "voice_auto_start": True,
 }
 
 
@@ -110,6 +113,15 @@ def load_config() -> dict:
         cfg["ollama_url"] = os.environ["MM_OLLAMA_URL"]
     if os.environ.get("MM_MODEL"):
         cfg["default_model"] = os.environ["MM_MODEL"]
+
+    # ⚠️ 把 localhost 换成 127.0.0.1。
+    # Windows 上 localhost 会先解析到 IPv6 的 ::1，而 Ollama 只监听 IPv4，
+    # 于是每次连接都要先等一次回退超时 —— **实测 2065ms，换成 127.0.0.1 只需 1ms**。
+    # 模型调用很频繁，这一项每年要白等掉大量时间，所以在这里统一兜住：
+    # 即使老配置里还写着 localhost 也会被自动纠正。
+    url = str(cfg.get("ollama_url") or "")
+    if "localhost" in url:
+        cfg["ollama_url"] = url.replace("localhost", "127.0.0.1")
     return cfg
 
 

@@ -383,6 +383,8 @@
       addMsg("bot", "这是一段新对话，直接说需求即可。");
     }
     await loadSessions();
+    // 记忆按对话隔离：换了对话，记忆面板也必须跟着换
+    await loadMemory();
     showToast(`已切换到「${await currentTitle(sid)}」`);
   }
 
@@ -405,6 +407,8 @@
       messagesEl.innerHTML = "";
       addMsg("bot", "新对话已开始，这段对话与之前互不影响。");
       await loadSessions();
+      // 新对话有自己独立的记忆（从空白开始），面板要跟着切
+      await loadMemory();
       showToast("已新建对话", "ok");
     } catch (e) {
       showToast("新建失败：" + e.message, "warn");
@@ -433,57 +437,58 @@
   if (newSessionBtn) newSessionBtn.onclick = newSession;
 
   // ---------- 记忆库 · 文段式 ----------
+  // ---------- 记忆库：长期（跨对话共享）+ 短期（按对话独立）----------
+  // 切对话时只有"短期记忆"跟着变；长期记忆是同一份，永远不变。
   async function loadMemory() {
+    const lng = $("#memLongText"), sht = $("#memShortText");
+    if (!lng || !sht) return;
     try {
-      const d = await api("/api/memory");
-      const box = $("#memoryList");
-      box.innerHTML = "";
-      if (!d.ok || !d.sections || !d.sections.length) {
-        box.innerHTML = '<p class="hint">暂无记忆文段。AI 会在对话中按分区文段自动写入，也可手动新增。</p>';
-        return;
-      }
-      d.sections.forEach((s) => {
-        const item = document.createElement("div");
-        item.className = "sec-item";
-        item.innerHTML = `
-          <input class="sec-title" value="${esc(s.title || "")}" placeholder="分区标题" />
-          <textarea class="sec-content" rows="5" placeholder="该分区的文段内容…">${esc(s.content || "")}</textarea>
-          <div class="sec-meta">
-            <span class="sec-time"></span>
-            <button class="sec-save btn sm">💾 保存</button>
-            <button class="sec-del btn sm ghost danger">删除</button>
-          </div>`;
-        const tEl = item.querySelector(".sec-title");
-        const cEl = item.querySelector(".sec-content");
-        const timeEl = item.querySelector(".sec-time");
-        try {
-          timeEl.textContent = "更新 " + new Date((s.updated_at || 0) * 1000).toLocaleString();
-        } catch {}
-        item.querySelector(".sec-save").onclick = async () => {
-          await api("/api/memory/" + s.id, { method: "PUT", body: JSON.stringify({ title: tEl.value, content: cEl.value }) });
-          loadMemory();
-        };
-        item.querySelector(".sec-del").onclick = async () => {
-          if (confirm("删除该分区文段？")) { await api("/api/memory/" + s.id, { method: "DELETE" }); loadMemory(); }
-        };
-        box.appendChild(item);
-      });
-    } catch {}
+      const d = await api("/api/memory?session_id=" + encodeURIComponent(sessionId || ""));
+      if ((d.session_id || "") !== (sessionId || "")) return;   // 用户已切走，别覆盖
+      lng.value = d.long || "";
+      sht.value = d.short || "";
+      const lm = $("#memLongMeta");
+      if (lm) lm.textContent = `${(d.long || "").length} / ${d.long_cap || 2000} 字`;
+      const sm = $("#memShortMeta");
+      if (sm) sm.textContent = (d.short || "").length
+        ? `${(d.short || "").length} / ${d.short_cap || 1000} 字`
+        : "这个对话还没有短期记忆";
+      const nm = $("#memSessName");
+      if (nm) nm.textContent = await currentTitle(sessionId);
+    } catch (e) { /* 静默：面板不可用不影响聊天 */ }
   }
-  $("#secAdd").onclick = async () => {
-    const t = $("#secTitleInput").value.trim();
-    if (!t) { alert("请填写分区标题"); return; }
-    await api("/api/memory", { method: "POST", body: JSON.stringify({ title: t, content: "" }) });
-    $("#secTitleInput").value = "";
-    loadMemory();
-  };
-  $("#memRefresh").onclick = loadMemory;
-  $("#memClearAll").onclick = async () => {
-    if (confirm("确认清空全部记忆文段？此操作不可撤销。")) {
-      await api("/api/memory", { method: "DELETE" });
+
+  function bindMemoryPanel() {
+    const ls = $("#memLongSave");
+    if (ls) ls.onclick = async () => {
+      const r = await api("/api/memory", {
+        method: "POST",
+        body: JSON.stringify({ scope: "long", content: $("#memLongText").value }),
+      });
+      showToast(r.ok ? "已保存长期记忆（所有对话通用）" : "保存失败", r.ok ? "ok" : "warn");
       loadMemory();
-    }
-  };
+    };
+    const ss = $("#memShortSave");
+    if (ss) ss.onclick = async () => {
+      if (!sessionId) { showToast("还没有对话", "warn"); return; }
+      const r = await api("/api/memory", {
+        method: "POST",
+        body: JSON.stringify({ session_id: sessionId, content: $("#memShortText").value }),
+      });
+      showToast(r.ok ? "已保存本次对话的短期记忆" : "保存失败", r.ok ? "ok" : "warn");
+      loadMemory();
+    };
+    const sc = $("#memShortClear");
+    if (sc) sc.onclick = async () => {
+      if (!sessionId) return;
+      if (!confirm("清空**这个对话**的短期记忆？\n\n其他对话的短期记忆、以及长期记忆都不受影响。")) return;
+      await api("/api/memory?scope=session&session_id=" + encodeURIComponent(sessionId),
+                { method: "DELETE" });
+      showToast("已清空本对话短期记忆");
+      loadMemory();
+    };
+  }
+  bindMemoryPanel();
 
   // ---------- 内存占用：看清占在哪 + 一键释放 ----------
   // 设计原则：**释放只动对话记录与归档，长期记忆一律保留**。
@@ -512,9 +517,11 @@
         `<div class="mu-row"><span>对话记录</span><b>${fmtBytes(t.sessions_bytes)}</b>`
         + `<em>${t.session_count} 个对话 · ${t.message_count} 条消息</em></div>`
         + `<div class="mu-row"><span>归档底稿</span><b>${fmtBytes(t.transcript_bytes)}</b>`
-        + `<em>${t.transcript_files} 个文件（可安全释放）</em></div>`
-        + `<div class="mu-row keep"><span>🧠 长期记忆</span><b>${fmtBytes(t.memory_bytes)}</b>`
-        + `<em>${t.memory_used_sections}/${t.memory_sections} 个分区有内容（始终保留）</em></div>`
+        + `<em>${t.transcript_files} 个文件（释放前会先沉淀要点）</em></div>`
+        + `<div class="mu-row keep"><span>🧩 长期记忆</span><b>${t.long_chars || 0} 字</b>`
+        + `<em>所有对话共享 · 始终保留</em></div>`
+        + `<div class="mu-row"><span>💬 短期记忆</span><b>${t.short_chars || 0} 字</b>`
+        + `<em>${t.short_used || 0} 个对话有短期记忆 · 可释放</em></div>`
         + (t.rss_bytes
             ? `<div class="mu-row"><span>运行内存</span><b>${fmtBytes(t.rss_bytes)}</b><em>应用进程常驻内存</em></div>`
             : "");
@@ -533,20 +540,24 @@
               <span class="mu-sess-size">${fmtBytes(s.bytes)}</span>
             </div>
             <div class="mu-sess-meta">${s.messages} 条 · 约 ${fmtTokens(s.tokens)} token`
+            + `${s.memory_chars ? ` · 记忆 ${s.memory_chars} 字` : ' · 无记忆'}`
             + `${full ? ' · <span class="mu-warn">已达上下文上限，早期内容靠摘要保留</span>' : ''}</div>
             <button class="btn sm ghost mu-free">释放此对话历史</button>`;
           row.querySelector(".mu-sess-title").textContent = s.title || s.id;
           row.querySelector(".mu-free").onclick = async (ev) => {
             ev.stopPropagation();
             if (!confirm(`释放「${s.title || s.id}」的对话记录？\n\n`
-                       + "长期记忆与偏好不受影响。")) return;
+                       + "· 释放前会先把这段对话里值得记住的要点提炼进记忆\n"
+                       + "· 记忆本身不受影响")) return;
             const r = await api("/api/memory/release", {
               method: "POST",
-              body: JSON.stringify({ scope: "session", session_id: s.id }),
+              body: JSON.stringify({ scope: "session", session_id: s.id, sweep: true }),
             });
-            showToast(r.ok ? `已释放 ${fmtBytes(r.freed_bytes)}` : "释放失败",
+            const extra = r.swept ? `，先沉淀了 ${r.swept} 条要点` : "";
+            showToast(r.ok ? `已释放 ${fmtBytes(r.freed_bytes)}${extra}` : "释放失败",
                       r.ok ? "ok" : "warn");
             loadMemoryUsage();
+            loadMemory();
           };
           list.appendChild(row);
         });
@@ -565,24 +576,60 @@
     };
     const rf = $("#muRefresh");
     if (rf) rf.onclick = (e) => { e.stopPropagation(); loadMemoryUsage(); };
-    const rl = $("#muRelease");
-    if (rl) rl.onclick = async (e) => {
+    // 释放短期记忆：它是"缓存"性质的，可以先清；
+    // 清之前后端会先把归档里的要点沉淀一遍，避免把结论一起清掉。
+    const fs = $("#muFreeShort");
+    if (fs) fs.onclick = async (e) => {
       e.stopPropagation();
-      if (!confirm("释放缓存占用？\n\n"
-                 + "· 会清理：归档底稿、几乎没用过的空会话、过长对话的早期记录\n"
-                 + "· 不会动：长期记忆（分区文段）、你的偏好与约定")) return;
-      rl.disabled = true;
+      if (!confirm("释放所有对话的**短期记忆**？\n\n"
+                 + "· 会先做：把归档里还没记下的要点提炼进记忆\n"
+                 + "· 会清掉：各对话的短期记忆（正在做的事、本次结论）\n"
+                 + "· 不会动：长期记忆（身份/偏好/约定）")) return;
+      fs.disabled = true;
+      const old = fs.textContent;
+      fs.textContent = "沉淀并释放中…";
       try {
         const r = await api("/api/memory/release",
-                            { method: "POST", body: JSON.stringify({ scope: "auto" }) });
+                            { method: "POST",
+                              body: JSON.stringify({ scope: "short", sweep: true }) });
         if (r.ok) {
-          showToast(`已释放 ${fmtBytes(r.freed_bytes)}，长期记忆已保留`, "ok");
+          const extra = r.swept ? `，先沉淀了 ${r.swept} 条要点` : "";
+          showToast(`已释放短期记忆 ${r.short_freed_chars || 0} 字${extra}；长期记忆已保留`, "ok");
         } else {
           showToast(r.reason || "释放失败", "warn");
         }
         loadMemoryUsage();
+        loadMemory();
+      } finally {
+        fs.disabled = false;
+        fs.textContent = old;
+      }
+    };
+    const rl = $("#muRelease");
+    if (rl) rl.onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm("释放缓存占用？\n\n"
+                 + "· 会先做：把归档里还没记下的重要要点提炼进记忆\n"
+                 + "· 再清理：归档底稿、几乎没用过的空会话、过长对话的早期记录\n"
+                 + "· 不会动：各对话的记忆、全局偏好")) return;
+      rl.disabled = true;
+      const old = rl.textContent;
+      rl.textContent = "沉淀并释放中…";
+      try {
+        const r = await api("/api/memory/release",
+                            { method: "POST",
+                              body: JSON.stringify({ scope: "auto", sweep: true }) });
+        if (r.ok) {
+          const extra = r.swept ? `，先沉淀了 ${r.swept} 条要点` : "";
+          showToast(`已释放 ${fmtBytes(r.freed_bytes)}${extra}；记忆已保留`, "ok");
+        } else {
+          showToast(r.reason || "释放失败", "warn");
+        }
+        loadMemoryUsage();
+        loadMemory();
       } finally {
         rl.disabled = false;
+        rl.textContent = old;
       }
     };
   })();
@@ -999,7 +1046,7 @@
   function autoGrow() { inputEl.style.height = "auto"; inputEl.style.height = inputEl.scrollHeight + "px"; }
   inputEl.addEventListener("input", autoGrow);
 
-  // ---------- 语音输入（唤醒词「西派西派」+ 静音自动发送）----------
+  // ---------- 语音输入（唤醒词「小千小千」+ 静音自动发送）----------
   const voiceHintEl = $("#voiceHint");
   const voiceTextEl = $("#voiceText");
   const voiceBtn = $("#voiceBtn");
@@ -1016,9 +1063,9 @@
     } else if (state === "awake") {
       voiceTextEl.textContent = "🎙 已唤醒 · 请说内容（停顿 2 秒自动发送）";
     } else if (state === "listening") {
-      voiceTextEl.textContent = "👂 监听中 · 说「西派西派」唤醒";
+      voiceTextEl.textContent = "👂 监听中 · 说「小千小千」唤醒";
     } else {
-      voiceTextEl.textContent = "语音未开启 · 点 🎤 后说「西派西派」唤醒";
+      voiceTextEl.textContent = "语音未开启 · 点 🎤 后说「小千小千」唤醒";
     }
   }
 

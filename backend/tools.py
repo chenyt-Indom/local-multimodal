@@ -186,18 +186,19 @@ def make_schemas(web_enabled: bool = False) -> list:
             "type": "function",
             "function": {
                 "name": "remember",
-                "description": "把值得长期记住的稳定信息（身份/偏好/约定/项目）写入长期记忆，按【分区文段】组织。分区建议用：身份信息 / 工作背景 / 偏好习惯 / 重要约定 / 当前项目 / 近期动态。寒暄、临时问答、一次性指令不要存。content 必须是该分区**合并旧内容后的完整文段**——把旧文段和新信息一起重写，只写新增部分会覆盖掉原有记忆。",
+                "description": "把值得记住的信息写入记忆。**长期记忆**跨所有对话共享（身份、姓名、职业、长期偏好、约定）；**短期记忆**只在当前对话生效（正在做的项目、本次讨论的结论、临时设定）。寒暄、临时问答、一次性的提问不要存。content 写**一条**具体事实（保留名称、数字、技术栈），系统会自动追加并去重，**不需要你重写旧内容**。",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "section": {
-                            "type": "string",
-                            "description": "分区标题，如 工作背景 / 个人背景 / 当前关注 / 近期动态（可新建其他贴切标题）"},
                         "content": {
                             "type": "string",
-                            "description": "这一分区要存储的完整、最新的文段（第三人称、直接、可读，合并旧内容与新信息）"},
+                            "description": "要记住的一条具体事实（第三人称、直接、可读，60 字以内）"},
+                        "scope": {
+                            "type": "string",
+                            "enum": ["long", "short"],
+                            "description": "long=长期记忆（跨对话通用，放身份/偏好/约定）；short（默认）=短期记忆（只在这个对话用，放当前项目/本次结论）"},
                     },
-                    "required": ["section", "content"],
+                    "required": ["content"],
                 },
             },
         },
@@ -340,7 +341,7 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
     if name == "append_file":
         return _do_append_file(arguments)
     if name == "remember":
-        return _do_remember(arguments)
+        return _do_remember(arguments, context)
     if name == "search_memory":
         return _do_search_memory(arguments)
     if name == "get_time":
@@ -945,13 +946,25 @@ def _do_append_file(arguments):
 
 
 # ---------- 记忆工具 ----------
-def _do_remember(arguments):
-    section = (arguments.get("section") or "").strip()
-    content = (arguments.get("content") or "").strip()
+def _do_remember(arguments, context=None):
+    """写入记忆。scope=long 写长期记忆（跨对话），否则写当前对话的短期记忆。
+
+    短期记忆按对话隔离，所以必须从 context 拿 session —— 拿不到就拒绝，
+    免得内容写进了不知道哪个对话（等于丢失）。
+    """
+    content = (arguments.get("content") or arguments.get("section") or "").strip()
     if not content:
         return "错误：内容为空。"
-    memory_mod.remember(section, content)
-    return f"已更新长期记忆文段【{section}】。"
+    scope = (arguments.get("scope") or "short").strip().lower()
+    if scope in ("long", "global"):
+        ok = memory_mod.merge_long(content)
+        return ("已记入长期记忆（所有对话都通用）。" if ok
+                else "这条已经在长期记忆里了，没有重复记。")
+    session = str(((context or {}).get("session")) or "").strip()
+    if not session:
+        return "错误：无法确定当前对话，记忆未写入。"
+    ok = memory_mod.merge_short(session, content)
+    return ("已记入本次对话的短期记忆。" if ok else "这条已经在本对话记忆里了，没有重复记。")
 
 
 def _do_search_memory(arguments):

@@ -47,20 +47,37 @@
       <div class="list sessions-list" id="sessionsList"></div>
     </section>
 
-    <!-- 抱负操作无需按钮：直接对话驱动 -->
+    <!-- 记忆：一份长期（跨对话共享）+ 每个对话一份短期（互相独立） -->
     <section class="panel memory" id="memoryPanel">
-      <h2>🧠 记忆库 · 文段式</h2>
-      <p class="hint">记忆按分区文段整体维护（身份信息 / 工作背景 / 偏好习惯 / 重要约定 / 当前项目 / 近期动态）。AI 会自动更新补充；你也可直接编辑、删除、新增文段。</p>
-      <div class="row">
-        <input type="text" id="secTitleInput" placeholder="新分区标题，如 偏好习惯" />
-        <button class="btn sm" id="secAdd">＋ 新增</button>
+      <h2>🧠 记忆库</h2>
+      <p class="hint"><b>长期记忆</b>跨所有对话共享（放身份/偏好/约定），所以新开对话也不会不认识你；
+        <b>短期记忆</b>只属于当前对话（放正在做的事），切对话就换一份，可随时释放。</p>
+
+      <div class="mem-block">
+        <div class="mem-block-head">
+          <span class="mem-block-title">🧩 长期记忆</span>
+          <span class="mem-block-sess">所有对话共享</span>
+        </div>
+        <textarea id="memLongText" rows="4"
+          placeholder="例如：用户姓名陈宇桐；广州民航职业技术学院大一；偏好简体中文…"></textarea>
+        <div class="mem-meta" id="memLongMeta"></div>
+        <div class="mini-toolbar">
+          <button class="btn sm" id="memLongSave">💾 保存</button>
+        </div>
       </div>
-      <div class="mini-toolbar">
-        <button class="btn sm ghost" id="memRefresh">刷新</button>
-        <button class="btn sm ghost danger" id="memClearAll">清空全部</button>
-      </div>
-      <div class="list" id="memoryList">
-        <p class="hint">暂无记忆文段。AI 会在对话中按"分区文段"自动写入，也可手动新增。</p>
+
+      <div class="mem-block">
+        <div class="mem-block-head">
+          <span class="mem-block-title">💬 短期记忆</span>
+          <span class="mem-block-sess" id="memSessName">—</span>
+        </div>
+        <textarea id="memShortText" rows="4"
+          placeholder="这个对话里正在做的事…（AI 会自动补充，你也可以自己写）"></textarea>
+        <div class="mem-meta" id="memShortMeta"></div>
+        <div class="mini-toolbar">
+          <button class="btn sm" id="memShortSave">💾 保存</button>
+          <button class="btn sm ghost danger" id="memShortClear">清空本对话短期记忆</button>
+        </div>
       </div>
 
       <!-- 内存占用：看清是哪块在占地方，并一键释放（长期记忆始终保留） -->
@@ -75,9 +92,11 @@
           <div class="mu-list" id="muList"></div>
           <div class="mu-actions">
             <button class="btn sm" id="muRelease">🧹 一键释放</button>
+            <button class="btn sm ghost" id="muFreeShort">🧠 释放短期记忆</button>
             <button class="btn sm ghost" id="muRefresh">刷新</button>
           </div>
-          <p class="hint mu-note">释放只清理**对话记录与归档**，长期记忆（上面的分区文段）一律保留。</p>
+          <p class="hint mu-note">「一键释放」清理归档与对话记录；「释放短期记忆」只清各对话的短期记忆。
+            <b>长期记忆（身份/偏好/约定）永远不会被释放</b>，只能在上面手动修改。</p>
         </div>
       </div>
     </section>
@@ -141,12 +160,12 @@
       <div class="attachments" id="attachments"></div>
       <div class="drop-hint" id="dropHint">松开鼠标导入图片/文件</div>
       <div class="voice-hint" id="voiceHint">
-        <span class="v-dot"></span><span id="voiceText">语音未开启 · 点 🎤 后说「西派西派」唤醒</span>
+        <span class="v-dot"></span><span id="voiceText">语音未开启 · 点 🎤 后说「小千小千」唤醒</span>
       </div>
       <div class="input-row">
         <button class="icon-btn" id="attachBtn" title="上传图片">🖼</button>
         <button class="icon-btn" id="videoBtn" title="上传视频">🎬</button>
-        <button class="icon-btn" id="voiceBtn" title="语音输入：说「西派西派」唤醒，停顿 2 秒自动发送">🎤</button>
+        <button class="icon-btn" id="voiceBtn" title="语音输入：说「小千小千」唤醒，停顿 2 秒自动发送">🎤</button>
         <input type="file" id="fileInput" accept="image/*" multiple hidden />
         <input type="file" id="videoInput" accept="video/*" hidden />
         <textarea id="input" rows="1" placeholder="描述需求：画一只机器人 · 读取报告.txt 并改错别字 · 记住我喜欢中文交流 · （拖图可微改）"></textarea>

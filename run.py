@@ -55,6 +55,82 @@ def _alert(msg: str, title: str = "本地多模态助手") -> None:
         print(msg)
 
 
+# --------------------------------------------------------------------------
+#  语音唤醒：把窗口弹到最前
+# --------------------------------------------------------------------------
+WINDOW_TITLE = "本地多模态助手"
+
+
+def _focus_window_win32() -> bool:
+    """按标题找到应用窗口并置前（不依赖 pywebview 对象，因此对
+    "窗口由外部启动器创建"的情况也有效）。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        found = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        def _cb(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            n = user32.GetWindowTextLengthW(hwnd)
+            if n <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(hwnd, buf, n + 1)
+            if WINDOW_TITLE in (buf.value or ""):
+                found.append(hwnd)
+                return False        # 找到一个就停
+            return True
+
+        user32.EnumWindows(_cb, 0)
+        if not found:
+            return False
+        hwnd = found[0]
+        # 最小化了要先还原，否则置前只能看到任务栏闪烁
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 9)      # SW_RESTORE
+        else:
+            user32.ShowWindow(hwnd, 5)      # SW_SHOW
+        user32.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        return False
+
+
+def _make_wake_focus(window=None):
+    """生成"被唤醒时"的回调：先试 pywebview 对象，再退回 Win32 按标题找。"""
+    def _focus() -> None:
+        if window is not None:
+            try:
+                window.show()
+                window.restore()
+            except Exception:
+                pass
+        _focus_window_win32()
+    return _focus
+
+
+def _autostart_voice() -> None:
+    """启动时自动打开麦克风监听（可被配置项 voice_auto_start 关掉）。
+
+    容器里没有麦克风，这里会失败 —— 失败就静默跳过，界面上点 🎤 会给出提示，
+    不能让"没有麦克风的部署"因为自动启动而报错。
+    """
+    try:
+        from backend import config as _cfg
+        if not _cfg.load_config().get("voice_auto_start", True):
+            return
+        from backend import main as _main
+        # 模型要在后台加载，稍等一下再开，避免和 ollama 抢资源
+        time.sleep(3)
+        r = _main.voice_start()
+        print(f"[voice] 自动监听：{r}")
+    except Exception as e:
+        print(f"[voice] 自动监听失败（可忽略）：{e}")
+
+
 def main() -> None:
     config.load_config()
     server = uvicorn.Server(uvicorn.Config(app, host=HOST, port=PORT,
@@ -74,6 +150,14 @@ def main() -> None:
     if NO_WINDOW:
         # 被外部启动器拉起：这里只保持后端服务存活，窗口由启动器负责，
         # 否则会和启动器各开一个窗口（用户看到两个）。
+        # 窗口不由本进程创建，所以"唤醒置前"只能靠 Win32 按标题找。
+        try:
+            from backend import voice as _voice
+            _voice.set_wake_hook(_make_wake_focus(None))
+        except Exception:
+            pass
+        threading.Thread(target=_autostart_voice, daemon=True,
+                         name="voice-autostart").start()
         try:
             while not server.should_exit:
                 time.sleep(0.5)
@@ -91,13 +175,21 @@ def main() -> None:
         raise
 
     window = webview.create_window(
-        "本地多模态助手",
+        WINDOW_TITLE,
         URL,
         width=1280,
         height=840,
         min_size=(960, 640),
         text_select=True,
     )
+    # 语音唤醒时要能把这个窗口弹到最前 —— 在这里注册回调
+    try:
+        from backend import voice as _voice
+        _voice.set_wake_hook(_make_wake_focus(window))
+    except Exception:
+        pass
+    threading.Thread(target=_autostart_voice, daemon=True,
+                     name="voice-autostart").start()
     try:
         webview.start(private_mode=False)
     finally:

@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
-"""本地语音输入：唤醒词「西派西派」+ 离线流式识别 + 静音自动发送。
+"""本地语音输入：唤醒词「小千小千」+ 离线流式识别 + 静音自动发送。
 
 工作流程
 --------
-1. 用户点开麦克风 → 进入**待机监听**（state=listening），持续做流式识别
-2. 识别文本中命中唤醒词（默认「西派」）→ 进入**收音**（state=awake），
-   唤醒词之后的内容作为指令开头
+1. 程序启动后自动进入**待机监听**（state=listening），持续做流式识别
+2. 识别文本中命中唤醒词（「小千小千」或「小千」）→ 进入**收音**（state=awake），
+   同时**把应用窗口弹到最前**（见 set_wake_hook），唤醒词之后的内容作为指令开头
 3. 收音期间持续累积文本并实时推给前端（partial 事件）
 4. 检测到**连续静音超过 silence_sec 秒**且已有内容 → 发出 final 事件
    （auto=True），前端据此自动发送；随后回到待机监听
+   · 唤醒后一直没说话 → 同样在 silence_sec 后结束，但**内容不足就不发**
+     （不会凭空发一条空消息）
 
 全程离线：麦克风由 sounddevice 采集，识别由 sherpa-onnx 本地模型完成。
 """
@@ -26,12 +28,113 @@ BLOCK_MS = 100               # 每次读取 100ms
 BLOCK_SIZE = SAMPLE_RATE * BLOCK_MS // 1000
 
 # —— 行为参数 ——
-WAKE_WORDS = ("西派西派", "西派")   # 命中任意一个即唤醒
+WAKE_WORDS = ("小千小千", "小千")   # 命中任意一个即唤醒（双呼更稳，单呼更灵敏）
 SILENCE_SEC = 2.0                   # 唤醒后静音多久自动发送
-SILENCE_RMS = 0.012                 # 低于此 RMS 视为静音（可调）
+SILENCE_RMS = 0.010                 # 低于此 RMS 视为静音（调低=更不容易被当成静音，
+                                    # 说话声小的时候不会被过早切断）
 MIN_CHARS = 2                       # 至少要识别出这么多字才允许自动发送
 
+# —— 静音门控（性能关键）——
+# 常驻监听最容易踩的坑：每 100ms 就跑一次 ASR 解码，持续吃满 CPU 并持有 GIL，
+# 把同时运行的 Web 服务饿死（实测健康检查从 20ms 恶化到 21 秒）。
+# 所以待机时**只在检测到人声后才启动识别**，安静时就只算个音量，开销可忽略。
+GATE_RMS = 0.010                    # 音量超过它才认为"有人在说话"
+PRE_ROLL_BLOCKS = 4                 # 检测到人声前多留 0.4 秒音频，
+                                    # 否则第一个字常被吃掉（"小千"变成"千"）
+IDLE_RESET_SEC = 3.0                # 安静这么久就重置识别流，避免上下文无限增长
+
+# —— 唤醒词容错表 ——
+# 语音识别把「小千」写成别的同音字太常见了（晓谦/小签/小迁…）。
+# 只认精确的「小千」会导致"喊了没反应"，所以这里做同音归一化再匹配 ——
+# 相当于把唤醒的置信度门槛放低，换取更高的激活率。
+_XIAO_VARIANTS = "小晓筱肖萧校孝笑消宵霄"      # 「xiao」这一类听感相近的字
+_QIAN_VARIANTS = "千谦签迁倩浅纤铅嵌仟乾黔阡茜"  # 「qian」这一类
+
 EventFn = Callable[[dict], None]
+
+# 唤醒时触发的钩子（由 run.py 注册，用来把窗口弹到最前）
+_wake_hook: Callable[[], None] | None = None
+
+
+def set_wake_hook(fn: Callable[[], None] | None) -> None:
+    """注册"被唤醒时"的回调（把窗口带到前台）。"""
+    global _wake_hook
+    _wake_hook = fn
+
+
+def _fire_wake_hook() -> None:
+    fn = _wake_hook
+    if fn is None:
+        return
+    try:
+        # 放到子线程里做：置前窗口可能阻塞几百毫秒，不能拖慢音频回调
+        threading.Thread(target=fn, daemon=True, name="wake-focus").start()
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
+# 唤醒词匹配（宽松）
+# --------------------------------------------------------------------------
+_WAKE_MAP = {}
+for _c in _XIAO_VARIANTS:
+    _WAKE_MAP[ord(_c)] = "小"
+for _c in _QIAN_VARIANTS:
+    _WAKE_MAP[ord(_c)] = "千"
+
+
+def normalize_wake(text: str) -> str:
+    """把易混的同音字归一化成「小」「千」，并去掉空白与标点。
+
+    归一化是**逐字替换**的，所以归一化后的下标与原串一一对应 ——
+    这样才能用它的位置在原文里截出"唤醒词之后的内容"。
+    """
+    if not text:
+        return ""
+    out = []
+    for ch in text:
+        if ch.isspace() or ch in "，。、！？,.!?；;：:～~-—":
+            continue
+        out.append(_WAKE_MAP.get(ord(ch), ch))
+    return "".join(out)
+
+
+def match_wake(text: str) -> tuple:
+    """检测唤醒词，返回 (是否命中, 唤醒词之后的内容)。
+
+    比精确匹配宽松得多，为的是提高激活率：
+      1. 双呼「小千小千」→ 命中；
+      2. 单呼「小千」→ 也命中（灵敏度优先，宁可多唤一次也别喊不动）；
+      3. 同音字（晓谦/小签/小迁…）归一化后照样能命中。
+    误唤醒的代价只是弹个窗口，没喊动的代价是"以为坏了" —— 所以偏向灵敏。
+    """
+    if not text:
+        return False, ""
+    norm = normalize_wake(text)
+    if not norm:
+        return False, ""
+    # 先看双呼：必须**整体跳过 4 个字**，否则「小千小千，今天天气」
+    # 会把第二个"小千"当成正文留在指令里。
+    idx = norm.find("小千小千")
+    if idx >= 0:
+        return True, _tail_after(text, idx + 4)
+    # 再看单呼
+    idx = norm.find("小千")
+    if idx >= 0:
+        return True, _tail_after(text, idx + 2)
+    return False, ""
+
+
+def _tail_after(text: str, skip_chars: int) -> str:
+    """取原文中"第 skip_chars 个有效字符"之后的内容。"""
+    seen = 0
+    for i, ch in enumerate(text):
+        if ch.isspace() or ch in "，。、！？,.!?；;：:～~-—":
+            continue
+        seen += 1
+        if seen >= skip_chars:
+            return text[i + 1:].strip("，。、！？,.!?　 ")
+    return ""
 
 
 # --------------------------------------------------------------------------
@@ -89,6 +192,8 @@ class VoiceListener:
         self._text = ""                  # 唤醒后累积的文本
         self._silence_start: float | None = None
         self._last_partial = ""
+        self._preroll: list = []         # 门控前的一小段音频（避免吃掉第一个字）
+        self._idle_since: float | None = None
 
     # ---------------- 对外接口 ----------------
     @property
@@ -120,6 +225,8 @@ class VoiceListener:
         self._stop.clear()
         self._awake = False
         self._text = ""
+        self._preroll = []
+        self._idle_since = None
         self._silence_start = None
         self._last_partial = ""
         self._thread = threading.Thread(target=self._loop, daemon=True,
@@ -192,13 +299,10 @@ class VoiceListener:
         except Exception:
             return 0.0
 
-    def _match_wake(self, text: str) -> tuple[bool, str]:
-        """检测唤醒词，返回 (是否命中, 唤醒词之后的内容)。"""
-        for w in WAKE_WORDS:
-            idx = text.find(w)
-            if idx >= 0:
-                return True, text[idx + len(w):].strip()
-        return False, ""
+    @staticmethod
+    def _match_wake(text: str) -> tuple:
+        """检测唤醒词（宽松匹配，见模块级 match_wake）。"""
+        return match_wake(text)
 
     def _reset_stream(self) -> None:
         if self._recognizer is not None:
@@ -244,9 +348,40 @@ class VoiceListener:
             self._emit({"type": "state", "state": "idle"})
 
     def _feed(self, samples) -> None:
-        """把一块音频喂给识别器，并驱动状态机。"""
+        """把一块音频喂给识别器，并驱动状态机（含静音门控）。"""
         if self._stream is None:
             return
+
+        rms = self._rms(samples)
+        loud = rms >= GATE_RMS
+
+        # —— 待机 + 安静：**不跑识别**，只维护一小段前置音频 ——
+        # 这是让"常驻监听"不吃满 CPU 的关键：绝大多数时间都是静音，
+        # 那些时刻完全不需要跑 ASR（之前没做门控，把 Web 服务都拖慢了）。
+        if not self._awake and not loud:
+            self._preroll.append(samples)
+            if len(self._preroll) > PRE_ROLL_BLOCKS:
+                self._preroll.pop(0)
+            now = time.time()
+            if self._idle_since is None:
+                self._idle_since = now
+            elif now - self._idle_since > IDLE_RESET_SEC:
+                # 安静够久就重置识别流，防止上下文越积越长、解码越来越慢
+                self._reset_stream()
+                self._idle_since = now
+            return
+
+        # —— 有人在说话（或已唤醒）：把前置音频一起补喂进去 ——
+        # 不补的话，第一个字往往落在门控之前，会被吃掉
+        if self._preroll:
+            for buf in self._preroll:
+                try:
+                    self._stream.accept_waveform(SAMPLE_RATE, buf)
+                except Exception:
+                    pass
+            self._preroll.clear()
+        self._idle_since = None
+
         try:
             rec = self._recognizer
             self._stream.accept_waveform(SAMPLE_RATE, samples)
@@ -256,7 +391,6 @@ class VoiceListener:
         except Exception:
             return
 
-        rms = self._rms(samples)
         quiet = rms < SILENCE_RMS
 
         # —— 尚未唤醒：只在文本里找唤醒词 ——
@@ -269,6 +403,8 @@ class VoiceListener:
                 self._silence_start = time.time() if not rest else None
                 self._last_partial = ""
                 self._emit({"type": "wake", "state": "awake"})
+                # 把窗口弹到最前（用户喊唤醒词时多半没看着窗口）
+                _fire_wake_hook()
                 if rest:
                     self._emit({"type": "partial", "text": rest})
             return
@@ -288,6 +424,7 @@ class VoiceListener:
                 if len(final_text) >= MIN_CHARS:
                     self._emit({"type": "final", "text": final_text,
                                 "auto": True})
+                # 内容不足就什么也不发（不会凭空发一条空消息）
                 self._finish_round()
         else:
             self._silence_start = None
@@ -298,6 +435,8 @@ class VoiceListener:
         self._text = ""
         self._silence_start = None
         self._last_partial = ""
+        self._preroll = []
+        self._idle_since = None
         self._reset_stream()
         self.state = "listening"
         self._emit({"type": "state", "state": "listening"})

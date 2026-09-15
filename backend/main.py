@@ -259,11 +259,13 @@ def _should_extract(session: str, text: str) -> bool:
     return n % _MEM_EVERY_N == 0
 
 
-def _auto_extract_memory(last_user: str, answer: str, model: str, cfg: dict) -> None:
-    """把本轮要点提炼进长期记忆（后台线程，不阻塞回复）。
+def _auto_extract_memory(session: str, last_user: str, answer: str,
+                         model: str, cfg: dict) -> None:
+    """把本轮要点提炼进**当前对话**的记忆（后台线程，不阻塞回复）。
 
     长期记忆是"久远对话可被清理"的前提——要点沉淀下来后，
-    老的聊天记录就可以安全裁剪或清除。
+    老的聊天记录才可以安全裁剪或清除。**所以下面释放归档前，
+    必须先跑一遍这个沉淀，否则还没提炼的内容会跟着归档一起消失。**
 
     ⚠️ **num_ctx 必须与聊天保持一致**（因此这里直接复用 cfg）。
     Ollama 只要发现 num_ctx 与已加载的不同，就会**卸载并重载模型**
@@ -275,16 +277,18 @@ def _auto_extract_memory(last_user: str, answer: str, model: str, cfg: dict) -> 
     """
     try:
         prompt = (
-            "从下面这轮对话里提取值得【长期记住】的信息。只提取**稳定、可复用**的内容：\n"
-            "· 身份/背景：职业、专业、所在单位、常用语言\n"
+            "从下面这轮对话里提取值得记住的信息。只提取**稳定、可复用**的内容：\n"
+            "· 身份/背景：职业、专业、所在单位\n"
             "· 偏好/习惯：喜欢什么、讨厌什么、希望回答怎么写\n"
             "· 重要约定：以后都要遵守的规则、称呼、格式\n"
-            "· 当前项目：在做什么、技术栈、环境\n"
+            "· 正在做的事：项目、技术栈、环境、结论\n"
             "**不要**提取：寒暄、临时问答、一次性的具体问题、助手自己的回答内容。\n\n"
             "输出格式（每行一条，最多 3 条）：\n"
-            "分区|要点\n"
-            "分区只能从这几个里选：身份信息 / 工作背景 / 偏好习惯 / 重要约定 / 当前项目 / 近期动态\n"
-            "要点写**具体事实**（保留名称、数字、技术栈等），一条不超过 60 字。\n"
+            "类别|要点\n"
+            "类别只能是这两个之一：\n"
+            "  · 长期 —— 换任何对话都成立的信息：身份、姓名、职业、长期偏好、约定、习惯\n"
+            "  · 短期 —— 只跟当前这件事有关：正在做的项目、本次讨论的结论、临时设定\n"
+            "要点写**具体事实**（保留名称、数字、技术栈），一条不超过 60 字。\n"
             "没有值得记的就只输出两个字：无\n\n"
             f"用户：{last_user}\n助手：{(answer or '')[:300]}"
         )
@@ -302,54 +306,22 @@ def _auto_extract_memory(last_user: str, answer: str, model: str, cfg: dict) -> 
             line = line.strip().lstrip("-•* ").strip()
             if not line or "|" not in line:
                 continue
-            sec, val = line.split("|", 1)
-            sec, val = sec.strip().strip("【】[]"), val.strip()
-            if not sec or not val or len(val) > 120:
+            kind, val = line.split("|", 1)
+            kind = kind.strip().strip("【】[]")
+            val = val.strip()
+            if not val or len(val) > 120:
                 continue
-            _merge_memory_point(sec, val)
+            if "短期" in kind or "对话" in kind or "项目" in kind:
+                # 跟"这件事"绑定的 → 短期记忆（只在这个对话里生效）
+                memory.merge_short(session, val)
+            else:
+                # 身份/偏好/约定 → 长期记忆（所有对话都通用）
+                memory.merge_long(val)
             kept += 1
             if kept >= 3:
                 break
     except Exception:
         pass
-
-
-def _merge_memory_point(section: str, point: str, cap: int = 600) -> None:
-    """把一条要点**并入**指定分区（追加 + 去重），而不是覆盖整个分区。
-
-    以前的写法是 `memory.upsert("当前关注", 本轮要点)` —— 那是**整段替换**，
-    等于每自动记一次，该分区之前的内容就被抹掉了，最后只剩最新一条。
-    这是"长期记忆明明记过却想不起来"的主要原因之一（实测踩过）。
-
-    超长时从**最早**的要点开始丢（保留最近的），并给出明确上限，
-    免得单分区无限膨胀。
-    """
-    import re as _re
-    # 归一化：统一去掉首尾空白与句末标点，否则「喜欢简洁的回答」和
-    # 「喜欢简洁的回答。」会被当成两条不同的要点重复记进去。
-    point = (point or "").strip().strip("。.；;，,、！!？?　 ")
-    if not point:
-        return
-
-    secs = memory.get_sections()
-    cur = next((s for s in secs if (s.get("title") or "") == section), None)
-    body = ((cur or {}).get("content") or "").strip()
-
-    # 去重：完全重复、或本条已被旧内容涵盖，就不必再记
-    if point in body:
-        return
-    existing = [p.strip().strip("。.；;，,、！!？?　 ")
-                for p in _re.split(r"[；;\n。]", body) if p.strip()]
-    if any(point == e or point in e for e in existing):
-        return
-
-    new = (body.rstrip("；;。 \n") + "；" + point) if body else point
-    if len(new) > cap:
-        parts = [p for p in new.split("；") if p.strip()]
-        while parts and len("；".join(parts)) > cap:
-            parts.pop(0)          # 丢最早的，保最近的
-        new = "；".join(parts)
-    memory.upsert(section, new)
 
 
 # 允许本地界面跨域访问（浏览器 debug 时用）
@@ -612,7 +584,7 @@ class _SystemPrompt:
     """WorkBuddy 风格系统提示：精简注入分层记忆，给出工具使用引导。"""
 
     @staticmethod
-    def build(last_user_text: str):
+    def build(last_user_text: str, session: str = ""):
         cfg = config.load_config()
         parts = [
             # 时间感知：让模型始终知道"今夕是何年何时"，避免说"不知道今天日期"
@@ -660,9 +632,10 @@ class _SystemPrompt:
             "- 若检索到的材料足以支撑推断，可以给出**你自己的分析和见解**，\n"
             "  但必须让用户分得清「材料里写的」和「你的推断」——后者要明说是推断。",
         ]
-        # 长期记忆（WorkBuddy 画像 + 检索到的记忆，精简注入）
+        # 长期记忆：**只注入当前对话的那一块** + 极简全局偏好。
+        # 对话之间互不相通 —— 切到别的对话就换一份记忆。
         if cfg.get("memory_enabled", True):
-            ctx = memory.build_context(last_user_text, top_k=cfg.get("memory_top_k", 5))
+            ctx = memory.build_context(session, query=last_user_text)
             if ctx:
                 parts.append(ctx)
         # RAG 知识库
@@ -705,7 +678,9 @@ async def chat(req: ChatRequest):
 
     # 系统提示与工具定义属于**固定开销**，和聊天历史抢同一个上下文窗口，
     # 所以要先算出来，才能知道还剩多少空间给历史。
-    sys_prompt = _SystemPrompt.build(last_user)
+    # session 必须提前取到：记忆是按对话隔离的，注入时必须知道是哪个对话。
+    session = req.session_id or ""
+    sys_prompt = _SystemPrompt.build(last_user, session)
     tool_schemas = tools.make_schemas(cfg.get("web_enabled", False))
 
     # ---------- 上下文预算：按剩余空间裁剪历史 ----------
@@ -741,7 +716,7 @@ async def chat(req: ChatRequest):
         working = [{"role": "system", "content": full_sys}] + messages
         final_text = ""
         final_thinking = ""
-        session = req.session_id or ""
+        # session 已在上面定义（记忆按对话隔离，需要提前拿到）
 
         # 空回答重试：qwen3-vl 的思考会吃掉大量 token，偶尔会「想完了但没来得及写正文」，
         # 表现为思考戛然而止、界面什么都没有。这种情况按上面配置重跑一次并加倍配额。
@@ -827,7 +802,9 @@ async def chat(req: ChatRequest):
             ui_events = []
             # images：本轮拖入的图（否则复用最近一张）
             # shown_images：本轮已展示给用户的图，供「保存到图库」工具按序号引用
-            ctx = {"images": images or _recent_image(), "shown_images": []}
+            # session：记忆按对话隔离，写记忆的工具必须知道当前是哪个对话
+            ctx = {"images": images or _recent_image(), "shown_images": [],
+                   "session": session}
             for tc in tool_calls:
                 fn = (tc.get("function") or {})
                 name = fn.get("name", "")
@@ -871,7 +848,7 @@ async def chat(req: ChatRequest):
         if cfg.get("auto_memorize", True) and _should_extract(session, last_user):
             try:
                 threading.Thread(target=_auto_extract_memory,
-                                 args=(last_user, final_text, model, cfg),
+                                 args=(session, last_user, final_text, model, cfg),
                                  daemon=True).start()
             except Exception:
                 pass
@@ -886,15 +863,57 @@ def _wants_search(text: str) -> bool:
     return bool(re.search(r"搜索|查一下|网上查|最新消息|实时新闻|搜一下|去网上|联网查", text, re.I))
 
 
-# ---------- 长期记忆 API（分区文段）----------
+# ---------- 记忆 API ----------
+# 结构：**一份长期记忆（所有对话共享） + 每个对话一份短期记忆（互相独立）**。
+# 长期记忆放"换任何对话都成立"的信息（身份/偏好/约定），所以新开对话不会不认识你；
+# 短期记忆放"这件事"的上下文，切对话就换一份，并且可以单独释放。
 @app.get("/api/memory")
-def memory_list():
-    return {"ok": True, "sections": memory.get_sections()}
+def memory_get(session_id: str = ""):
+    """一次取回两块：长期记忆（全局）+ 该对话的短期记忆。"""
+    sid = (session_id or "").strip()
+    lng = memory.get_long_doc()
+    sht = memory.get_short_doc(sid) if sid else {"content": "", "updated_at": 0}
+    return {"ok": True, "session_id": sid,
+            "long": lng["content"], "long_updated_at": lng["updated_at"],
+            "short": sht["content"], "short_updated_at": sht["updated_at"],
+            "long_cap": memory.LONG_CAP, "short_cap": memory.SHORT_CAP}
+
+
+@app.post("/api/memory")
+def memory_set(body: dict):
+    """保存记忆。scope=long 存长期记忆，否则存该对话的短期记忆。"""
+    scope = str((body or {}).get("scope") or "short").lower()
+    content = str((body or {}).get("content") or "")
+    if scope in ("long", "global"):
+        d = memory.set_long(content)
+        return {"ok": True, "scope": "long", "content": d["content"]}
+    sid = str((body or {}).get("session_id") or "").strip()
+    if not sid:
+        raise HTTPException(400, "缺少 session_id")
+    d = memory.set_short(sid, content)
+    return {"ok": True, "scope": "short", "session_id": sid, "content": d["content"]}
+
+
+@app.delete("/api/memory")
+def memory_clear(session_id: str = "", scope: str = "short"):
+    """清空记忆。scope=long 清长期记忆；session 清某个对话的短期记忆；否则清全部短期。"""
+    scope = (scope or "short").lower()
+    if scope == "long":
+        memory.set_long("")
+        return {"ok": True, "cleared": "long"}
+    if scope == "session":
+        sid = (session_id or "").strip()
+        if not sid:
+            raise HTTPException(400, "缺少 session_id")
+        memory.set_short(sid, "")
+        return {"ok": True, "cleared": "session", "session_id": sid}
+    r = memory.release("short")
+    return {"ok": True, "cleared": "all_short", **r}
 
 
 @app.get("/api/memory/usage")
 def memory_usage():
-    """各部分占用情况：每个会话的历史、长期记忆、归档、进程内存。
+    """各部分占用情况：每个会话的历史、记忆、归档、进程内存。
 
     用途有二：让用户看清"到底是哪块在占地方"；给一键释放提供依据。
     """
@@ -907,6 +926,8 @@ def memory_usage():
         except Exception:
             return 0
 
+    mu = memory.usage()
+    shorts = memory._load_shorts()
     items, sess_bytes = [], 0
     for s in sm.list_sessions():
         sid = s.get("id") or ""
@@ -919,16 +940,14 @@ def memory_usage():
             "messages": len(msgs), "chars": chars,
             "tokens": _est_tokens("".join(str(m.get("content") or "") for m in msgs)),
             "bytes": b, "trimmed": int(s.get("trimmed") or 0),
+            # 该对话的短期记忆（跟着对话走，一眼看出哪个对话记了什么）
+            "memory_chars": len(str((shorts.get(sid) or {}).get("content") or "")),
         })
     items.sort(key=lambda x: x["bytes"], reverse=True)
 
-    # 长期记忆（最重要，任何释放都不应动它）
-    secs = memory.get_sections()
-    mem_chars = sum(len(s.get("content") or "") for s in secs)
-    mem_used = sum(1 for s in secs if (s.get("content") or "").strip())
-    mem_bytes = _tsize(memory.MEMORY_DOC_FILE)
+    mem_bytes = _tsize(memory.LONG_FILE) + _tsize(memory.SHORT_FILE)
 
-    # 归档 transcript（长期记忆的"底稿"，最不重要，可优先释放）
+    # 归档 transcript（记忆的"底稿"，释放前要先把它沉淀掉，见 memory_release）
     tr_bytes, tr_files = 0, 0
     if _os.path.isdir(memory.TRANSCRIPT_DIR):
         for fn in _os.listdir(memory.TRANSCRIPT_DIR):
@@ -944,8 +963,11 @@ def memory_usage():
                 "session_count": len(items),
                 "message_count": sum(i["messages"] for i in items),
                 "transcript_files": tr_files,
-                "memory_sections": len(secs), "memory_used_sections": mem_used,
-                "memory_chars": mem_chars,
+                # 记忆：长期一份 + 短期按对话
+                "long_chars": mu["long_chars"], "long_cap": mu["long_cap"],
+                "short_chars": mu["short_chars"], "short_used": mu["short_used"],
+                "short_cap": mu["short_cap"],
+                "memory_chars": mu["long_chars"] + mu["short_chars"],
                 "rss_bytes": _process_rss(),
                 # 界面/接口用的关键阈值，避免前端写死数字
                 "max_keep": sm.MAX_KEEP, "keep_recent": sm.KEEP_RECENT,
@@ -973,11 +995,11 @@ def memory_release(body: dict):
     """一键释放占用。**默认只清缓存，绝不动长期记忆。**
 
     分级（从最不重要的开始，够用就停）：
-      1. 归档 transcript —— 最不重要，长期记忆已经沉淀了要点
+      0. **先把归档里还没沉淀的重要内容提炼进记忆**（关键！）
+      1. 归档 transcript —— 沉淀完才能删
       2. 空会话 / 很久没聊且内容极少的僵尸会话
-      3. 把过长的会话历史裁到最近若干条（对话记录，不是长期记忆）
-    长期记忆（文段）**只在这些都不够、且用户显式确认时才压缩**，
-    并且永远保留有内容的分区。
+      3. 把过长的会话历史裁到最近若干条（对话记录，不是记忆）
+    记忆本身（每个对话那一块 + 全局偏好）**永远不动**。
     """
     import os as _os
     from . import sessions as sm
@@ -985,6 +1007,7 @@ def memory_release(body: dict):
     scope = str((body or {}).get("scope") or "auto").lower()
     sid = str((body or {}).get("session_id") or "").strip()
     confirm_memory = bool((body or {}).get("confirm_memory"))
+    do_sweep = bool((body or {}).get("sweep", True))
     freed = 0
     detail = []
 
@@ -994,20 +1017,44 @@ def memory_release(body: dict):
         except Exception:
             return 0
 
-    # ---- 清空单个会话的历史上下文（长期记忆不受影响）----
+    # ---- 清空单个会话的历史上下文（记忆不受影响）----
     if scope == "session":
         if not sid:
             return {"ok": False, "reason": "未指定 session_id"}
+        # 删历史前也先沉淀一遍，否则这段对话里没被记下的要点就没了
+        swept = 0
+        if do_sweep:
+            try:
+                swept = _sweep_one(sid)
+            except Exception:
+                swept = 0
         before = _tsize(sm._path(sid))
         sm.save_messages(sid, [])
         after = _tsize(sm._path(sid))
+        msg = f"已清空该对话的 {_fmt_bytes(before)} 历史"
+        if swept:
+            msg += f"（先沉淀了 {swept} 条要点进记忆，不会丢）"
         return {"ok": True, "freed_bytes": max(0, before - after),
-                "detail": [f"已清空该对话的 {_fmt_bytes(before)} 历史（长期记忆保留）"],
-                "memory_intact": True}
+                "swept": swept, "detail": [msg], "memory_intact": True}
 
-    # ---- 1) 归档 transcript ----
+    # ---- 0) 沉淀：把归档里还没进记忆的重要内容提炼出来 ----
+    # 这一步是"释放不会丢重要信息"的关键。归档是提炼记忆的原始素材，
+    # 而自动提炼只在命中关键词或每 4 轮触发，所以直接删归档 =
+    # **把还没被记下的重要内容永久丢掉**。
+    swept_total = 0
+    if do_sweep and scope in ("auto", "caches"):
+        try:
+            known = {s.get("id") for s in sm.list_sessions()}
+            swept_total = _sweep_all(known_sids=known)
+        except Exception as e:
+            detail.append(f"沉淀归档时出错（已跳过，不会丢数据）：{e}")
+        if swept_total:
+            detail.append(f"先从归档里沉淀了 {swept_total} 条要点进记忆")
+
+    # ---- 1) 归档 transcript（沉淀之后才删）----
     if scope in ("auto", "caches"):
         if _os.path.isdir(memory.TRANSCRIPT_DIR):
+            n_del = 0
             for fn in _os.listdir(memory.TRANSCRIPT_DIR):
                 if not fn.endswith(".jsonl"):
                     continue
@@ -1015,10 +1062,11 @@ def memory_release(body: dict):
                 freed += _tsize(p)
                 try:
                     _os.remove(p)
+                    n_del += 1
                 except Exception:
                     pass
-            if freed:
-                detail.append(f"清理归档记录 {_fmt_bytes(freed)}")
+            if n_del:
+                detail.append(f"清理归档记录 {n_del} 个（已先沉淀要点）")
 
     # ---- 2) 僵尸会话（很久没聊且几乎没内容）----
     if scope in ("auto", "caches"):
@@ -1038,18 +1086,127 @@ def memory_release(body: dict):
             freed += max(0, before - _tsize(sm._path(sid2)))
             detail.append(f"「{(s.get('title') or '')[:12]}」历史裁到最近 {sm.KEEP_RECENT} 条")
 
-    # ---- 4) 长期记忆：仅在显式确认时压缩（且只丢空分区）----
-    if scope == "memory" and confirm_memory:
-        secs = memory.get_sections()
-        for s in secs:
-            if not (s.get("content") or "").strip():
-                memory.remove(s.get("id"))
-        detail.append("长期记忆：仅移除了空分区（有内容的分区一律保留）")
+    # ---- 4) 记忆本身：不参与释放 ----
+    # 记忆（每个对话那一块 + 全局偏好）是**全库里最该保住的东西**，
+    # 所以任何释放都明确不碰它。只有用户在界面上主动清空才会没。
+    detail.append("记忆（各对话记忆块 + 全局偏好）已完整保留")
+
+    # ---- 5) 短期记忆：可选释放（它是"缓存"性质的，长期记忆仍然保留）----
+    short_freed = 0
+    if scope == "short":
+        # 释放前先把归档沉淀一轮，否则短期记忆一清、对话里的结论就真没了
+        if do_sweep:
+            try:
+                swept_total += _sweep_all(
+                    known_sids={s.get("id") for s in sm.list_sessions()})
+            except Exception:
+                pass
+        r = memory.release("short")
+        short_freed = int(r.get("freed_chars") or 0)
+        detail.append(f"已释放全部短期记忆（{short_freed} 字）")
+        detail.append("长期记忆（身份/偏好/约定）已保留")
 
     return {"ok": True, "freed_bytes": freed,
+            "swept": swept_total, "short_freed_chars": short_freed,
             "detail": detail or ["没有需要释放的内容"],
             "memory_intact": True,
-            "hint": "对话记录已释放；长期记忆与偏好始终保留。"}
+            "hint": "短期记忆与缓存已释放；长期记忆（身份/偏好/约定）始终保留。"}
+
+
+# =====================================================================
+#  归档沉淀：把 transcript 里还没进记忆的重要内容提炼出来
+#  —— "释放不会丢重要信息"的关键保障
+# =====================================================================
+_SWEEP_MAX_SESSIONS = 8      # 单次释放最多沉淀几个对话，避免等太久
+_SWEEP_MIN_MSGS = 4          # 少于这么多条的归档不值得单独跑一次模型
+
+
+def _sweep_one(session: str, cfg: dict = None, model: str = None) -> int:
+    """把某个对话的归档沉淀进它的记忆，返回新增要点条数。
+
+    用一次轻量模型调用把归档里的稳定信息抽成要点，合并进该对话的记忆。
+    失败就返回 0（**宁可少记，也不能因为沉淀失败就把数据删了**）。
+    """
+    if not session:
+        return 0
+    msgs = memory.read_transcript(session, limit=120)
+    if len(msgs) < _SWEEP_MIN_MSGS:
+        return 0
+    cfg = cfg or config.load_config()
+    model = model or cfg.get("default_model")
+    convo = "\n".join(
+        f"{'用户' if m['role'] == 'user' else '助手'}：{str(m['content'])[:220]}"
+        for m in msgs[-60:])
+    prompt = (
+        "下面是一段历史对话。请提取其中值得记住的内容，"
+        "**这段对话记录马上就要被删除**，只保留你提取的要点。\n"
+        "· 要提取：用户透露的身份/偏好/约定、正在做的事、得出的结论、关键数据\n"
+        "· 不要提取：寒暄、一次性的提问、助手自己的解释性内容\n"
+        "· 输出格式（每行一条）：类别|要点\n"
+        "  类别只能二选一：\n"
+        "    长期 —— 换任何对话都成立（身份、姓名、职业、长期偏好、约定）\n"
+        "    短期 —— 只跟这件事有关（当前项目、本次结论、临时设定）\n"
+        "· 要点直接写事实（含名称/数字/技术栈），每条不超过 60 字\n"
+        "· 最多 6 条；确实没有值得留存的内容就只输出：无\n\n"
+        + convo
+    )
+    params = dict(cfg)
+    params["temperature"] = 0.2
+    params["max_tokens"] = 500      # num_ctx 必须与聊天一致（见 _auto_extract_memory）
+    resp = client.chat([{"role": "user", "content": prompt}], model=model,
+                       stream=False, params=params)
+    data = resp.json() if hasattr(resp, "json") else resp
+    text = ((data.get("message") or {}).get("content") or "").strip()
+    if not text or text.startswith("无"):
+        return 0
+    kept = 0
+    for line in text.splitlines():
+        line = line.strip().lstrip("-•* ").strip()
+        if not line or len(line) < 4:
+            continue
+        if "|" in line:
+            kind, val = line.split("|", 1)
+            kind, val = kind.strip(), val.strip()
+        else:
+            kind, val = "短期", line        # 模型没按格式来：按对话内容处理更安全
+        if not val:
+            continue
+        if "长期" in kind:
+            ok = memory.merge_long(val[:120])
+        else:
+            ok = memory.merge_short(session, val[:120])
+        if ok:
+            kept += 1
+        if kept >= 6:
+            break
+    return kept
+
+
+def _sweep_all(known_sids=None) -> int:
+    """对所有归档做一次沉淀。返回新增要点总数。
+
+    只处理"对话还在"的归档 —— 对话已删的归档没有记忆可挂，
+    提取出来也无处安放（那部分属于用户主动删除，本就该消失）。
+    """
+    import glob as _glob
+    total, done = 0, 0
+    try:
+        cfg = config.load_config()
+    except Exception:
+        return 0
+    for path in _glob.glob(os.path.join(memory.TRANSCRIPT_DIR, "*.jsonl")):
+        if done >= _SWEEP_MAX_SESSIONS:
+            break
+        sid = os.path.basename(path)[:-6]
+        if known_sids is not None and sid not in known_sids:
+            continue          # 对话已删，没必要再沉淀
+        try:
+            got = _sweep_one(sid, cfg)
+        except Exception:
+            got = 0
+        total += got
+        done += 1
+    return total
 
 
 def _fmt_bytes(n: int) -> str:
@@ -1060,35 +1217,11 @@ def _fmt_bytes(n: int) -> str:
         n /= 1024
 
 
-@app.post("/api/memory")
-def memory_add(body: dict):
-    title = (body.get("title") or "").strip()
-    content = (body.get("content") or "").strip()
-    if not content:
-        raise HTTPException(400, "记忆内容不能为空")
-    sec = memory.upsert(title, content)
-    return {"ok": True, "section": sec}
-
-
-@app.put("/api/memory/{sid}")
-def memory_update(sid: str, body: dict):
-    sec = memory.update(sid, title=body.get("title"), content=body.get("content"))
-    if not sec:
-        raise HTTPException(404, "记忆文段不存在")
-    return {"ok": True, "section": sec}
-
-
 @app.delete("/api/memory/{sid}")
-def memory_delete(sid: str):
-    if not memory.remove(sid):
-        raise HTTPException(404, "记忆文段不存在")
-    return {"ok": True}
-
-
-@app.delete("/api/memory")
-def memory_clear_all():
-    memory.clear()
-    return {"ok": True}
+def memory_delete_by_sid(sid: str):
+    """按对话删除记忆（对话被删时也会自动调到这里）。"""
+    memory.delete_short(sid)
+    return {"ok": True, "session_id": sid}
 
 
 # ---------- 知识库 AI API ----------
@@ -1258,11 +1391,37 @@ def t2i_unload():
 
 
 # ---------- 多会话管理 ----------
+_legacy_migrated = False
+
+
+def _migrate_memory_once(active_sid: str) -> None:
+    """把老的"多分区"记忆搬进当前对话（只做一次）。
+
+    记忆从"全局多分区"改成了"每个对话一块"，老数据必须搬过去，不能丢。
+    放在这里而不是模块导入时执行，是因为迁移需要知道"搬给哪个对话"，
+    而默认对话是第一次调 /api/sessions 才建出来的。
+    """
+    global _legacy_migrated
+    if _legacy_migrated:
+        return
+    _legacy_migrated = True
+    try:
+        r = memory.migrate_legacy(active_sid)
+        if r.get("migrated"):
+            print(f"[memory] 老记忆已迁移：长期 {r.get('long', 0)} 条 / "
+                  f"短期 {r.get('short', 0)} 条")
+    except Exception as e:
+        print(f"[memory] 旧记忆迁移失败（不影响使用）：{e}")
+
+
 @app.get("/api/sessions")
 def session_list():
     """列出所有会话（按最近更新倒序）。首次调用会自动创建一个默认会话。"""
     sessions.ensure_default()
-    return {"ok": True, "sessions": sessions.list_sessions()}
+    items = sessions.list_sessions()
+    if items:
+        _migrate_memory_once(items[0].get("id") or "")
+    return {"ok": True, "sessions": items}
 
 
 @app.post("/api/sessions")
@@ -1293,7 +1452,9 @@ def session_rename(sid: str, body: dict):
 
 @app.delete("/api/sessions/{sid}")
 def session_delete(sid: str):
+    # 记忆按对话隔离，对话没了它的记忆也没必要留着（否则会攒一堆孤儿记忆）
     sessions.delete(sid)
+    memory.delete_short(sid)
     return {"ok": True}
 
 
@@ -1356,7 +1517,7 @@ def library_delete(iid: str):
     return {"ok": True}
 
 
-# ---------- 语音输入（唤醒词「西派西派」+ 离线流式识别）----------
+# ---------- 语音输入（唤醒词「小千小千」+ 离线流式识别）----------
 _voice_clients: set = set()
 _voice_loop = None
 

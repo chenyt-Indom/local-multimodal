@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Ollama 本地 API 客户端。
-完全本地运行：仅与 http://localhost:11434 通信，不走公网、数据不出机。
+完全本地运行：仅与 http://127.0.0.1:11434 通信，不走公网、数据不出机。
 """
 import base64
 import io
