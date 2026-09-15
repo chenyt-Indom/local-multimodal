@@ -483,6 +483,122 @@
     if (rf) rf.onclick = loadKb;
   })();
 
+  // ---------- 生成文库（模型产出的文件）----------
+  // 刻意和知识库分开：知识库是用户的资料、只读；这里是模型的产出，可改可删可导出。
+  let dlCurrent = "";
+
+  async function loadDoclib(highlight) {
+    const list = $("#dlList");
+    if (!list) return;
+    if (highlight) dlCurrent = highlight;
+    let d;
+    try {
+      d = await api("/api/doclib/files");
+    } catch (e) {
+      list.innerHTML = '<div class="hint">读取失败：' + escapeHtml(String(e.message || e)) + "</div>";
+      return;
+    }
+    const files = d.files || [];
+    if (!files.length) {
+      list.innerHTML = '<div class="hint">还没有文件。让模型「把这篇作文写成文档」' +
+        '或者「给我一个 Python 模块」，它就会存到这里。</div>';
+      return;
+    }
+    list.innerHTML = files.map((f) => {
+      const icon = /\\.(docx)$/i.test(f.name) ? "📄"
+        : /\\.(md|markdown)$/i.test(f.name) ? "📝"
+        : /\\.(py|js|ts|java|c|cpp|go|rs|sh|bat|ps1)$/i.test(f.name) ? "💻"
+        : /\\.(json|csv|yml|yaml|ini)$/i.test(f.name) ? "🗂" : "📃";
+      return `<div class="list-item dl-item${f.rel === dlCurrent ? " active" : ""}" data-rel="${escapeHtml(f.rel)}">` +
+        `<span class="dl-icon">${icon}</span>` +
+        `<span class="dl-name" title="${escapeHtml(f.rel)}">${escapeHtml(f.name)}</span>` +
+        `<span class="dl-meta">${escapeHtml(f.modified)} · ${(f.size / 1024).toFixed(1)}KB</span></div>`;
+    }).join("");
+    list.querySelectorAll(".dl-item").forEach((el) => {
+      el.onclick = () => openDoclibFile(el.dataset.rel);
+    });
+  }
+
+  async function openDoclibFile(rel) {
+    dlCurrent = rel;
+    let d;
+    try {
+      d = await api("/api/doclib/file?rel=" + encodeURIComponent(rel));
+    } catch (e) {
+      // docx 这类二进制文件读不出文本是正常的，给一条能走的出路
+      showToast("这个文件读不出正文（可能是 Word/表格这类）。可以直接下载或导出。", "warn");
+      return;
+    }
+    $("#dlEditor").hidden = false;
+    $("#dlEditorName").textContent = d.rel + "（" + (d.chars || 0) + " 字）";
+    $("#dlText").value = d.text || "";
+    document.querySelectorAll(".dl-item").forEach((el) =>
+      el.classList.toggle("active", el.dataset.rel === rel));
+  }
+
+  (function bindDoclibPanel() {
+    const wrap = $("#doclibPanel");
+    if (!wrap) return;
+    const open = $("#dlOpenFolder");
+    if (open) open.onclick = () =>
+      openFolderRequest("/api/doclib/open_folder", { method: "POST" });
+    const rf = $("#dlRefresh");
+    if (rf) rf.onclick = () => loadDoclib();
+    const bk = $("#dlBackup");
+    if (bk) bk.onclick = async () => {
+      try {
+        const r = await api("/api/doclib/backup", { method: "POST" });
+        showToast(`已备份 ${r.count} 个文件到 ${r.path}`, "ok");
+      } catch (e) { showToast("备份失败：" + String(e.message || e), "warn"); }
+    };
+    const close = $("#dlCloseBtn");
+    if (close) close.onclick = () => { $("#dlEditor").hidden = true; dlCurrent = ""; };
+    const save = $("#dlSaveBtn");
+    if (save) save.onclick = async () => {
+      if (!dlCurrent) return;
+      try {
+        await api("/api/doclib/file", { method: "POST",
+          body: JSON.stringify({ rel: dlCurrent, text: $("#dlText").value }) });
+        showToast("已保存（原内容自动备份）", "ok");
+        loadDoclib();
+      } catch (e) { showToast("保存失败：" + String(e.message || e), "warn"); }
+    };
+    const docx = $("#dlDocxBtn");
+    if (docx) docx.onclick = async () => {
+      if (!dlCurrent) return;
+      docx.disabled = true;
+      try {
+        // 先把当前编辑框的内容存下来，再导出 —— 否则导出的还是旧版本
+        await api("/api/doclib/file", { method: "POST",
+          body: JSON.stringify({ rel: dlCurrent, text: $("#dlText").value }) });
+        const r = await api("/api/doclib/export_docx", { method: "POST",
+          body: JSON.stringify({ rel: dlCurrent }) });
+        showToast("已导出：" + r.rel + "（WPS / Word 都能打开）", "ok");
+        loadDoclib(r.rel);
+      } catch (e) { showToast("导出失败：" + String(e.message || e), "warn"); }
+      finally { docx.disabled = false; }
+    };
+    const dl = $("#dlDownload");
+    if (dl) dl.onclick = () => {
+      if (!dlCurrent) return;
+      window.open("/api/doclib/download?rel=" + encodeURIComponent(dlCurrent), "_blank");
+    };
+    const del = $("#dlDelBtn");
+    if (del) del.onclick = async () => {
+      if (!dlCurrent) return;
+      if (!confirm("删除《" + dlCurrent + "》？\n（会移进回收站，需要时能捞回来）")) return;
+      try {
+        await api("/api/doclib/delete", { method: "POST",
+          body: JSON.stringify({ rel: dlCurrent }) });
+        showToast("已删除（在回收站里）", "ok");
+        $("#dlEditor").hidden = true;
+        dlCurrent = "";
+        loadDoclib();
+      } catch (e) { showToast("删除失败：" + String(e.message || e), "warn"); }
+    };
+  })();
+
+
   // ---------- 多会话管理 ----------
   // 每个会话互相独立（各自的消息与上下文），全部持久化在后端，
   // 程序重启后自动恢复上次使用的会话。
@@ -1296,6 +1412,64 @@
       layer.querySelector('[data-act="deny"]').onclick = () => answer(false);
       layer.querySelector('[data-act="allow"]').onclick = () => answer(true);
     };
+
+    // 问答框：材料不足时模型可以在这里问细节。用户填完它接着做，
+    // 不用把需求重新描述一遍 —— 这是"写得像你要的"和"瞎猜一篇"的区别。
+    const showAskDialog = (ui) => {
+      if (document.querySelector(".ask-layer")) return;
+      const qs = ui.questions || [];
+      if (!qs.length) return;
+      const layer = document.createElement("div");
+      layer.className = "confirm-layer ask-layer";
+      layer.innerHTML =
+        '<div class="confirm-box">' +
+        '<div class="confirm-title">💬 想先跟你确认几个细节</div>' +
+        '<div class="confirm-reason">补充下面的信息，写出来才贴你的要求。不想答的直接留空跳过。</div>' +
+        '<div class="ask-list"></div>' +
+        '<div class="confirm-btns">' +
+        '<button class="btn ghost" data-act="skip">跳过，按你的理解写</button>' +
+        '<button class="btn primary" data-act="send">提交，继续</button></div></div>';
+      const list = layer.querySelector(".ask-list");
+      const items = [];
+      qs.forEach((q, i) => {
+        const box = document.createElement("div");
+        box.className = "ask-item";
+        const type = q.multi ? "checkbox" : "radio";
+        const opts = (q.options || []).map((o) =>
+          `<label class="ask-opt"><input type="${type}" name="ask${i}" value="${escapeHtml(o)}">` +
+          `<span>${escapeHtml(o)}</span></label>`).join("");
+        box.innerHTML = `<div class="ask-q">${i + 1}. ${escapeHtml(q.question)}</div>` +
+          (opts ? `<div class="ask-opts">${opts}</div>` : "") +
+          `<input class="ask-free" type="text" placeholder="${opts ? "也可以自己写…" : "在这里回答"}" />`;
+        list.appendChild(box);
+        items.push(box);
+      });
+      document.body.appendChild(layer);
+
+      const finish = async (skip) => {
+        layer.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+        const answers = [];
+        items.forEach((box, i) => {
+          const checked = [...box.querySelectorAll("input[type=radio]:checked, input[type=checkbox]:checked")]
+            .map((el) => el.value);
+          const free = (box.querySelector(".ask-free").value || "").trim();
+          const merged = [checked.join("、"), free].filter(Boolean).join("；");
+          answers.push({ question: qs[i].question, answer: skip ? "" : merged });
+        });
+        try {
+          await api("/api/tool/answer", {
+            method: "POST", body: JSON.stringify({ id: ui.id, answers }) });
+          showToast(skip ? "已跳过，让它自己决定" : "已提交，它继续写", skip ? "" : "ok");
+        } catch (e) {
+          showToast("提交失败：" + String(e.message || e), "warn");
+        } finally {
+          layer.remove();
+        }
+      };
+      layer.querySelector('[data-act="skip"]').onclick = () => finish(true);
+      layer.querySelector('[data-act="send"]').onclick = () => finish(false);
+      layer.querySelector(".ask-free") && layer.querySelector(".ask-free").focus();
+    };
     const addMedia = (ui) => {
       const isWeb = ui.origin === "web";
       const card = document.createElement("div");
@@ -1403,6 +1577,11 @@
           if (obj.ui) {
             if (obj.ui.type === "sources") sourcesData = obj.ui;   // 稍后在回答下方渲染
             else if (obj.ui.type === "confirm") showConfirm(obj.ui);
+            else if (obj.ui.type === "ask") showAskDialog(obj.ui);
+            else if (obj.ui.type === "library") {
+              // 模型动了生成文库 → 面板跟着刷新，让用户马上看到结果
+              if (typeof loadDoclib === "function") loadDoclib(obj.ui.rel);
+            }
             else if (obj.ui.type === "code") {
               answerWrap.appendChild(makeCodeCard(obj.ui));
               messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -1740,6 +1919,7 @@
   loadToggles();
   loadMemory();
   loadKb();
+  loadDoclib();
   loadLibrary();
   loadDevice();
   setInterval(refreshHealth, 5000);

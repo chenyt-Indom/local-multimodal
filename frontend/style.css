@@ -723,3 +723,48 @@ body.dragging .drop-overlay,
 .confirm-tip { margin-top: 10px; font-size: 12px; color: var(--muted); }
 .confirm-btns { margin-top: 14px; display: flex; gap: 10px; justify-content: flex-end; }
 .confirm-btns .btn { width: auto; margin: 0; padding: 8px 16px; }
+
+/* ---------- 问答框（模型追问细节）---------- */
+.ask-list { margin-top: 12px; display: flex; flex-direction: column; gap: 14px; max-height: 52vh; overflow: auto; }
+.ask-item {
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 12px; background: var(--panel2);
+}
+.ask-q { font-size: 13px; color: var(--text); font-weight: 600; }
+.ask-opts { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px; }
+.ask-opt {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text);
+  border: 1px solid var(--border); border-radius: 999px; padding: 4px 10px; cursor: pointer;
+}
+.ask-opt:hover { background: rgba(79,139,249,.12); border-color: rgba(79,139,249,.45); }
+.ask-free {
+  margin-top: 8px; width: 100%; padding: 7px 10px; border-radius: 8px;
+  border: 1px solid var(--border); background: #0f1218; color: var(--text);
+  font-size: 12.5px; outline: none;
+}
+.ask-free:focus { border-color: var(--accent); }
+
+/* ---------- 生成文库面板 ---------- */
+.dl-list { display: flex; flex-direction: column; gap: 4px; }
+.dl-item {
+  display: flex; align-items: center; gap: 8px; padding: 7px 9px; border-radius: 8px;
+  cursor: pointer; border: 1px solid transparent;
+}
+.dl-item:hover { background: var(--panel2); }
+.dl-item.active { background: rgba(79,139,249,.14); border-color: rgba(79,139,249,.4); }
+.dl-icon { flex: none; }
+.dl-name {
+  flex: 1; min-width: 0; font-size: 12.5px; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dl-meta { flex: none; font-size: 11px; color: var(--muted); }
+.dl-editor { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 10px; }
+.dl-editor-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.dl-editor-name { font-size: 12px; color: var(--accent); font-weight: 600; }
+#dlText {
+  width: 100%; height: 220px; resize: vertical; padding: 10px; border-radius: 8px;
+  border: 1px solid var(--border); background: #0f1218; color: var(--text);
+  font-family: Consolas, "Microsoft YaHei", monospace;
+  font-size: 12.5px; line-height: 1.6; outline: none;
+}
+#dlText:focus { border-color: var(--accent); }

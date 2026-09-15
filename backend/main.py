@@ -21,7 +21,7 @@ import asyncio
 import datetime
 import threading
 from . import (config, ollama_client, memory, kb, file_tools, video, web_tools,
-               t2i, tools, voice, sessions, image_library)
+               t2i, tools, voice, sessions, image_library, doclib, docx_write)
 
 app = FastAPI(title="本地多模态助手", version="1.0.0")
 client = ollama_client.OllamaClient()
@@ -100,6 +100,10 @@ SIMPLE_MAX_TOKENS = 512
 # 联网场景的生成长度下限：要把搜索结果喂给模型 + 让它逐条列出来源链接，
 # token 消耗远高于普通问答。给少了就会出现"搜索完了但没输出回答"。
 WEB_MAX_TOKENS = 4096
+# 长文创作（作文/方案/报告）的输出上限。
+# 这类任务要真写出几百上千字，还要留足"思考"的额度 —— 4096 实测经常写不完，
+# 而且这一轮已经把用不到的工具 schema 砍掉了，腾出的空间正好给它。
+WRITING_MAX_TOKENS = 6144
 
 # 输出长度天花板：空回答重试时加倍，但不能无限涨
 # （上下文窗口还要留给提示词与历史，超出只会让 Ollama 截断提示词）
@@ -377,6 +381,17 @@ _EXTRACT_PROMPT = """你是"用户档案整理员"。阅读下面的对话，挑
 · 目标计划：想学什么、打算做什么、正在准备什么、答应过要做的事
 · 目标进展：之前提过的目标/计划有了新进展（做完了、没做成、改主意了、放弃了）
 
+【必须推断的意图】（用户**没有明说**、但从提问方式能看出来的 —— 这一类最容易被漏掉）
+· 「我能不能 / 可不可以 / 值不值得 / 适不适合 / 要不要 …」→ 用户正在**权衡**这件事
+· 「怎么才能 … / 需要什么条件 / 要准备什么 / 难不难」而且说的是他自己 → 有**行动意向**
+· 同一话题反复追问、或问完又问细节 → 这是他的**长期关注点**
+· 写进记忆时**必须以「（推断）」开头**，让人一眼看出这是推出来的、不是他说的。
+  例：用户问「自考本科怎么样？我未来可不可以去考？」
+  → `长期|（推断）用户在考虑通过自考提升学历，正在权衡要不要报考`
+· **不要**推断的：纯客观知识提问（「什么是…」「…的历史」「…分几类」）、
+  一次性查资料；也**不要替他把话说满** —— 他说"在考虑"就记"在考虑"，
+  别记成"决定要考"（推断过头会让后面的对话全跑偏）
+
 【绝对不要提取】
 · 寒暄闲聊（你好、谢谢、哈哈）和临时指令（"再短一点""换个说法"）
 · 一次性的具体提问（"帮我查天气""这段代码哪错了"）
@@ -487,7 +502,9 @@ def _apply_extract(text: str, session: str, limit: int = 4) -> int:
             continue
         parts = _split_extract_line(line)
         verb = parts[0].strip().strip("【】[]（）() ")
-        rest = [p.strip().strip("【】[]（）() ") for p in parts[1:]]
+        # ⚠️ 值里**不要**剥掉圆括号 —— 「（推断）用户…」这种标记是内容的一部分，
+        # 剥了用户就看不出这条是推出来的（踩过：存进去变成「推断）用户…」）
+        rest = [p.strip().strip("【】[]|｜ ") for p in parts[1:]]
         kind = ""
         if rest and (rest[0] in _KIND_LONG or rest[0] in _KIND_SHORT):
             kind = rest.pop(0)          # 容忍 "更新|长期|旧|新" 这种多写一层的写法
@@ -558,6 +575,11 @@ FRONTEND_DIR = config.res("frontend")
 class ToolConfirmRequest(BaseModel):
     id: str
     allow: bool = False
+
+
+class ToolAnswerRequest(BaseModel):
+    id: str
+    answers: list = []
 
 
 class CodeRunRequest(BaseModel):
@@ -827,7 +849,9 @@ MAX_TOOL_ROUNDS = 10  # 单次对话内最多连续调用工具轮次，防止�
 # 121 秒后 done_reason=length、正文一个字都没有；3 道题只过 1 道。
 # qwen2.5-coder 是**非思考型**的代码专用模型，不存在这个问题。
 #
-# 路由是**按轮**的：这一轮像写代码就用代码模型，下一轮闲聊自动回到视觉模型。
+# 路由是**按轮**的：这一轮要写代码或写长文就用专用模型，下一轮闲聊自动回到视觉模型。
+# （2026-09-15 扩展：原来只管代码。实测「写一篇小作文」这类长文生成会让默认模型
+#   思考吃光额度、正文为空、请求挂 10 分钟以上，所以长文创作也走这里。）
 # 代价是切换模型要重新加载（12GB 显存放不下两个模型），所以只在真需要时才切。
 _CODE_HINTS = (
     "写代码", "代码", "脚本", "函数", "程序", "报错", "bug", "调试", "跑一下",
@@ -835,6 +859,18 @@ _CODE_HINTS = (
     "python", "javascript", "typescript", "java", "c++", "c#", "golang", "rust",
     "html", "css", "shell", "bash", "bat", "powershell", "json", "api",
     "帮我实现", "实现一个", "写一段", "写个", "单元测试", "帮我改这段",
+)
+
+# 长文创作类请求：这些任务**必须一次写出几百上千字**，
+# 默认的思考型模型会把输出额度全烧在思考上（实测两次重试都是空正文、请求挂 10 分钟以上），
+# 交给非思考型模型才稳。短问答不要走这里（没必要，还慢）。
+_WRITING_HINTS = (
+    "写一篇", "写篇", "写一段", "写个作文", "作文", "文章", "短文", "长文",
+    "演讲稿", "发言稿", "致辞", "倡议书", "读后感", "观后感", "心得体会",
+    "工作总结", "实践报告", "调研报告", "开题报告", "毕业论文", "论文",
+    "策划书", "方案", "企划", "文案", "宣传稿", "新闻稿", "通讯稿",
+    "简历", "自荐信", "求职信", "自我介绍稿", "检讨书", "申请书",
+    "帮我写", "替我写", "拟一篇", "拟一份", "起草",
 )
 
 _model_tags_cache = {"t": 0.0, "names": set()}
@@ -872,6 +908,25 @@ def _is_code_task(text: str) -> bool:
     return any(k in t for k in _CODE_HINTS)
 
 
+def _is_writing_task(text: str) -> bool:
+    """是不是"要写一整篇东西"（而不是问一句答一句）。"""
+    t = (text or "")
+    if not t or len(t) < 6:
+        return False
+    return any(k in t for k in _WRITING_HINTS)
+
+
+def _needs_task_model(text: str) -> bool:
+    """要不要换用"专用模型"（非思考型）。
+
+    ⚠️ **长文创作不算在内**（试过，更糟）：换成 qwen2.5-coder 之后确实不出空答案了，
+    但它是代码模型，多轮里会跑偏 —— 把工具调用当 JSON 文本吐出来、
+    话题漂到无关内容（让它写作文，它导出了一份"Python 网络请求示例"）。
+    长文创作改走"砍工具 + 加额度"的路子（见 _writing_tools），用回默认模型。
+    """
+    return _is_code_task(text)
+
+
 def _route_code_model(cfg: dict, text: str, fallback: str):
     """代码类请求换用专用代码模型，返回 (模型名, 给用户看的提示)。"""
     if not cfg.get("code_auto_route", True):
@@ -879,12 +934,12 @@ def _route_code_model(cfg: dict, text: str, fallback: str):
     want = str(cfg.get("code_model") or "").strip()
     if not want or want == fallback:
         return fallback, ""
-    if not _is_code_task(text):
+    if not _needs_task_model(text):
         return fallback, ""
     if want not in _installed_models():
         # 还没下载 → 静默用回默认模型。配置名留着，用户下载后自动生效，不用改设置。
         return fallback, ""
-    return want, "已切到代码模型 %s（专用代码模型，不思考、写代码更稳）" % want
+    return want, "已切到专用模型 %s（写代码：它不思考，不会把输出额度烧在思考上）" % want
 
 
 # =====================================================================
@@ -894,30 +949,47 @@ def _route_code_model(cfg: dict, text: str, fallback: str):
 # 难点在于：工具是跑在线程池里的（阻塞），而弹窗必须**立刻**出现在网页上。
 # 做法：把事件塞进一个异步队列（流式生成器边跑边吐出去），
 # 然后**阻塞那个工作线程**，等 /api/tool/confirm 把用户的选择写回来。
-_confirm_pending: dict = {}
-_confirm_lock = threading.Lock()
+def _dict_ui_channel(pair) -> dict:
+    confirm, ask = pair
+    return {"confirm": confirm, "ask": ask}
+
+_ui_pending: dict = {}
+_ui_lock = threading.Lock()
 
 
-def _make_confirmer(loop, live_ui, timeout: float = 900.0):
-    """生成一个 confirm(payload) -> bool 的通道，交给工具用。"""
+def _make_ui_channel(loop, live_ui, timeout: float = 900.0):
+    """生成"问用户"的两个通道：confirm（危险操作确认）与 ask（追问细节）。
 
-    def confirm(payload: dict) -> bool:
-        cid = "cf-" + os.urandom(5).hex()
-        item = {"event": threading.Event(), "allow": False}
-        with _confirm_lock:
-            _confirm_pending[cid] = item
+    ⚠️ 为什么非得这么绕：工具跑在线程池里（阻塞），而弹窗必须**立刻**出现在网页上。
+    做法是把事件 `call_soon_threadsafe` 塞进一个异步队列（流式生成器边跑边吐），
+    然后**阻塞那个工作线程**，等 HTTP 端点把用户的选择/回答写回来。
+    """
+
+    def _request(kind: str, payload: dict):
+        cid = ("cf-" if kind == "confirm" else "ak-") + os.urandom(5).hex()
+        item = {"event": threading.Event(), "allow": False, "answers": None}
+        with _ui_lock:
+            _ui_pending[cid] = item
         try:
-            msg = {"type": "confirm", "id": cid}
+            msg = {"type": kind, "id": cid}
             msg.update(dict(payload or {}))
             loop.call_soon_threadsafe(live_ui.put_nowait, msg)
             if not item["event"].wait(timeout):
-                return False          # 用户一直没回应 → 当拒绝处理
-            return bool(item["allow"])
+                return None            # 用户一直没回应
+            return item
         finally:
-            with _confirm_lock:
-                _confirm_pending.pop(cid, None)
+            with _ui_lock:
+                _ui_pending.pop(cid, None)
 
-    return confirm
+    def confirm(payload: dict) -> bool:
+        item = _request("confirm", payload)
+        return bool(item and item.get("allow"))
+
+    def ask(payload: dict) -> list:
+        item = _request("ask", payload)
+        return list(((item or {}).get("answers")) or [])
+
+    return confirm, ask
 
 
 class _SystemPrompt:
@@ -1179,9 +1251,38 @@ async def chat(req: ChatRequest):
             "- 拿到的输出是真实结果，请依据它作答；如果代码报错，先说明错在哪、"
             "给出修正后的代码并**再跑一次**。\n"
             "- 回答里保留代码（用户要的是代码），但结论必须来自真实运行结果。")
+    # 创作类任务（作文/方案/报告）与生成文库的用法
+    sys_prompt += (
+        "\n\n【写作文 / 拟方案 / 写报告这类创作任务】\n"
+        "- **信息不够就先问**：如果用户没说清【用途、给谁看、字数、文体、"
+        "要突出的重点、时间或背景】，**必须调用 ask_user 工具**问 2~4 个关键问题再动笔"
+        "（要弹问答框，**不要在回答里用文字问**）—— 这比硬猜一篇强得多。"
+        "**已经说清楚了就别问**，直接写。\n"
+        "- 拿到补充信息后**直接开始写正文**，不要再说「好的我这就写」之类的话，也不要重复问。\n"
+        "- 写法：标题 + 小标题 + 段落，**篇幅要够**（没指定字数时一般 800 字以上），"
+        "多用具体细节和例子，别写空话套话。\n"
+        "- 用户**明确要文件**时（「写成文档」「给我一个 Python 模块」「导出成 Word」"
+        "「保存到文件」）→ 用 library 工具写进**生成文库**，并告诉他存哪了。\n"
+        "- 只是让你「写一篇作文 / 拟个方案」→ **直接写在回答里**，不要自作主张建文件。\n"
+        "- ⚠️ 用户说「**把这篇 / 刚才那篇**存起来、导出」时，content 必须是**你上一轮写的正文原文**，"
+        "**完整复制过去** —— 不许只写摘要、不许留占位符（如「（在此粘贴正文）」）、不许自己另编一版。"
+        "存完如实告诉用户存了哪个文件、多少字。\n"
+        "- ⚠️ 描述文件内容时**只能说你真正写进去的东西**，别编造章节、页数或里边根本没有的内容。\n"
+        "- ⚠️ **知识库是用户的资料，只能读、绝不能改**；凡是要写文件一律进生成文库。"
+        "两者用途完全不同，不要混为一谈。\n"
+        "- 用户要「WPS 格式 / Word 文档」→ 先写进文库，再用 library 的 export_docx 转成 .docx"
+        "（WPS 能直接打开）。旧的 .wps 是私有二进制格式，写不了，要跟他说明这一点。")
+    # 长文创作（作文/方案/报告…）：这一轮只需要"问细节"和"存文件"两个工具，
+    # 其余 schema 全砍掉，把省下的额度让给正文；同时把输出上限提上去。
+    # 为什么要这么绕：默认模型是思考型的，18 个工具的 schema（约 5800 token）
+    # 加上思考，会把 num_ctx 挤到写不下几百字的正文，表现就是"想完什么都没写"。
+    writing_mode = bool(_is_writing_task(last_user)) and not images and not _recent_image()
+    if writing_mode:
+        cfg["max_tokens"] = max(int(cfg.get("max_tokens") or 2048), WRITING_MAX_TOKENS)
     tool_schemas = tools.make_schemas(cfg.get("web_enabled", False),
                                       cfg.get("rag_enabled", False),
-                                      cfg.get("code_exec_enabled", False))
+                                      cfg.get("code_exec_enabled", False),
+                                      writing=writing_mode)
 
     # ---------- 上下文预算：按剩余空间裁剪历史 ----------
     # 工具定义本身就有 3000~4500 token，系统提示约 1000；
@@ -1314,7 +1415,8 @@ async def chat(req: ChatRequest):
             ctx = {"images": images or _recent_image(), "shown_images": [],
                    "session": session,
                    # 危险操作（删文件、起进程、联网…）先问用户，批准了再执行
-                   "confirm": _make_confirmer(loop, live_ui)}
+                   # ask：材料不足时弹出问答框向用户追问细节
+                   **_dict_ui_channel(_make_ui_channel(loop, live_ui))}
 
             # 先把本轮所有工具调用解析出来，并逐个通知前端"开始执行"
             calls = []
@@ -1413,14 +1515,107 @@ def tool_confirm(req: ToolConfirmRequest):
 
     工具线程正阻塞等待这个结果，所以这里必须**立即**返回，不能有任何耗时操作。
     """
-    with _confirm_lock:
-        item = _confirm_pending.get(req.id)
+    with _ui_lock:
+        item = _ui_pending.get(req.id)
     if not item:
         raise HTTPException(status_code=404,
                             detail="这个确认请求已经失效或超时了，请让模型重新发起")
     item["allow"] = bool(req.allow)
     item["event"].set()
     return {"ok": True, "allow": bool(req.allow)}
+
+
+@app.post("/api/tool/answer")
+def tool_answer(req: ToolAnswerRequest):
+    """问答框的回答（模型问细节时用）。answers 可以直接是字符串列表。"""
+    with _ui_lock:
+        item = _ui_pending.get(req.id)
+    if not item:
+        raise HTTPException(status_code=404,
+                            detail="这个提问已经失效或超时了，请让模型重新发起")
+    item["answers"] = [dict(a) if isinstance(a, dict) else {"answer": str(a)}
+                       for a in (req.answers or [])]
+    item["event"].set()
+    return {"ok": True, "count": len(item["answers"])}
+
+
+# =====================================================================
+#  生成文库（模型产出物；与只读的知识库分开）
+# =====================================================================
+@app.get("/api/doclib/files")
+def library_files():
+    return {"ok": True, "files": doclib.list_files(), "stats": doclib.stats()}
+
+
+@app.get("/api/doclib/file")
+def library_read(rel: str):
+    r = doclib.read_file(rel)
+    if not r.get("ok"):
+        raise HTTPException(status_code=404, detail=r.get("error") or "读取失败")
+    return r
+
+
+@app.post("/api/doclib/file")
+def library_write(body: dict):
+    """前端编辑后保存（用户在界面上改的，不弹确认）。"""
+    rel = str((body or {}).get("rel") or "").strip()
+    r = doclib.write_file(rel, str((body or {}).get("text") or ""))
+    if not r.get("ok"):
+        raise HTTPException(status_code=400, detail=r.get("error") or "保存失败")
+    return r
+
+
+@app.post("/api/doclib/delete")
+def library_delete(body: dict):
+    r = doclib.delete_file(str((body or {}).get("rel") or "").strip())
+    if not r.get("ok"):
+        raise HTTPException(status_code=400, detail=r.get("error") or "删除失败")
+    return r
+
+
+@app.post("/api/doclib/export_docx")
+def library_export_docx(body: dict):
+    """把文库里的文本转成 Word（.docx）——WPS / Word 都能直接打开。"""
+    rel = str((body or {}).get("rel") or "").strip()
+    rd = doclib.read_file(rel)
+    if not rd.get("ok"):
+        raise HTTPException(status_code=404, detail=rd.get("error") or "读取失败")
+    base = rd["rel"]
+    out = re.sub(r"\.(md|markdown|txt|text)$", "", base, flags=re.I) + ".docx"
+    if out == base:
+        out = base + ".docx"
+    data = docx_write.text_to_docx(rd.get("text") or "",
+                                   title=os.path.splitext(os.path.basename(base))[0])
+    w = doclib.save_bytes(out, data)
+    if not w.get("ok"):
+        raise HTTPException(status_code=400, detail=w.get("error") or "导出失败")
+    return {"ok": True, "rel": out, "bytes": w.get("bytes", 0)}
+
+
+@app.post("/api/doclib/backup")
+def library_backup():
+    r = doclib.backup_all()
+    if not r.get("ok"):
+        raise HTTPException(status_code=400, detail=r.get("error") or "备份失败")
+    return r
+
+
+@app.get("/api/doclib/download")
+def library_download(rel: str):
+    path = doclib.file_path(rel)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return FileResponse(path, filename=os.path.basename(path),
+                        media_type="application/octet-stream")
+
+
+@app.post("/api/doclib/open_folder")
+def library_open_folder():
+    """在资源管理器里打开生成文库目录（容器里由宿主机小助手代劳）。"""
+    return _open_folder_impl(doclib.ensure_dir())
+
+
+@app.post("/api/chat/stop")
 
 
 @app.post("/api/code/run")

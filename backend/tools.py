@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 import os
+import re
 import sys
 import time
 import glob
@@ -21,20 +22,33 @@ import urllib.parse
 from . import t2i
 from . import file_tools
 from . import memory as memory_mod
+from . import doclib as library_mod
+from . import docx_write
 
 
 # =====================================================================
 #  工具 Schema（发给模型）
 # =====================================================================
 def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
-                 code_exec: bool = False) -> list:
+                 code_exec: bool = False, writing: bool = False) -> list:
     """返回工具 schema 列表。
 
     web_enabled=True 时才暴露联网搜索工具——保证"开关不开不联网"的约定：
     关着的时候模型连工具都看不到，自然不会去联网。
     kb_enabled 同理：关着就不给知识库工具。
     code_exec 同理：关着就不给"本地跑代码"的工具（默认关，避免模型擅自执行代码）。
+
+    writing=True 是**长文创作**场景，只给最必要的几个工具（见下面）。
     """
+    if writing:
+        # 写作文/方案这类任务只需要「问细节」和「存文件」，
+        # 其余工具（画图、搜图、文件系统、跑代码…）这轮根本用不上。
+        # 砍掉它们的收益很实在：18 个工具的 schema ≈ 5800 token，
+        # 而长文生成既要思考又要写几百上千字，额度本来就很紧张。
+        picked = [_ASK_USER_SCHEMA, _LIBRARY_SCHEMA]
+        if kb_enabled:
+            picked.insert(0, _KB_SCHEMA)      # 写东西时查用户资料是常见需求
+        return picked
     schemas = [
         {
             "type": "function",
@@ -238,6 +252,8 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
     ]
     # 知识库工具只在「知识库」开关打开时暴露 —— 与联网同样的约定：
     # 开关关着，模型连工具都看不到，自然就不会去翻资料。
+    schemas.append(_LIBRARY_SCHEMA)
+    schemas.append(_ASK_USER_SCHEMA)
     if kb_enabled:
         schemas.append(_KB_SCHEMA)
     if code_exec:
@@ -309,6 +325,90 @@ def _run_py_schema() -> dict:
             },
         },
     }
+
+
+# ---------- 生成文库（模型自己的产出物）----------
+# 和知识库**严格分开**：知识库是用户的资料、只读；这里是模型产出、可读可写可删。
+_LIBRARY_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "library",
+        "description": (
+            "【生成文库】存放**你自己产出**的文件（作文 / 方案 / 报告 / 代码模块 / 表格等）。\n"
+            "⚠️ 和「知识库」是两个不同的地方，别搞混：\n"
+            "  · 知识库 = 用户的资料，**只能读、绝不能改**；\n"
+            "  · 生成文库 = 你的产出，**可以写、可以改、可以删**。\n"
+            "用 action 指定动作：\n"
+            "· list —— 列出文库里的文件（不知道有什么就先列一下）\n"
+            "· read —— 读文件正文（name）\n"
+            "· write —— 写入/覆盖（name + content）；name 带 .md/.txt/.py/.json 等后缀\n"
+            "· append —— 追加到文件末尾（name + content）\n"
+            "· delete —— 删除（会移进回收站，可恢复）\n"
+            "· copy —— 复制成新文件（name + new_name）\n"
+            "· backup —— 整库备份\n"
+            "· export_docx —— 把已写好的文本文件导出成 Word（name，会自动加 .docx 后缀）\n"
+            "  Word 文档 WPS 也能直接打开，用户要「WPS 格式 / Word 文档」就用这个。\n"
+            "什么时候写进文库：用户**明确要一个文件**时（「写成文档」「给我一个 Python 模块」"
+            "「导出成 Word」「保存到文件」）。\n"
+            "什么时候不写：只是让你「写篇作文 / 拟个方案」→ **直接写在回答里**就行，"
+            "别自作主张建文件；不过长文写完可以问一句要不要存进文库。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string",
+                           "enum": ["list", "read", "write", "append", "delete",
+                                    "copy", "backup", "export_docx"]},
+                "name": {"type": "string",
+                         "description": "文件名（可带子目录，如 作文/我的大学.md）。不要写盘符或 .."},
+                "content": {"type": "string", "description": "write/append 时要写入的正文"},
+                "new_name": {"type": "string", "description": "copy 时的目标文件名"},
+            },
+            "required": ["action"],
+        },
+    },
+}
+
+
+# ---------- 反问用户（材料不足时先把细节问清楚）----------
+_ASK_USER_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ask_user",
+        "description": (
+            "【向用户提问】在界面上弹出一个问答框，让用户补充信息，他填完你继续做。\n"
+            "什么时候用：创作类任务缺关键信息时 —— 写作文/演讲稿/方案/总结/报告这类，"
+            "如果用户没说清【用途、给谁看、字数、文体、要突出的重点、时间或背景】，"
+            "**先问清楚再写**，比硬猜一篇强得多。\n"
+            "⚠️ **必须调用这个工具来问，不要在回答里用文字提问** ——"
+            "用户在弹框里填比在对话框里一条条回方便得多。\n"
+            "什么时候别用：用户已经把要求说清楚了；能自己查到的客观事实"
+            "（用 search_knowledge / web_search）；纯技术或计算任务。\n"
+            "一次最多 4 个问题，每题给 2-4 个选项（用户也可以不选、自己写）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "description": "要问的问题（1-4 个）",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {"type": "string", "description": "要问的问题，一句话"},
+                            "header": {"type": "string", "description": "短标签，4-8 个字"},
+                            "options": {"type": "array", "items": {"type": "string"},
+                                        "description": "2-4 个候选答案"},
+                            "multi": {"type": "boolean", "description": "是否可多选"},
+                        },
+                        "required": ["question"],
+                    },
+                },
+            },
+            "required": ["questions"],
+        },
+    },
+}
 
 
 # 知识库检索工具（受「知识库」开关控制）
@@ -456,6 +556,10 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
         return _do_search_knowledge(arguments)
     if name == "run_python":
         return _do_run_python(arguments, ui_events, context)
+    if name == "library":
+        return _do_library(arguments, ui_events)
+    if name == "ask_user":
+        return _do_ask_user(arguments, context)
     if name == "get_time":
         return time.strftime("%Y-%m-%d %H:%M:%S (%A)")
     if name == "web_search":
@@ -1266,6 +1370,134 @@ def _do_run_python(arguments, ui_events=None, context=None):
                           "rc": r.get("rc"), "seconds": r.get("seconds"),
                           "risky": r.get("risky") or []})
     return _format_py_result(r)
+
+
+# =====================================================================
+#  生成文库工具
+# =====================================================================
+def _do_library(arguments, ui_events=None):
+    """生成文库的增删改查 + 导出 Word。"""
+    action = str((arguments or {}).get("action") or "list").strip().lower()
+    name = str((arguments or {}).get("name") or "").strip()
+    content = (arguments or {}).get("content")
+    new_name = str((arguments or {}).get("new_name") or "").strip()
+    content = "" if content is None else str(content)
+
+    def _notify(kind, **kw):
+        if isinstance(ui_events, list):
+            ui_events.append(dict(type="library", act=kind, **kw))
+
+    try:
+        if action == "list":
+            files = library_mod.list_files()
+            if not files:
+                return "生成文库现在是空的。要写文件的话用 action=write 并给 name 和 content。"
+            lines = ["【生成文库】共 %d 个文件：" % len(files)]
+            for f in files[:60]:
+                lines.append("- %s（%s，%d 字节）" % (f["rel"], f["modified"], f["size"]))
+            return "\n".join(lines)
+
+        if action == "read":
+            r = library_mod.read_file(name)
+            if not r.get("ok"):
+                return "读取失败：%s" % r.get("error")
+            _notify("read", rel=r["rel"], content=r.get("text") or "")
+            head = r.get("text") or ""
+            if r.get("chars", 0) > 20000:
+                head = head[:20000] + "\n……（内容很长，已截断）"
+            return "【%s】共 %d 字：\n\n%s" % (r["rel"], r.get("chars", 0), head)
+
+        if action in ("write", "append"):
+            r = library_mod.write_file(name, content,
+                                       "append" if action == "append" else "overwrite")
+            if not r.get("ok"):
+                return "写入失败：%s" % r.get("error")
+            _notify("write", rel=r["rel"], chars=r.get("chars", 0))
+            tip = "（原有内容已自动备份）" if r.get("backup") else ""
+            return ("已%s到生成文库：%s（%d 字）%s。\n"
+                    "告诉用户文件已经存好了、存在生成文库面板里，他可以在那里打开、编辑、"
+                    "导出 Word 或删除。" % ("追加" if action == "append" else "写入",
+                                            r["rel"], r.get("chars", 0), tip))
+
+        if action == "delete":
+            r = library_mod.delete_file(name)
+            if not r.get("ok"):
+                return "删除失败：%s" % r.get("error")
+            _notify("delete", rel=r["rel"])
+            return "已删除 %s（实际移到了回收站 _回收站/，需要的话可以恢复）。" % r["rel"]
+
+        if action == "copy":
+            r = library_mod.copy_file(name, new_name)
+            if not r.get("ok"):
+                return "复制失败：%s" % r.get("error")
+            _notify("write", rel=r["to"], chars=0)
+            return "已复制：%s → %s" % (r["from"], r["to"])
+
+        if action == "backup":
+            r = library_mod.backup_all()
+            if not r.get("ok"):
+                return "备份失败：%s" % r.get("error")
+            return "已备份 %d 个文件到 %s" % (r.get("count", 0), r.get("path", ""))
+
+        if action == "export_docx":
+            rd = library_mod.read_file(name)
+            if not rd.get("ok"):
+                return "导出失败：%s" % rd.get("error")
+            base = rd["rel"]
+            out = re.sub(r"\.(md|markdown|txt|text)$", "", base, flags=re.I) + ".docx"
+            if out == base:
+                out = base + ".docx"
+            data = docx_write.text_to_docx(rd.get("text") or "",
+                                           title=os.path.splitext(os.path.basename(base))[0])
+            w = library_mod.save_bytes(out, data)
+            if not w.get("ok"):
+                return "导出失败：%s" % w.get("error")
+            _notify("write", rel=w["rel"], chars=0)
+            return ("已导出 Word 文档：%s（%d 字节）。WPS 和 Word 都能直接双击打开。\n"
+                    "告诉用户去生成文库面板下载/打开它。" % (w["rel"], w.get("bytes", 0)))
+
+        return "未知的 action：%s（可用 list/read/write/append/delete/copy/backup/export_docx）" % action
+    except Exception as e:
+        return "文库操作失败：%s: %s" % (type(e).__name__, e)
+
+
+# =====================================================================
+#  反问用户
+# =====================================================================
+def _do_ask_user(arguments, context=None):
+    """把问题弹到界面上，等用户回答。复用"确认弹窗"那条通道。"""
+    qs = (arguments or {}).get("questions") or []
+    if not isinstance(qs, list) or not qs:
+        return "错误：没有可问的问题。"
+    norm = []
+    for q in qs[:4]:
+        if not isinstance(q, dict):
+            continue
+        text = str(q.get("question") or "").strip()
+        if not text:
+            continue
+        opts = [str(o).strip() for o in (q.get("options") or []) if str(o).strip()][:4]
+        norm.append({"question": text,
+                     "header": str(q.get("header") or "").strip()[:12],
+                     "options": opts, "multi": bool(q.get("multi"))})
+    if not norm:
+        return "错误：问题的格式不对，至少要有一个非空 question。"
+    ask = (context or {}).get("ask")
+    if not callable(ask):
+        return ("现在没有可用的提问通道（用户界面没连上），先把最合理的默认方案做出来，"
+                "并在回答里说明你假设了什么、哪些地方需要他补充。")
+    answers = ask({"questions": norm})
+    if not answers:
+        return ("用户没有回答（可能直接关掉了弹框）。请**按最合理的默认假设继续做**，"
+                "并在回答开头明确写出你替他假设了哪些条件，方便他纠正。")
+    lines = ["【用户补充的信息】"]
+    for i, a in enumerate(answers, 1):
+        if isinstance(a, dict):
+            lines.append("%d. %s → %s" % (i, a.get("question", ""), a.get("answer", "")))
+        else:
+            lines.append("%d. %s" % (i, a))
+    lines.append("请**基于这些信息**继续完成，不要再重复问同样的问题。")
+    return "\n".join(lines)
 
 
 def _do_search_knowledge(arguments):

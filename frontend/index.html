@@ -39,6 +39,36 @@
       <div class="list" id="kbList"></div>
     </section>
 
+    <!-- 生成文库：模型产出的文件（作文/方案/代码模块…）
+         与知识库**刻意分开**：知识库是用户的资料、只读；这里是模型的产出，可改可删可导出 -->
+    <section class="panel doclib" id="doclibPanel">
+      <div class="sec-head">
+        <h2>✍️ 生成文库</h2>
+        <span class="head-acts">
+          <button class="btn sm ghost" id="dlOpenFolder" title="打开生成文库文件夹">📂 文件夹</button>
+          <button class="btn sm ghost" id="dlBackup" title="把整个文库备份一份">备份</button>
+          <button class="btn sm ghost" id="dlRefresh">刷新</button>
+        </span>
+      </div>
+      <p class="hint">模型写出来的文件放这里（作文 / 方案 / 报告 / 代码模块…）。
+        <b>和知识库不是一回事</b>：知识库是你的资料、模型只能读；这里是模型的产出，可以改、可以删
+        （删掉会进回收站，能捞回来）。</p>
+      <div class="list dl-list" id="dlList"></div>
+      <div class="dl-editor" id="dlEditor" hidden>
+        <div class="dl-editor-head">
+          <span class="dl-editor-name" id="dlEditorName"></span>
+          <span class="head-acts">
+            <button class="btn sm ghost" id="dlSaveBtn">保存</button>
+            <button class="btn sm ghost" id="dlDocxBtn" title="导出为 Word 文档（WPS 与 Word 都能直接打开）">导出 Word</button>
+            <button class="btn sm ghost" id="dlDownload">下载</button>
+            <button class="btn sm ghost danger" id="dlDelBtn">删除</button>
+            <button class="btn sm ghost" id="dlCloseBtn">关闭</button>
+          </span>
+        </div>
+        <textarea id="dlText" spellcheck="false" placeholder="文件内容"></textarea>
+      </div>
+    </section>
+
     <!-- 图片库：搜到的图 / 生成的图统一留存，可随时调用与删除 -->
     <section class="panel library" id="libraryPanel">
       <div class="sec-head">
@@ -155,7 +185,7 @@
       <label class="pill" data-cfg="rag_enabled"><i class="sw"></i>知识库</label>
       <label class="pill" data-cfg="web_enabled"><i class="sw"></i>联网</label>
       <label class="pill" data-cfg="auto_memorize"><i class="sw"></i>自动记忆</label>
-      <label class="pill" data-cfg="code_auto_route" title="遇到写代码的需求自动换用专用代码模型（qwen2.5-coder，不思考、更稳）"><i class="sw"></i>代码模型</label>
+      <label class="pill" data-cfg="code_auto_route" title="写代码或写长文时，自动换用专用模型（qwen2.5-coder，非思考型，更稳更快）"><i class="sw"></i>专用模型</label>
       <label class="pill" data-cfg="code_exec_enabled" title="让模型在本机真跑 Python 把结果算出来（默认关闭；开启后模型写的代码会在你电脑上执行）"><i class="sw"></i>本地算代码</label>
     </div>
 
