@@ -652,6 +652,35 @@
      开发台右栏 —— 同一个 DOM 节点搬家，所有已有事件监听、拖拽、多模态
      上传、流式渲染统统照旧，不用重写一套聊天。关闭时再搬回原来的位置。 */
   var chatHomeMark = null;
+  // 对话区默认**收起**（只留一条输入框），这样开发台是真正铺满整屏的。
+  var chatCollapsed = true;
+
+  function setChatCollapsed(v) {
+    chatCollapsed = !!v;
+    var box = $("stChatSlot");
+    if (box) box.classList.toggle("collapsed", chatCollapsed);
+    var b = $("stChatToggle");
+    if (b) b.textContent = chatCollapsed ? "💬 展开对话" : "💬 收起对话";
+  }
+
+  function expandChat() { if (chatCollapsed) setChatCollapsed(false); }
+
+  /* 在开发台里一发消息就自动展开对话记录 —— 否则消息发出去了却看不见回复。
+     用**捕获阶段**挂，抢在原来的发送处理之前跑。 */
+  function hookComposer() {
+    var send = $("sendBtn");
+    if (send && !send.__stHooked) {
+      send.__stHooked = true;
+      send.addEventListener("click", function () { setChatCollapsed(false); }, true);
+    }
+    var inp = $("input");
+    if (inp && !inp.__stHooked) {
+      inp.__stHooked = true;
+      inp.addEventListener("keydown", function (e) {
+        if (e.key === "Enter" && !e.shiftKey) setChatCollapsed(false);
+      }, true);
+    }
+  }
 
   function mountChat() {
     var main = $("main");
@@ -662,6 +691,7 @@
       main.parentNode.insertBefore(chatHomeMark, main);
     }
     slot.appendChild(main);
+    hookComposer();
   }
 
   function unmountChat() {
@@ -676,6 +706,7 @@
     if (opened) return;
     var el = $("studio");
     mountChat();
+    setChatCollapsed(chatCollapsed);      // 保持上次的收/展状态
     el.hidden = false;
     opened = true;
     var btn = $("openStudioBtn");
@@ -799,6 +830,7 @@
     if (btn) btn.onclick = toggle;
     if (!$("studio")) return;
     $("stClose").onclick = close;
+    $("stChatToggle").onclick = function () { setChatCollapsed(!chatCollapsed); };
     $("stRefresh").onclick = function () { refresh(); loadChanges(); };
     $("stSave").onclick = saveCur;
     $("stRun").onclick = runCur;

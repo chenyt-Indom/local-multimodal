@@ -250,6 +250,7 @@
         <button class="btn sm ghost" id="stUpload" title="把当前项目提交并上传到 GitHub / Gitee / 自建 Git（用本机 git 凭据）">⬆ 上传</button>
         <button class="btn sm ghost" id="stDebug" title="运行并检查：有报错就把完整 traceback 交给 AI 去修">🔧 调试</button>
         <button class="btn sm ghost" id="stZip" title="把整个项目打包成 zip 下载">📦 打包</button>
+        <button class="btn sm ghost" id="stChatToggle" title="展开/收起下面的对话记录（输入框始终都在）">💬 对话</button>
         <button class="btn sm ghost" id="stClose" title="收起开发台，回到纯聊天">⇥ 收起</button>
       </span>
     </div>
@@ -292,10 +293,11 @@
           <pre id="stOutBody"></pre>
         </div>
       </div>
-      <!-- 聊天区会在打开开发台时被搬进这里（同一个 DOM，所有功能照旧：
-           多模态拖拽、图片/文档上传、流式输出、终止按钮都在） -->
-      <div class="studio-chat" id="stChatSlot"></div>
     </div>
+
+    <!-- 对话区（**底部停靠**）：打开开发台时把聊天区搬进这里。
+         收起状态只留一条输入框 —— 所以"聊天界面"和"开发台"两边都能直接对话。 -->
+    <div class="studio-chat" id="stChatSlot"></div>
   </section>
 
   <!-- 改动对比（Monaco diff）：AI 到底改了什么，一目了然，可一键撤销 -->

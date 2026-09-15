@@ -781,14 +781,25 @@ body.dragging .drop-overlay,
 .folder-head:first-child { margin-top: 2px; }
 
 /* ---------- 开发台（人机协同开发）----------
-   整页全屏（**不是**分屏小窗）：打开就相当于换了一页，
-   聊天区被搬进右侧那一栏，所以“对话框”始终在，拖图/拖文件/流式输出都照旧。 */
+   整页全屏：打开就相当于换了一页，编辑器铺满。
+   对话区**停靠在底部**，可以收成一条输入框 —— 所以两个界面都能直接对话。
+   ⚠️ 关键：`.main` 在 flex 列里必须 `min-height:0`，否则消息一多就会把它撑高、
+   把下面的输入框**挤到可视区外面**（实测踩过：截图里右边根本没有输入框）。 */
 .studio { position: fixed; inset: 0; z-index: 300; background: var(--bg);
   display: flex; flex-direction: column; }
 .studio[hidden] { display: none; }
-.studio-chat { width: min(42%, 560px); min-width: 330px; display: flex; flex-direction: column;
-  border-left: 1px solid var(--border); background: var(--panel); }
-.studio-chat .main { flex: 1; min-width: 0; }
+.studio-chat { height: 42vh; min-height: 0; flex: 0 0 auto; display: flex; flex-direction: column;
+  border-top: 1px solid var(--border); background: var(--panel); }
+.studio-chat.collapsed { height: auto; }
+/* 收起时容器是 auto 高度，子元素再 flex:1（basis 0）会被压成 0 高 ——
+   直接换成普通块级排布，高度完全由内容（输入框）决定，不给 flex 留歧义。 */
+.studio-chat.collapsed .main { flex: none; display: block; }
+.studio-chat.collapsed .chat-header,
+.studio-chat.collapsed .top-bar,
+.studio-chat.collapsed .messages,
+.studio-chat.collapsed .composer .tip { display: none; }
+.studio-chat .main { flex: 1; min-height: 0; }
+.studio-chat .messages { min-height: 0; }
 .studio-proj { background: var(--panel2); color: var(--text); border: 1px solid var(--border);
   border-radius: 6px; padding: 4px 6px; font-size: 12px; max-width: 150px; outline: none; }
 .st-count { color: var(--accent); }
