@@ -686,7 +686,7 @@ class _SystemPrompt:
         return "\n\n".join(p for p in parts if p)
 
 
-async def _stream_lines(resp):
+async def _stream_lines(resp, session: str = ""):
     """在子线程里读阻塞的 `requests.iter_lines`，通过队列交回事件循环。
 
     ⚠️ **为什么必须这样绕一层**（实测踩过）：
@@ -698,6 +698,10 @@ async def _stream_lines(resp):
     （实测 547 个分块全部在同一时刻到达；而直连 Ollama 首块只要 0.4s。）
 
     改成"子线程阻塞读 + 队列传递"后，事件循环始终空闲，每来一块就能立刻推给前端。
+
+    「终止任务」是怎么实现的：前端 abort 掉 fetch → 连接断开 → Starlette 关掉本生成器
+    → 走到下面的 `finally` → `resp.close()` 掐断到 Ollama 的连接 → 模型随即停止生成。
+    所以**不需要额外的停止接口**，关键是这个 finally 必须真的执行到。
     """
     q: asyncio.Queue = asyncio.Queue(maxsize=256)
     loop = asyncio.get_running_loop()
@@ -712,11 +716,21 @@ async def _stream_lines(resp):
             loop.call_soon_threadsafe(_q_put, q, None)   # 结束哨兵
 
     threading.Thread(target=_worker, daemon=True, name="ollama-stream").start()
-    while True:
-        item = await q.get()
-        if item is None:
-            break
-        yield item
+    _register_stream(session, resp)
+    try:
+        while True:
+            item = await q.get()
+            if item is None:
+                break
+            yield item
+    finally:
+        # 用户点了「终止」，或者连接断了：立刻掐掉到 Ollama 的连接，
+        # 否则子线程会一直读下去、模型也会一直生成（白烧显卡）。
+        _unregister_stream(session, resp)
+        try:
+            resp.close()
+        except Exception:
+            pass
 
 
 def _q_put(q, item) -> None:
@@ -732,6 +746,47 @@ def _q_put(q, item) -> None:
             q.put_nowait(item)
         except Exception:
             pass
+
+
+# ---------- 正在进行的生成（供「终止任务」使用）----------
+# 正常情况下前端 abort 掉连接就够了；这里额外留一份引用，
+# 是为了「连接没断干净」时也能主动掐掉上游，不至于让模型白跑。
+_active_streams: dict = {}
+_active_lock = threading.Lock()
+
+
+def _register_stream(session: str, resp) -> None:
+    with _active_lock:
+        _active_streams.setdefault(session or "", []).append(resp)
+
+
+def _unregister_stream(session: str, resp) -> None:
+    with _active_lock:
+        lst = _active_streams.get(session or "")
+        if not lst:
+            return
+        try:
+            lst.remove(resp)
+        except ValueError:
+            pass
+        if not lst:
+            _active_streams.pop(session or "", None)
+
+
+def _stop_streams(session: str = "") -> int:
+    """掐断指定会话（空字符串=全部）正在进行的上游连接，返回停掉的数量。"""
+    with _active_lock:
+        targets = (list(_active_streams.items()) if not session
+                   else [(session, _active_streams.get(session, []))])
+        killed = 0
+        for _sid, lst in targets:
+            for resp in list(lst):
+                try:
+                    resp.close()
+                    killed += 1
+                except Exception:
+                    pass
+        return killed
 
 
 @app.post("/api/chat")
@@ -829,7 +884,7 @@ async def chat(req: ChatRequest):
             done_reason = ""
             # 注意：必须用 _stream_lines（子线程读 + 队列），
             # 不能直接 for line in resp.iter_lines() —— 见它的注释
-            async for line in _stream_lines(resp):
+            async for line in _stream_lines(resp, session):
                 if not line:
                     continue
                 if isinstance(line, bytes):
@@ -973,6 +1028,18 @@ async def chat(req: ChatRequest):
         yield json.dumps({"done": True, "text": final_text, "thinking": final_thinking}) + "\n"
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+
+@app.post("/api/chat/stop")
+def chat_stop(body: dict | None = None):
+    """终止当前正在进行的生成（界面上的「■ 终止」按钮）。
+
+    正常情况下前端 abort 掉 fetch、连接一断，服务端就会顺势掐掉上游；
+    这里再兜一道：即使连接没断干净，也能立刻让模型停下来。
+    """
+    session = str(((body or {}).get("session_id")) or "").strip()
+    killed = _stop_streams(session)
+    return {"ok": True, "stopped": killed}
 
 
 def _wants_search(text: str) -> bool:
@@ -1746,8 +1813,28 @@ def voice_stop():
 
 
 # ---------- 前端 ----------
+@app.middleware("http")
+async def _no_cache_pages(request, call_next):
+    """让前端文件**每次回来校验**，而不是直接用缓存。
+
+    ⚠️ 踩过这个坑：改了 app.js（比如给拖拽加了"文档"分支），
+    但界面行为一点没变 —— 因为浏览器 / WebView 直接吃了缓存的旧文件，
+    看起来就像"功能根本没做"，白白怀疑代码。
+    加上 no-cache 后，浏览器每次会带 ETag 回来问一次：
+    文件没变仍是 304（几乎不花时间），变了就立刻拿到新的。
+    """
+    resp = await call_next(request)
+    path = request.url.path
+    if path == "/" or path.startswith("/static/"):
+        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return resp
+
+
 @app.get("/")
 def index():
-    return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
+    resp = FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
+    resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return resp
+
 
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")

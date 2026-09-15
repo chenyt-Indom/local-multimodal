@@ -5,6 +5,8 @@
   let docs = [];            // 待发送文档：[{name, text, chars}]（拖进来时抽取正文）
   let videoB64 = null;      // 待发送视频帧 base64 列表
   let streaming = false;
+  let abortCtl = null;      // 用于「■ 终止」：中断当前的流式请求
+  let aborted = false;      // 标记本轮是用户主动终止的（不是出错）
   const history = [];       // 会话消息（用于多轮上下文）
   // 会话标识（后端据此把历史会话落盘，供记忆检索）
   let sessionId = localStorage.getItem("ai_session_id") || "";
@@ -208,8 +210,9 @@
   $("#toggleSidebar").onclick = () => $("#sidebar").classList.toggle("hidden");
 
   // ---------- 拖拽文件到聊天框 ----------
-  // 文档类扩展名：拖进来会**抽取正文**当作本轮资料（和拖图片一个体验）
-  const DOC_EXT = /\.(txt|md|markdown|csv|tsv|json|log|ini|cfg|yaml|yml|xml|html?|py|js|ts|java|c|cpp|go|rs|sql|sh|bat|pdf|docx?|xlsx?|pptx?|wps|et|dps)$/i;
+  // 拖进来的**任何非图片/视频文件**都按"文档"处理：抽取正文当作本轮资料。
+  // 这里刻意**不做扩展名白名单** —— 白名单会把没列到的类型静默丢掉，
+  // 用户看到的就是"拖了完全没反应"。能不能读交给后端判断，读不出会明确说明原因。
 
   // 字数显示：不足 1000 就照实写，别四舍五入成"1k"（一份 50 字的文件显示"1k 字"很误导）
   function fmtChars(n) {
@@ -246,8 +249,13 @@
   }
 
   function onDropFiles(files) {
-    if (!files) return;
-    [...files].forEach((f) => {
+    const list = files ? [...files] : [];
+    if (!list.length) {
+      // 别静默失败：拖进来却什么都没发生，用户只会以为功能坏了
+      showToast("没有读到文件。请从资源管理器把文件直接拖到窗口里再松开。", "warn");
+      return;
+    }
+    list.forEach((f) => {
       if (!f) return;
       if (f.type && f.type.startsWith("image/")) {
         const reader = new FileReader();
@@ -258,8 +266,11 @@
         const dt = new DataTransfer(); dt.items.add(f);
         $("#videoInput").files = dt.files;
         $("#videoInput").dispatchEvent(new Event("change"));
-      } else if (DOC_EXT.test(f.name || "")) {
-        addDocAttachment(f);      // 文档：抽正文当资料
+      } else {
+        // 其余一律当"文档"处理，**不再用扩展名白名单**
+        // （以前白名单里没有的类型会被静默忽略，表现为"拖了没反应"）。
+        // 能不能读由后端判定，读不出会明确告诉你原因。
+        addDocAttachment(f);
       }
     });
   }
@@ -273,8 +284,21 @@
     if (dropHint) dropHint.classList.remove("show");
   }));
   mainEl.addEventListener("drop", (e) => {
-    onDropFiles(e.dataTransfer && e.dataTransfer.files);
+    const dt = e.dataTransfer;
+    let files = (dt && dt.files) ? [...dt.files] : [];
+    if (!files.length && dt && dt.items) {
+      // 少数环境下 files 是空的，得从 items 里捞（必须在任何 await 之前同步取）
+      for (const it of dt.items) {
+        if (it.kind === "file") { const f = it.getAsFile(); if (f) files.push(f); }
+      }
+    }
+    onDropFiles(files);
   });
+
+  // 拖到窗口任意位置都不要让浏览器"直接打开"这个文件 ——
+  // 否则整个界面会被替换成文件内容，看起来像把应用弄坏了。
+  window.addEventListener("dragover", (e) => e.preventDefault());
+  window.addEventListener("drop", (e) => e.preventDefault());
 
   // ---------- 图片库 ----------
   // 搜到的图 / 生成的图保存后集中在这里，可随时查看、放大、删除。
@@ -1107,9 +1131,13 @@
     };
 
     streaming = true;
+    aborted = false;
     $("#sendBtn").disabled = true;
+    setStopVisible(true);
+    abortCtl = new AbortController();
     try {
       const resp = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" },
+        signal: abortCtl.signal,
         body: JSON.stringify({ messages: history, images_b64: mediaB64,
                                docs: (docPayload && docPayload.length) ? docPayload : null,
                                stream: true, session_id: sessionId }) });
@@ -1168,11 +1196,53 @@
       persistSession();   // 落盘，保证程序重启后能恢复这段对话
     } catch (err) {
       finishThinking();
-      answerBubble.textContent = "❌ " + err.message + "（可能内存/模型未就绪，请查看状态）";
+      if (aborted || (err && err.name === "AbortError")) {
+        // 用户点了「■ 终止」：把已经生成出来的部分留着，别报成错误
+        answerBubble.classList.remove("empty-answer");
+        answerBubble.textContent = answer ? answer + "\n\n〔已终止〕" : "〔已终止〕";
+        if (answer) history.push({ role: "assistant", content: answer });
+        showToast("已终止本次生成");
+        try { persistSession(); } catch (e) { /* 落盘失败不影响使用 */ }
+      } else {
+        answerBubble.textContent = "❌ " + err.message + "（可能内存/模型未就绪，请查看状态）";
+      }
     } finally {
-      streaming = false; $("#sendBtn").disabled = false;
+      streaming = false;
+      abortCtl = null;
+      $("#sendBtn").disabled = false;
+      setStopVisible(false);
     }
   }
+
+  // ---------- 终止当前任务 ----------
+  function setStopVisible(on) {
+    const b = $("#stopBtn");
+    if (!b) return;
+    b.hidden = !on;
+    b.disabled = !on;
+  }
+
+  function stopStreaming() {
+    if (!streaming) return;
+    aborted = true;
+    // ① 断掉前端的流（连接一断，服务端就会掐掉到 Ollama 的连接）
+    try { abortCtl && abortCtl.abort(); } catch (e) { /* 忽略 */ }
+    // ② 再补一刀：显式通知后端停止，防止连接没断干净导致模型继续跑
+    try {
+      fetch("/api/chat/stop", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+    } catch (e) { /* 忽略 */ }
+    // ③ 立刻恢复界面，不用等 finally
+    streaming = false;
+    $("#sendBtn").disabled = false;
+    setStopVisible(false);
+  }
+
+  const stopBtnEl = $("#stopBtn");
+  if (stopBtnEl) stopBtnEl.onclick = stopStreaming;
+  setStopVisible(false);
 
   $("#sendBtn").onclick = send;
   inputEl.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } };

@@ -622,3 +622,17 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 .kb-item .kb-body { display: flex; flex-direction: column; flex: 1; min-width: 0; line-height: 1.3; }
 .kb-item .kb-sub { font-size: 10px; color: var(--muted); }
 .kb-item.bad .kb-sub { color: #e08a80; }
+
+/* ---------- 「■ 终止」按钮（生成中才出现）---------- */
+/* 注意：.btn 默认是 width:100% + margin-top:10px（那是给侧栏"整行按钮"用的），
+   放进输入行必须像 .send 一样把这两项覆盖掉，否则会把输入框挤扁。 */
+.btn.stop {
+  width: auto; margin: 0; padding: 10px 14px;
+  flex: 0 0 auto; white-space: nowrap;
+  border: 1px solid rgba(229, 83, 75, .45);
+  background: transparent;
+  animation: stopPulse 1.6s ease-in-out infinite;
+}
+.btn.stop:hover { background: rgba(229, 83, 75, .14); animation: none; }
+@keyframes stopPulse { 0%, 100% { opacity: 1 } 50% { opacity: .6 } }
+@media (prefers-reduced-motion: reduce) { .btn.stop { animation: none } }

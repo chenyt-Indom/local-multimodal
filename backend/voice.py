@@ -38,9 +38,14 @@ MIN_CHARS = 2                       # 至少要识别出这么多字才允许自
 # 常驻监听最容易踩的坑：每 100ms 就跑一次 ASR 解码，持续吃满 CPU 并持有 GIL，
 # 把同时运行的 Web 服务饿死（实测健康检查从 20ms 恶化到 21 秒）。
 # 所以待机时**只在检测到人声后才启动识别**，安静时就只算个音量，开销可忽略。
-GATE_RMS = 0.010                    # 音量超过它才认为"有人在说话"
-PRE_ROLL_BLOCKS = 4                 # 检测到人声前多留 0.4 秒音频，
-                                    # 否则第一个字常被吃掉（"小千"变成"千"）
+#
+# 但门控本身也会带来"唤醒慢 / 少字"：门槛太高会把说话声的开头判成静音，
+# 模型拿到的音频从半个字开始，既要多花时间才能认出唤醒词，还容易认错。
+# 下面两个值都是**实测调过**的：门槛下调 + 前置音频加长。
+GATE_RMS = 0.005                    # 音量超过它才算"有人在说话"（原 0.01 偏高，
+                                    # 正常说话起音常低于它，导致开头被吃掉）
+PRE_ROLL_BLOCKS = 10                # 检测到人声前多留 1.0 秒音频（原 0.4 秒，
+                                    # 不够流式模型"热机"，是唤醒慢的一个直接原因）
 IDLE_RESET_SEC = 3.0                # 安静这么久就重置识别流，避免上下文无限增长
 
 # —— 唤醒词容错表 ——
@@ -137,6 +142,26 @@ def _tail_after(text: str, skip_chars: int) -> str:
     return ""
 
 
+def strip_wake_prefix(text: str) -> str:
+    """去掉句子**开头**的唤醒词，只留真正的指令。
+
+    ⚠️ 为什么需要它：唤醒之后，流式模型给出的仍然是"整段"识别结果，
+    开头照样带着「小千小千」。原先直接把整段当指令发出去，
+    用户看到的输入前面就永远挂着唤醒词 —— 这也正是"识别内容乱七八糟"的一部分。
+    """
+    s = (text or "").strip()
+    for _ in range(3):                     # 最多剥三层，覆盖「小千小千」连呼
+        norm = normalize_wake(s)
+        idx = norm.find("小千")
+        if idx < 0 or idx > 2:             # 只在开头附近才剥，避免误伤正文
+            break
+        hit, rest = match_wake(s)
+        if not hit or rest == s:
+            break
+        s = rest.strip()
+    return s
+
+
 # --------------------------------------------------------------------------
 # 模型定位
 # --------------------------------------------------------------------------
@@ -151,8 +176,32 @@ def _model_candidates() -> list[str]:
     ]
 
 
+def _model_rank(path: str) -> int:
+    """模型目录的偏好打分（越大越优先）。
+
+    为什么要有这个：同一个目录下可能同时躺着好几个模型。
+    原来的写法是"谁先被 glob 到就用谁"，结果精度很差的 14M 小模型
+    只要排在前面就会一直被选中 —— 识别出来的字当然乱七八糟。
+    这里把已知更好的模型显式排在前面。
+    """
+    name = os.path.basename(path).lower()
+    if "bilingual-zh-en" in name:
+        return 100          # 中英双语 zipformer，明显比 14M 准，仍是流式
+    if "zipformer" in name and "14m" not in name:
+        return 80
+    if "paraformer" in name or "sense-voice" in name:
+        return 60           # 非流式，精度高但不适合边听边出
+    if "14m" in name:
+        return 10           # 最小最快，但精度最差
+    return 50
+
+
 def find_model_dir() -> str | None:
-    """找到可用的 ASR 模型目录（需含 tokens.txt 与 onnx 权重）。"""
+    """找到可用的 ASR 模型目录（需含 tokens.txt 与 onnx 权重）。
+
+    多个候选时**按精度优先**选，而不是"谁先被扫到用谁"。
+    """
+    found = []
     for root in _model_candidates():
         if not root or not os.path.isdir(root):
             continue
@@ -160,8 +209,11 @@ def find_model_dir() -> str | None:
         for cand in [root] + [d for d in glob.glob(os.path.join(root, "*")) if os.path.isdir(d)]:
             if os.path.exists(os.path.join(cand, "tokens.txt")) and glob.glob(
                     os.path.join(cand, "*.onnx")):
-                return cand
-    return None
+                found.append(cand)
+    if not found:
+        return None
+    found.sort(key=_model_rank, reverse=True)
+    return found[0]
 
 
 def _pick(model_dir: str, *keywords: str) -> str | None:
@@ -278,7 +330,8 @@ class VoiceListener:
                 encoder=encoder,
                 decoder=decoder,
                 joiner=joiner,
-                num_threads=2,
+                num_threads=4,                     # 2 → 4：解码更快，唤醒更跟手
+                                                   # （本机 CPU 核心多，不差这两个线程）
                 sample_rate=SAMPLE_RATE,
                 feature_dim=80,
                 decoding_method="greedy_search",
@@ -411,10 +464,12 @@ class VoiceListener:
 
         # —— 已唤醒：累积文本 + 静音计时 ——
         if text:
-            self._text = text
-            if text != self._last_partial:
-                self._last_partial = text
-                self._emit({"type": "partial", "text": text})
+            # 模型给的是整段结果，开头还带着唤醒词，必须先剥掉再当指令
+            cmd = strip_wake_prefix(text)
+            self._text = cmd
+            if cmd != self._last_partial:
+                self._last_partial = cmd
+                self._emit({"type": "partial", "text": cmd})
 
         if quiet:
             if self._silence_start is None:

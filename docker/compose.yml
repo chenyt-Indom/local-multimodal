@@ -19,7 +19,11 @@ name: local-multimodal
 services:
   # ---------------- 界面与后端 ----------------
   app:
-    image: local-multimodal-app:latest
+    # 由部署脚本按显卡情况写入 .env：
+    #   有 N 卡 → local-multimodal-app:gpu （CUDA 版 torch，绘图走显卡）
+    #   没有   → local-multimodal-app:latest（CPU 版，体积小）
+    # 默认值保持 CPU 版，保证「不写 .env 直接 up」也能跑起来。
+    image: ${APP_IMAGE:-local-multimodal-app:latest}
     build:
       context: ./build
       dockerfile: docker/Dockerfile.app

@@ -182,7 +182,8 @@
         <button class="icon-btn" id="voiceBtn" title="语音输入：说「小千小千」唤醒，停顿 2 秒自动发送">🎤</button>
         <input type="file" id="fileInput" accept="image/*" multiple hidden />
         <input type="file" id="videoInput" accept="video/*" hidden />
-        <textarea id="input" rows="1" placeholder="描述需求：画一只机器人 · 读取报告.txt 并改错别字 · 记住我喜欢中文交流 · （拖图可微改）"></textarea>
+        <textarea id="input" rows="1" placeholder="描述需求：画一只机器人 · 读取报告.txt 并改错别字 · 记住我喜欢中文交流 · （拖图/拖文档进来都可以）"></textarea>
+        <button class="btn ghost danger stop" id="stopBtn" hidden title="终止当前任务（生成会立刻停下）">■ 终止</button>
         <button class="btn primary send" id="sendBtn">发送</button>
       </div>
       <p class="tip">智能体模式：直接说指令，AI 自主规划并调用工具完成任务。数据均在本机处理。</p>
