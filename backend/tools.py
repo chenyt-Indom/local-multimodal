@@ -241,7 +241,7 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
     if kb_enabled:
         schemas.append(_KB_SCHEMA)
     if code_exec:
-        schemas.append(_RUN_PY_SCHEMA)
+        schemas.append(_run_py_schema())
     if web_enabled:
         schemas.append(_WEATHER_SCHEMA)   # 天气走数据 API，比搜索可靠得多
         schemas.append(_WEB_SEARCH_SCHEMA)
@@ -257,29 +257,58 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
 # 为什么要它：模型写代码不难，难的是**算对**。让它把代码真跑一遍，
 # 数字、日期、正则匹配结果都是真算出来的，而不是"看着像"。
 # 默认关闭 —— 打开后模型写的代码会在用户电脑上执行，风险由用户判断。
-_RUN_PY_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "run_python",
-        "description": (
-            "【本地执行 Python】在用户电脑上**真跑**一段 Python 代码并返回输出。\n"
-            "什么时候用：需要精确计算、处理数据、验证自己写的算法对不对、"
-            "做日期/单位换算、正则匹配测试等 —— 凡是「算出来比想出来更可靠」的场景都用它。\n"
-            "怎么用：把完整可运行的代码放进去，用 print() 输出你要看的结果；\n"
-            "**不要**用 input()（没人能输入），不要写文件以外的东西到磁盘（会在临时目录里执行）。\n"
-            "可用库：标准库 + numpy / scipy / matplotlib / sympy。\n"
-            "拿到输出后**依据真实结果**回答用户，不要把输出原样贴给用户就完事。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "code": {"type": "string",
-                         "description": "完整可运行的 Python 代码，用 print() 打印要看的中间结果"},
+_SCI_LIBS = ("numpy", "scipy", "pandas", "matplotlib", "sympy")
+_sci_cache = None
+
+
+def available_science_libs() -> list:
+    """当前环境里**真正能用**的科学计算库。
+
+    用 find_spec 探测而不是真的 import —— 只为判断有没有，不值得拖慢启动。
+    为什么要动态探测（实测）：源码环境和容器的库**不一样**，容器里就没有
+    scipy / matplotlib。描述里写死库名会让模型写出跑不起来的代码，
+    所以按本机实际能力告诉它。
+    """
+    global _sci_cache
+    if _sci_cache is None:
+        import importlib.util
+        ok = []
+        for m in _SCI_LIBS:
+            try:
+                if importlib.util.find_spec(m):
+                    ok.append(m)
+            except Exception:
+                pass
+        _sci_cache = ok
+    return _sci_cache
+
+
+def _run_py_schema() -> dict:
+    libs = available_science_libs()
+    libs_txt = "、".join(libs) if libs else "（本机没有额外的科学计算库，只能用标准库）"
+    return {
+        "type": "function",
+        "function": {
+            "name": "run_python",
+            "description": (
+                "【本地执行 Python】在用户电脑上**真跑**一段 Python 代码并返回输出。\n"
+                "什么时候用：需要精确计算、处理数据、验证自己写的算法对不对、"
+                "做日期/单位换算、正则匹配测试等 —— 凡是「算出来比想出来更可靠」的场景都用它。\n"
+                "怎么用：把完整可运行的代码放进去，用 print() 输出你要看的结果；\n"
+                "**不要**用 input()（没人能输入），不要写文件以外的东西到磁盘（会在临时目录里执行）。\n"
+                "可用库：标准库 + " + libs_txt + "。\n"
+                "拿到输出后**依据真实结果**回答用户，不要把输出原样贴给用户就完事。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string",
+                             "description": "完整可运行的 Python 代码，用 print() 打印要看的中间结果"},
+                },
+                "required": ["code"],
             },
-            "required": ["code"],
         },
-    },
-}
+    }
 
 
 # 知识库检索工具（受「知识库」开关控制）
