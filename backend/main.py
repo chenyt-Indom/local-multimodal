@@ -1443,6 +1443,10 @@ async def chat(req: ChatRequest):
     # 本轮像写代码 → 换专用代码模型（只影响这一轮，下一轮自动回默认模型）
     if not req.model:
         model, model_note = _route_code_model(cfg, last_user, model)
+    # 本轮实际用的模型是不是"专用代码模型"？
+    # 它不支持原生工具调用，工具定义必须整轮砍掉（见下面 tool_schemas 的处理）。
+    _code_model_name = str(cfg.get("code_model") or "").strip()
+    code_model_on = bool(_code_model_name) and model == _code_model_name
 
     # 简单问题收紧生成长度：把"先思考很久"压到几秒（qwen3-vl 无法真正关闭思考）。
     # 但以下情况**绝不能**收紧，否则模型来不及输出工具调用或总结（表现为"思考中断、没有回答"）：
@@ -1516,6 +1520,15 @@ async def chat(req: ChatRequest):
                                       cfg.get("rag_enabled", False),
                                       cfg.get("code_exec_enabled", False),
                                       writing=writing_mode)
+    if code_model_on:
+        # ⚠️ 专用代码模型（qwen2.5-coder）**不支持 Ollama 的原生工具调用通道**。
+        # 实测（2026-09-15，同一句「写个合并有序列表的函数并运行验证」）：
+        #   · 带 tools：31.5 秒，**没有 tool_calls**，把调用当 JSON 文本写进正文 ——
+        #     用户看到一堵 `{"name": "run_python", "arguments": {...}}`，代码根本没跑；
+        #   · 不带 tools：12.2 秒，直接给 ```python 代码块，内容正确。
+        # 所以这一轮把工具全砍掉，让它专心写代码；前端会把代码块渲染成
+        # 带「▶ 运行 / ✏ 编辑」的卡片，用户照样能一键跑 —— 而且更有掌控感。
+        tool_schemas = []
 
     # ---------- 上下文预算：按剩余空间裁剪历史 ----------
     # 工具定义本身就有 3000~4500 token，系统提示约 1000；
@@ -1550,6 +1563,15 @@ async def chat(req: ChatRequest):
         loop = asyncio.get_running_loop()
         live_ui: asyncio.Queue = asyncio.Queue()
         full_sys = sys_prompt + ("\n\n" + digest if digest else "")
+        if code_model_on:
+            # 代码模型不支持工具调用，得明确告诉它"直接写代码"，
+            # 否则它会模仿工具调用的格式吐一堵 JSON（实测）。
+            full_sys += (
+                "\n\n【本轮说明】本轮已切换到专用代码模型，**没有工具可用**。"
+                "请直接把完整可运行的代码写进 ``` 代码块里（标注语言），"
+                "并在后面用一小段说明解释思路与你验证用的数据。"
+                "**绝对不要**输出形如 {\"name\": \"...\", \"arguments\": {...}} 的 JSON —— "
+                "那是工具调用的内部格式，写出来用户看到的是一堆乱码。")
         working = [{"role": "system", "content": full_sys}] + messages
         final_text = ""
         final_thinking = ""
