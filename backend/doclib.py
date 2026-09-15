@@ -127,15 +127,30 @@ def read_file(rel: str, limit: int = 200_000) -> dict:
 
 
 def tree_text(max_items: int = 200) -> str:
-    """给模型看的文库清单（人话格式，别让它去猜有哪些文件）。"""
+    """给模型看的文库目录树（按文件夹分组）。
+
+    原来是一串平铺的 `- 路径（时间，大小）`：文件名里虽然带着 `文件夹/`，
+    但混在几十行里**看不出有哪几个文件夹**，模型自然也不会去"进文件夹"。
+    """
     files = list_files()
     if not files:
         return "（生成文库还是空的）"
+    groups: dict = {}
+    for f in files:
+        groups.setdefault(f.get("folder") or "", []).append(f)
     lines = []
-    for f in files[:max_items]:
-        lines.append("- %s  （%s，%d 字节约）" % (f["rel"], f["modified"], f["size"]))
-    if len(files) > max_items:
-        lines.append("…… 还有 %d 个文件" % (len(files) - max_items))
+    shown = 0
+    for folder in sorted(groups, key=lambda x: (x == "", x)):
+        items = groups[folder]
+        lines.append("【%s】%d 个文件" % (folder or "根目录", len(items)))
+        for f in items:
+            if shown >= max_items:
+                break
+            lines.append("  · %s  （%s，%d 字节）"
+                         % (f["name"], f["modified"], f["size"]))
+            shown += 1
+    if len(files) > shown:
+        lines.append("…… 还有 %d 个文件" % (len(files) - shown))
     return "\n".join(lines)
 
 

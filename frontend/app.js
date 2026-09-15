@@ -504,7 +504,10 @@
         return;
       }
       list.innerHTML = "";
-      docs.forEach((doc) => {
+      // 知识库支持子文件夹（按课程 / 项目分类放）。
+      // 有子文件夹就按文件夹分组，像资源管理器；只有根目录文件时照旧平铺 ——
+      // 否则明明没分层却多出一行「📁 根目录」，反而更乱。
+      const kbRow = (doc) => {
         const row = document.createElement("div");
         row.className = "kb-item" + (doc.indexed ? "" : " bad");
         const ext = (doc.ext || "").toLowerCase();
@@ -524,13 +527,36 @@
           ? `${fmtChars(doc.chars)} · 可检索`
           : (doc.note || "读不出文字");      // 读不了要说清原因，不能让人以为没放进去
         row.querySelector(".kb-size").textContent = fmtBytes(doc.size || 0);
+        const rel = doc.rel || doc.filename || doc.id;
         row.querySelector(".kb-del").onclick = async () => {
-          if (!confirm(`从知识库移除《${doc.filename}》？\n（磁盘上的文件也会一起删掉）`)) return;
-          await api("/api/kb/" + encodeURIComponent(doc.filename), { method: "DELETE" });
+          if (!confirm(`从知识库移除《${rel}》？\n（磁盘上的文件也会一起删掉）`)) return;
+          // ⚠️ 用 rel（含文件夹）而不是 filename：子目录里可能有同名文件，
+          // 只给文件名后端无法确定删哪一个（会拒绝执行）
+          await api("/api/kb/" + encodeURIComponent(rel), { method: "DELETE" });
           loadKb();
         };
-        list.appendChild(row);
-      });
+        return row;
+      };
+      if (!docs.some((d) => (d.folder || "").trim())) {
+        docs.forEach((doc) => list.appendChild(kbRow(doc)));
+      } else {
+        // 分组顺序**照后端给的来**（后端会把「第一章」排在「第二章」前面）。
+        // 前端自己 sort 的话，中文会按拼音排成 二、九、六、七、三… 看不懂。
+        const groups = {};
+        const order = [];
+        docs.forEach((d) => {
+          const k = d.folder || "";
+          if (!groups[k]) { groups[k] = []; order.push(k); }
+          groups[k].push(d);
+        });
+        order.forEach((folder) => {
+          const head = document.createElement("div");
+          head.className = "folder-head";
+          head.textContent = "📁 " + (folder || "根目录");
+          list.appendChild(head);
+          groups[folder].forEach((doc) => list.appendChild(kbRow(doc)));
+        });
+      }
     } catch (e) { /* 静默 */ }
   }
 
@@ -563,16 +589,36 @@
         '或者「给我一个 Python 模块」，它就会存到这里。</div>';
       return;
     }
-    list.innerHTML = files.map((f) => {
-      const icon = /\\.(docx)$/i.test(f.name) ? "📄"
-        : /\\.(md|markdown)$/i.test(f.name) ? "📝"
-        : /\\.(py|js|ts|java|c|cpp|go|rs|sh|bat|ps1)$/i.test(f.name) ? "💻"
-        : /\\.(json|csv|yml|yaml|ini)$/i.test(f.name) ? "🗂" : "📃";
+    const dlRow = (f) => {
+      // 注意反斜杠只有一个：`/\\.(docx)$/` 是"反斜杠+任意字符+docx"，
+      // 永远匹配不上 .docx（早先过度转义留下的坑，这里修掉）
+      const icon = /\.(docx)$/i.test(f.name) ? "📄"
+        : /\.(md|markdown)$/i.test(f.name) ? "📝"
+        : /\.(py|js|ts|java|c|cpp|go|rs|sh|bat|ps1)$/i.test(f.name) ? "💻"
+        : /\.(json|csv|yml|yaml|ini)$/i.test(f.name) ? "🗂" : "📃";
       return `<div class="list-item dl-item${f.rel === dlCurrent ? " active" : ""}" data-rel="${escapeHtml(f.rel)}">` +
         `<span class="dl-icon">${icon}</span>` +
         `<span class="dl-name" title="${escapeHtml(f.rel)}">${escapeHtml(f.name)}</span>` +
         `<span class="dl-meta">${escapeHtml(f.modified)} · ${(f.size / 1024).toFixed(1)}KB</span></div>`;
-    }).join("");
+    };
+    // 同知识库：有子文件夹才分组显示
+    if (!files.some((f) => (f.folder || "").trim())) {
+      list.innerHTML = files.map(dlRow).join("");
+    } else {
+      // 同知识库：顺序按后端给的来，别在前端重排
+      const groups = {};
+      const order = [];
+      files.forEach((f) => {
+        const k = f.folder || "";
+        if (!groups[k]) { groups[k] = []; order.push(k); }
+        groups[k].push(f);
+      });
+      list.innerHTML = order
+        .map((folder) =>
+          `<div class="folder-head">📁 ${escapeHtml(folder || "根目录")}</div>` +
+          groups[folder].map(dlRow).join(""))
+        .join("");
+    }
     list.querySelectorAll(".dl-item").forEach((el) => {
       el.onclick = () => openDoclibFile(el.dataset.rel);
     });

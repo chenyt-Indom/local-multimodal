@@ -51,15 +51,123 @@ def ensure_dir() -> str:
     if not os.path.exists(readme):
         try:
             with open(readme, "w", encoding="utf-8") as f:
-                f.write("把领域资料（.txt / .md）放进这个文件夹即可被检索到，"
-                        "不需要重新导入。\n以 _ 开头的文件会被忽略。\n")
+                f.write("把领域资料放进这个文件夹即可被检索到，不需要重新导入。\n"
+                        "支持任意格式（txt / md / pdf / docx / xlsx / pptx…），\n"
+                        "也支持子文件夹 —— 按课程、按项目分门别类放，检索时照样找得到。\n"
+                        "以 _ 开头的文件或文件夹会被忽略（说明和索引就放在这类名字下）。\n")
         except Exception:
             pass
     return KB_DIR
 
 
+def _rel(path: str) -> str:
+    """取相对知识库根的路径（子文件夹用 / 分隔，跨平台一致）。"""
+    return os.path.relpath(path, KB_DIR).replace(os.sep, "/")
+
+
+def _is_hidden(rel: str) -> bool:
+    """任意一段以 _ 开头就跳过（说明文件、索引、用户想忽略的东西）。"""
+    return any(p.startswith("_") for p in rel.split("/"))
+
+
+def _safe_rel(name: str) -> str:
+    """把名字收敛成**库内**的安全相对路径（支持子文件夹）。
+
+    和生成文库同一套规则：挡 `..`、挡盘符、非法字符替换成 _。
+    盘符要**明确拒绝**而不是悄悄剥掉 —— 否则 `D:/笔记.md` 会变成库里的
+    `笔记.md`，用户以为写到了 D 盘（生成文库那边踩过这个坑）。
+    """
+    raw = str(name or "").strip().replace("\\", "/")
+    if not raw:
+        raise ValueError("文件名不能为空")
+    if re.match(r"^[A-Za-z]:", raw):
+        raise ValueError("不要写盘符（如 D:）—— 只能填知识库目录内的相对路径")
+    raw = raw.lstrip("/")
+    parts = []
+    for p in raw.split("/"):
+        p = p.strip()
+        if not p or p == ".":
+            continue
+        if p == "..":
+            raise ValueError("路径里不允许出现 ..")
+        parts.append(re.sub(r'[<>:"|?*\x00-\x1f]', "_", p))
+    if not parts:
+        raise ValueError("文件名不合法")
+    rel = "/".join(parts)
+    full = os.path.abspath(os.path.join(KB_DIR, rel))
+    root = os.path.abspath(KB_DIR) + os.sep
+    if not full.startswith(root):
+        raise ValueError("路径越界（只能写在知识库目录里）")
+    return rel
+
+
+def _iter_docs():
+    """递归遍历知识库，产出 (rel, 绝对路径)。
+
+    ⚠️ 遍历只留这一处。原来是"列目录"和"建索引"各写一遍 os.listdir ——
+    加子目录支持时最容易只改一处，结果列表里有、检索里没有（或反过来）。
+    """
+    _ensure_dir()
+    for root, dirs, files in os.walk(KB_DIR):
+        dirs[:] = [d for d in dirs if not d.startswith("_")]
+        for fn in files:
+            if fn.startswith("_") or fn.endswith(".json"):
+                continue
+            full = os.path.join(root, fn)
+            rel = os.path.relpath(full, KB_DIR).replace(os.sep, "/")
+            if _is_hidden(rel):
+                continue
+            yield rel, full
+
+
+_CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def _cn_to_num(text: str) -> str:
+    """把中文数字换成阿拉伯数字，**只用于排序**（不改变显示）。
+
+    「第一章」→「第1章」。不这么做的话，按拼音排出来是
+    二、九、六、七、三、十、四、五、一 —— 用户完全看不懂这个顺序。
+    """
+    def conv(m):
+        t = m.group(0)
+        if len(t) == 1:
+            if t == "十":
+                return "10"                 # 单字「十」是个坑：不特判就漏掉
+            return str(_CN_DIGITS.get(t, t))
+        if "十" in t:                       # 十一 / 二十 / 二十三
+            parts = t.split("十")
+            head = _CN_DIGITS.get(parts[0], 1) if parts[0] else 1
+            tail = _CN_DIGITS.get(parts[1], 0) if len(parts) > 1 and parts[1] else 0
+            return str(head * 10 + tail)
+        return "".join(str(_CN_DIGITS.get(c, c)) for c in t)
+
+    return re.sub(r"[零〇一二两三四五六七八九十]+", conv, text)
+
+
+def _sort_key(rel: str):
+    """目录排序键：中文数字转阿拉伯 + 所有数字零填充。
+
+    零填充是必须的：排序是按字符串比的，"第10章" < "第2章"
+    （'1' < '2'），必须变成 0010 vs 0002 才是人期待的顺序。
+    """
+    out = []
+    for part in rel.split("/"):
+        t = _cn_to_num(part)
+        t = re.sub(r"\d+", lambda m: m.group(0).zfill(4), t)
+        out.append(t)
+    return "/".join(out)
+
+
 def _doc_id(path):
-    return os.path.basename(path).split(".")[0]
+    """doc_id = 相对路径去掉扩展名（支持子文件夹，如 `课程/讲义1`）。
+
+    用相对路径而不是 basename：子文件夹里出现同名文件时
+    （`第一章/讲义.pdf` 和 `第二章/讲义.pdf`），basename 会在索引里
+    **互相覆盖**，最后只有一个能被检索到 —— 另一个等于白放。
+    """
+    return os.path.splitext(_rel(path))[0]
 
 
 def find_doc_path(doc_id: str) -> str:
@@ -68,12 +176,11 @@ def find_doc_path(doc_id: str) -> str:
     ⚠️ 以前检索里写死了 `did + ".txt"`，找不到再试 `".md"` ——
     PDF / Word 文档两个都试不中，取回空文本，于是就"检索不到"。
     """
-    _ensure_dir()
-    for fn in os.listdir(KB_DIR):
-        if fn.startswith("_") or fn.endswith(".json"):
-            continue
-        if os.path.splitext(fn)[0] == doc_id:
-            return os.path.join(KB_DIR, fn)
+    want = str(doc_id or "").strip().replace("\\", "/").lstrip("/")
+    stem = os.path.splitext(want)[0]          # 允许传带扩展名的名字
+    for rel, full in _iter_docs():
+        if os.path.splitext(rel)[0] == stem:
+            return full
     return ""
 
 
@@ -119,17 +226,14 @@ def list_documents():
     """
     _ensure_dir()
     docs = []
-    for fn in os.listdir(KB_DIR):
-        if fn.startswith("_") or fn.endswith(".json"):
-            continue
-        path = os.path.join(KB_DIR, fn)
-        if not os.path.isfile(path):
-            continue
+    for rel, path in _iter_docs():
         text, note = read_doc(path)
-        ext = os.path.splitext(fn)[1].lower().lstrip(".")
+        ext = os.path.splitext(rel)[1].lower().lstrip(".")
         docs.append({
             "id": _doc_id(path),
-            "filename": fn,
+            "rel": rel,                                   # 相对路径（含子文件夹）
+            "folder": os.path.dirname(rel),               # "" = 根目录
+            "filename": os.path.basename(rel),
             "ext": ext,
             "size": os.path.getsize(path),
             "chars": len(text),
@@ -137,24 +241,30 @@ def list_documents():
             "note": note,
             "updated_at": os.path.getmtime(path),
         })
-    # 能检索的排前面
-    docs.sort(key=lambda d: (not d["indexed"], d["filename"]))
+    # 能检索的排前面；再按"转数字后的路径"排 —— 同层内就是自然顺序
+    # （第一章 < 第二章 < 第十章），前端直接照这个顺序分组显示
+    docs.sort(key=lambda d: (not d["indexed"], _sort_key(d["rel"])))
     return docs
 
 
 def save_document(name: str, content: str) -> dict:
     """保存一份**纯文本**知识文档（界面上粘贴文字用的）。"""
     _ensure_dir()
-    safe = os.path.basename(name).replace("..", "").strip()
-    if not safe:
-        safe = f"doc_{int(time.time())}.txt"
-    if not safe.endswith((".txt", ".md")):
-        safe += ".txt"
-    path = os.path.join(KB_DIR, safe)
+    # 名字为空才用默认名；名字**不合法**（含 ..、盘符）要直接报错 ——
+    # 静默回退成 doc_<时间戳>.txt 的话，用户以为存下了、回头根本找不到。
+    # 注意：字符串可能本来就是 str，不用考虑 None
+    if not str(name or "").strip():
+        rel = f"doc_{int(time.time())}.txt"
+    else:
+        rel = _safe_rel(name)
+    if not rel.lower().endswith((".txt", ".md")):
+        rel += ".txt"
+    path = os.path.join(KB_DIR, rel.replace("/", os.sep))
+    os.makedirs(os.path.dirname(path) or KB_DIR, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
-    return {"id": _doc_id(path), "filename": safe, "size": len(content),
-            "updated_at": os.path.getmtime(path)}
+    return {"id": _doc_id(path), "rel": rel, "filename": os.path.basename(rel),
+            "size": len(content), "updated_at": os.path.getmtime(path)}
 
 
 def save_bytes(name: str, data: bytes) -> dict:
@@ -166,24 +276,42 @@ def save_bytes(name: str, data: bytes) -> dict:
     原始字节存好，读取时交给 doc_extract 解析。
     """
     _ensure_dir()
-    safe = os.path.basename(name or "").replace("..", "").strip()
-    if not safe:
-        safe = f"doc_{int(time.time())}.txt"
-    path = os.path.join(KB_DIR, safe)
+    if not str(name or "").strip():
+        rel = f"doc_{int(time.time())}.txt"
+    else:
+        rel = _safe_rel(name)          # 非法名直接抛错，不静默改名
+    path = os.path.join(KB_DIR, rel.replace("/", os.sep))
+    os.makedirs(os.path.dirname(path) or KB_DIR, exist_ok=True)
     with open(path, "wb") as f:
         f.write(data)
     _text_cache.pop(os.path.abspath(path), None)   # 覆盖了旧文件要清缓存
     text, note = read_doc(path)
-    return {"id": _doc_id(path), "filename": safe, "size": len(data),
+    return {"id": _doc_id(path), "rel": rel, "filename": os.path.basename(rel),
+            "size": len(data),
             "chars": len(text), "indexed": bool(text.strip()), "note": note,
             "updated_at": os.path.getmtime(path)}
 
 
 def delete_document(name: str) -> bool:
-    safe = os.path.basename(name)
-    path = os.path.join(KB_DIR, safe)
+    """删除文档。name 可以是相对路径（含子文件夹），也可以只是文件名。
+
+    只给文件名、而子文件夹里存在**多个同名文件**时**拒绝删除**并返回 False ——
+    猜错就删掉别人一份资料，代价太大，宁可让调用方给全路径。
+    """
+    _ensure_dir()
+    try:
+        rel = _safe_rel(name)
+    except ValueError:
+        return False
+    path = os.path.join(KB_DIR, rel.replace("/", os.sep))
     if os.path.isfile(path):
         os.remove(path)
+        return True
+    # 兜底：只给了文件名时，在子文件夹里找；有歧义就不动
+    base = os.path.basename(rel)
+    hits = [full for r, full in _iter_docs() if os.path.basename(r) == base]
+    if len(hits) == 1:
+        os.remove(hits[0])
         return True
     return False
 
@@ -194,10 +322,7 @@ def _build_index():
     _ensure_dir()
     documents = {}
     raw_len = {}
-    for fn in os.listdir(KB_DIR):
-        if fn.startswith("_") or fn.endswith(".json"):
-            continue
-        path = os.path.join(KB_DIR, fn)
+    for rel, path in _iter_docs():
         tokens = _tokenize(_read(path))
         if not tokens:
             continue
@@ -267,9 +392,45 @@ def search(query: str, top_k: int = 6):
             if positions:
                 anchor = min(positions)
                 snippet = text[max(0, anchor - 60): anchor + 400]
+        rel = _rel(path)
         results.append({"doc_id": did, "score": round(total, 4),
-                        "content": snippet, "filename": did})
+                        "content": snippet, "filename": os.path.basename(rel),
+                        "rel": rel, "folder": os.path.dirname(rel)})
     return results
+
+
+def tree_text(max_items: int = 200, head_chars: int = 50) -> str:
+    """给模型看的知识库目录树（按文件夹分组）。
+
+    为什么要树形：用户是按课程 / 项目建子文件夹来组织资料的，
+    平铺一串文件名会让模型**看不出结构**，也就想不到"去某个文件夹里找"。
+    带上每篇开头几十个字，模型才好判断"这篇是不是我要的"。
+    """
+    _ensure_dir()
+    docs = list_documents()
+    if not docs:
+        return "（知识库是空的）"
+    groups: dict = {}
+    for d in docs:
+        groups.setdefault(d.get("folder") or "", []).append(d)
+    lines = []
+    shown = 0
+    # 根目录排最后，子文件夹按名字排 —— 看起来就像资源管理器
+    for folder in sorted(groups, key=lambda x: (x == "", x)):
+        items = groups[folder]
+        lines.append("【%s】%d 篇" % (folder or "根目录", len(items)))
+        for d in items:
+            if shown >= max_items:
+                break
+            full = os.path.join(KB_DIR, d["rel"].replace("/", os.sep))
+            text, _note = read_doc(full)
+            head = (text or "").strip().replace("\n", " ")[:head_chars]
+            mark = "" if d.get("indexed") else "（读不出文字：%s）" % (d.get("note") or "格式不支持")
+            lines.append("  · %s %s%s" % (d["filename"], mark, head))
+            shown += 1
+    if len(docs) > shown:
+        lines.append("…… 还有 %d 篇" % (len(docs) - shown))
+    return "\n".join(lines)
 
 
 def build_rag_context(query: str, top_k: int = 4) -> str:
@@ -287,7 +448,10 @@ def build_rag_context(query: str, top_k: int = 4) -> str:
     lines = ["【知识库资料】（来自用户导入的领域文档，**优先于联网结果采信**；"
              "回答时注明出自哪一篇）"]
     for i, r in enumerate(results, 1):
-        lines.append(f"[资料{i}]({r['filename']})\n{r['content']}")
+        # 显示完整相对路径（含文件夹），模型才能说清"出自哪一篇"，
+        # 也能据此知道该去哪翻更多资料
+        tag = r.get("rel") or r.get("filename")
+        lines.append(f"[资料{i}]({tag})\n{r['content']}")
     lines.append("\n（以上是自动检索到的相关片段，通常够用。"
                  "若需要更多细节、或想先看看知识库里都有哪些资料，"
                  "可调用 search_knowledge 工具（list_all=true 列目录）；"

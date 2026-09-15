@@ -339,9 +339,12 @@ _LIBRARY_SCHEMA = {
             "  · 知识库 = 用户的资料，**只能读、绝不能改**；\n"
             "  · 生成文库 = 你的产出，**可以写、可以改、可以删**。\n"
             "用 action 指定动作：\n"
-            "· list —— 列出文库里的文件（不知道有什么就先列一下）\n"
-            "· read —— 读文件正文（name）\n"
+            "· list —— 列出文库的目录结构（按文件夹分组；不知道有什么就先列一下）\n"
+            "· read —— 读文件正文（name），name 可以是 `文件夹/文件名`\n"
             "· write —— 写入/覆盖（name + content）；name 带 .md/.txt/.py/.json 等后缀\n"
+            "  ★ name 可以带**子文件夹**，如 `作文/议论文/环境.md`、`代码/爬虫/main.py`。\n"
+            "    文件多了就按文件夹归类（用户按课程/项目分组时，跟着它的结构走），\n"
+            "    别全堆在根目录 —— 也不用为了分层硬造文件夹，几个文件平铺就够了。\n"
             "· append —— 追加到文件末尾（name + content）\n"
             "· delete —— 删除（会移进回收站，可恢复）\n"
             "· copy —— 复制成新文件（name + new_name）\n"
@@ -419,7 +422,8 @@ _KB_SCHEMA = {
         "description": (
             "检索本地知识库（用户导入的领域文档）。**这是用户自己的资料，"
             "优先级高于联网搜索**：涉及专业领域、内部规范、项目/产品资料时，先来这里查。\n"
-            "· 建议先用 list_all=true 摸清有哪些文档，再针对性检索；\n"
+            "· 建议先用 list_all=true 看**目录结构**（按文件夹分组、带开头摘要），"
+            "再针对性检索；\n"
             "· 一次没查到就换关键词再查，允许多轮检索；\n"
             "· 需要时效性信息时，可以**在同一轮里同时调用本工具和 web_search**，"
             "用知识库答内部细节、用网络补最新情况。\n"
@@ -1389,13 +1393,10 @@ def _do_library(arguments, ui_events=None):
 
     try:
         if action == "list":
-            files = library_mod.list_files()
-            if not files:
-                return "生成文库现在是空的。要写文件的话用 action=write 并给 name 和 content。"
-            lines = ["【生成文库】共 %d 个文件：" % len(files)]
-            for f in files[:60]:
-                lines.append("- %s（%s，%d 字节）" % (f["rel"], f["modified"], f["size"]))
-            return "\n".join(lines)
+            return ("【生成文库】目录结构（按文件夹分组）：\n"
+                    + library_mod.tree_text(max_items=120)
+                    + "\n\n写文件时 name 可以带子文件夹（如 `作文/第二版.md`），"
+                      "用文件夹归类更好找。")
 
         if action == "read":
             r = library_mod.read_file(name)
@@ -1515,18 +1516,14 @@ def _do_search_knowledge(arguments):
 
     # 先摸清有哪些资料
     if arguments.get("list_all"):
-        lines = [f"知识库共有 {len(docs)} 篇文档："]
-        for i, d in enumerate(docs, 1):
-            fn = d.get("filename") or d.get("id") or "?"
-            # 顺带把开头一小段带出来，模型才好判断"这篇是不是我要的"
-            try:
-                with open(os.path.join(kb_mod.KB_DIR, fn), "r", encoding="utf-8") as f:
-                    head = f.read(90).replace("\n", " ").strip()
-            except Exception:
-                head = ""
-            lines.append(f"{i}. 《{fn}》（{d.get('chars', 0)} 字）{head}")
-        lines.append("\n需要细节时，用 query 参数针对性检索。")
-        return "\n".join(lines)
+        # 用树形输出（按文件夹分组）。原来的实现有两个毛病：
+        #   · 只显示 basename，看不出文件在哪个子文件夹里
+        #   · 用 os.path.join(KB_DIR, fn) 直接打开 —— 子目录里的文件**打不开**，
+        #     开头摘要永远是空的（静默失败，最难查）
+        return ("知识库的目录结构（按文件夹分组，`·` 后面是开头摘要）：\n"
+                + kb_mod.tree_text()
+                + "\n\n需要细节时用 query 针对性检索；"
+                  "也可以按文件夹找 —— 文件名可带路径，如 `课程A/第一章/讲义.md`。")
 
     query = (arguments.get("query") or "").strip()
     if not query:
@@ -1538,7 +1535,8 @@ def _do_search_knowledge(arguments):
                 f"（当前共 {len(docs)} 篇文档；可换关键词再试，或 list_all=true 看看都有什么）")
     lines = [f"知识库检索结果（关键词：{query}）："]
     for i, h in enumerate(hits, 1):
-        title = h.get("filename") or h.get("doc_id") or "?"
+        # 带上所在文件夹，模型才能说清"出自哪一篇"，也能据此去翻同目录的其他资料
+        title = h.get("rel") or h.get("filename") or h.get("doc_id") or "?"
         body = (h.get("content") or "").strip()
         lines.append(f"\n[{i}] 《{title}》\n{body[:1200]}")
     lines.append("\n（以上来自用户自己的知识库，比联网结果更贴合其领域；"

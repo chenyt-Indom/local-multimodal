@@ -1300,6 +1300,14 @@ async def chat(req: ChatRequest):
         "**完整复制过去** —— 不许只写摘要、不许留占位符（如「（在此粘贴正文）」）、不许自己另编一版。"
         "存完如实告诉用户存了哪个文件、多少字。\n"
         "- ⚠️ 描述文件内容时**只能说你真正写进去的东西**，别编造章节、页数或里边根本没有的内容。\n"
+        "- ⚠️ **别编造工具名或界面功能**。你手上只有系统给的那几个工具；"
+        "想做的事没有对应工具时，直接说做不到，不要虚构工具名（如 list_directory、search_files），"
+        "也不要编造界面里并不存在的操作（如「右键选择导出为 Word」）——"
+        "用户会照着去找，然后发现根本没有。\n"
+        "- **知识库和生成文库都支持子文件夹**：列目录时你会看到按文件夹分组的结构；"
+        "文件名可以带路径（如 `课程A/第一章/讲义.md`）。"
+        "写文件时如果用户指定了文件夹就按他说的放；文件多了也可以主动归类，"
+        "但别为了分层硬造文件夹。\n"
         "- ⚠️ **只有真的调用了 library 工具、并拿到成功回执，才能说「已保存」。"
         "没调用工具就声称已保存，是最严重的错误** —— 用户去文库一看是空的，白信你一场。\n"
         "- ⚠️ **知识库是用户的资料，只能读、绝不能改**；凡是要写文件一律进生成文库。"
@@ -2069,7 +2077,11 @@ def kb_list():
 
 @app.post("/api/kb")
 def kb_save(body: UploadBody):
-    doc = kb.save_document(body.name, body.content)
+    """保存一段文本到知识库。name 可带子文件夹，如 `课程A/第一章/笔记.md`。"""
+    try:
+        doc = kb.save_document(body.name, body.content)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     return {"ok": True, "document": doc}
 
 
@@ -2082,7 +2094,10 @@ async def kb_upload(file: UploadFile):
     解析交给读取时按扩展名走 doc_extract。
     """
     data = await file.read()
-    doc = kb.save_bytes(file.filename or "未命名", data)
+    try:
+        doc = kb.save_bytes(file.filename or "未命名", data)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     return {"ok": True, "document": doc}
 
 
@@ -2117,10 +2132,13 @@ async def doc_extract_upload(file: UploadFile):
             "error": "" if text.strip() else (note or "没能从这份文档里读出文字")}
 
 
-@app.delete("/api/kb/{name}")
+# ⚠️ 路径参数要用 `{name:path}`：知识库现在是支持子文件夹的，
+# `课程A/第一章/讲义.md` 这种名字里带 `/`，普通的 `{name}` 匹配不上。
+@app.delete("/api/kb/{name:path}")
 def kb_delete(name: str):
     if not kb.delete_document(name):
-        raise HTTPException(404, "文档不存在")
+        raise HTTPException(404, "文档不存在。若子文件夹里有多个同名文件，"
+                                 "请带上文件夹路径再删。")
     return {"ok": True}
 
 
