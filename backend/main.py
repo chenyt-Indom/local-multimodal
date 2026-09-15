@@ -20,6 +20,7 @@ import json
 import time
 import asyncio
 import datetime
+import logging
 import threading
 from . import (config, ollama_client, memory, kb, file_tools, video, web_tools,
                t2i, tools, voice, sessions, image_library, doclib, docx_write)
@@ -89,32 +90,43 @@ def _is_simple_question(text: str) -> bool:
     （见 chat()），否则模型可能来不及输出工具调用。
     """
     t = (text or "").strip()
-    if not t or len(t) > 30:
+    # 阈值从 30 收到 14：问句短 ≠ 答案短。
+    # 「Python 的列表和元组有什么区别」19 字，却要写几百字才讲得清。
+    if not t or len(t) > 14:
+        return False
+    # 带疑问/求解释意味的一律不当简单问题
+    if any(k in t for k in ("什么", "为什么", "怎么", "如何", "区别", "对比",
+                            "介绍", "解释", "分析", "讲讲", "说说", "写", "帮")):
         return False
     return not any(k in t for k in _COMPLEX_HINTS)
 
 
-# 简单问题的生成长度上限（思考+回答总量）。512 足以覆盖问候/常识问答，
-# 又能把"先想很久"压到 3~5 秒；复杂问题仍用配置里的完整配额。
-SIMPLE_MAX_TOKENS = 512
+# 简单问题的生成长度上限（思考+回答总量）。
+# ⚠️ 原来是 512，实测**明显不够**：「Python 的列表和元组有什么区别」这种
+# 19 字的问题会被 `_is_simple_question` 判成"简单"，512 token 写一半就断，
+# 用户看到的是"配额不足/回答被截断"。这类问题只是**问句短**，不代表答案短。
+# 1536 仍会偶尔截断，再提到 3072 —— 用户明确要求"尽量不要限制"。
+# 问候语这类真正的一问一答根本用不到 3072，自然停下，不会变慢。
+SIMPLE_MAX_TOKENS = 3072
 
 # 联网场景的生成长度下限：要把搜索结果喂给模型 + 让它逐条列出来源链接，
 # token 消耗远高于普通问答。给少了就会出现"搜索完了但没输出回答"。
-WEB_MAX_TOKENS = 4096
+WEB_MAX_TOKENS = 8192
 # 长文创作（作文/方案/报告）的输出上限。
 # 这类任务要真写出几百上千字，还要留足"思考"的额度 —— 4096 实测经常写不完，
 # 而且这一轮已经把用不到的工具 schema 砍掉了，腾出的空间正好给它。
-WRITING_MAX_TOKENS = 6144
+WRITING_MAX_TOKENS = 12288
 
 # 输出长度天花板：空回答重试时加倍，但不能无限涨
 # （上下文窗口还要留给提示词与历史，超出只会让 Ollama 截断提示词）
-MAX_TOKENS_CEILING = 8192
+MAX_TOKENS_CEILING = 16384
 
-# 送入模型的历史消息上限（约 40 轮）。
+# 送入模型的历史消息上限（约 60 轮）。
 # 之前是 40 条（20 轮），实测**玩"成语接龙"这种多轮小游戏时不够**：
 # 超过 20 轮以后，第 1 轮的内容会被裁掉，用户回头问"第一轮接的是什么"，
-# 模型只能说"忘记了"。轮次密集的短对话并不占多少 token，放宽到 80 条。
-MAX_CONTEXT_MESSAGES = 80
+# 模型只能说"忘记了"。轮次密集的短对话并不占多少 token，放宽到 120 条。
+# （真正把关的是下面的 token 预算，它会按 num_ctx 自动裁剪，所以这里放大是安全的。）
+MAX_CONTEXT_MESSAGES = 120
 
 
 def _est_tokens(text) -> int:
@@ -275,6 +287,45 @@ _MEM_WINDOW_TURNS = 8          # 每次最多带上最近 8 条消息（约 4 �
 _mem_pending: dict = {}
 _mem_lock = threading.Lock()
 
+# ⚠️ 后台提炼会**独占 Ollama**（它一次只跑一个请求），而提炼实测要 85~250 秒，
+# 万一再触发一次翻倍重试就是 ~500 秒。用户在这个窗口里发消息，
+# 只能干等到提炼跑完 —— 表现就是"问了半天没反应、像卡死了"（2026-09-15 实测踩到）。
+# 两道防线：
+#   ① 有聊天在跑时**绝不启动**提炼，推后 15 秒再试（见 _run_memory_extract）；
+#   ② 万一聊天来的时候提炼已经在跑，给它发一条 note 说明原因，
+#      至少用户知道"是在整理记忆"，而不是以为程序死了。
+_chat_busy = 0          # 正在进行的聊天请求数
+_extracting = False     # 后台记忆提炼是否正在跑
+_extract_abort = False  # 用户开始说话了 → 让提炼主动断开，把显卡还回去
+_busy_lock = threading.Lock()
+
+
+def _chat_started() -> None:
+    """有聊天请求进来：登记 + 通知正在跑的提炼"让路"。"""
+    global _chat_busy, _extract_abort
+    with _busy_lock:
+        _chat_busy += 1
+        _extract_abort = True
+
+
+def _chat_finished() -> None:
+    global _chat_busy
+    with _busy_lock:
+        _chat_busy -= 1
+
+
+async def _track_chat(agen):
+    """包住聊天流：登记"有聊天在跑"，并顺带告知用户何时在等后台提炼。"""
+    _chat_started()
+    try:
+        if _extracting:
+            yield json.dumps({"note": (
+                "正在后台整理上一轮的记忆，模型被占用，这次回复会稍慢一些…")}) + "\n"
+        async for chunk in agen:
+            yield chunk
+    finally:
+        _chat_finished()
+
 
 def _schedule_memory_extract(session: str, turns: list, model: str, cfg: dict,
                              urgent: bool = False) -> None:
@@ -303,21 +354,49 @@ def _schedule_memory_extract(session: str, turns: list, model: str, cfg: dict,
 
 
 def _run_memory_extract(session: str, model: str, cfg: dict) -> None:
+    global _extracting, _extract_abort
+    # 有聊天在跑就先让路（详见上面 _chat_busy 的说明）。
+    # 注意：这里**不能动 st["turns"]** —— 我们只是推迟，不是消费。
+    with _busy_lock:
+        busy = _chat_busy > 0
+    if busy:
+        t = threading.Timer(15.0, _run_memory_extract, args=(session, model, cfg))
+        t.daemon = True
+        with _mem_lock:
+            st = _mem_pending.get(session) or {}
+            st["timer"] = t
+            _mem_pending[session] = st
+        t.start()
+        return
     with _mem_lock:
         st = _mem_pending.get(session) or {}
         turns = list(st.get("turns") or [])
-        st["turns"] = []
+        # ⚠️ **先别清空 turns**：万一这次被用户打断（或失败），
+        # 这批对话还得留着下次再来一遍，否则这几轮的内容就永远记不上了。
         st["first_ts"] = time.time()
         st["running"] = True
         _mem_pending[session] = st
+    with _busy_lock:
+        _extracting = True
+        _extract_abort = False        # 新的提炼开始，重新接受打断信号
+    ok = False
     try:
-        _auto_extract_memory(session, turns, model, cfg)
+        ok = bool(_auto_extract_memory(session, turns, model, cfg,
+                                       abort=lambda: _extract_abort))
     except Exception:
-        pass
+        # ⚠️ 这里**不能**静默 pass。
+        # 自动记忆整个链路跑在后台线程里，出错了界面上完全看不出来 ——
+        # 用户只会觉得"模型又不记事"，而日志里一个字都没有，无从排查（踩过）。
+        logging.getLogger("uvicorn.error").warning(
+            "自动记忆提炼失败（session=%s）", session, exc_info=True)
     finally:
+        with _busy_lock:
+            _extracting = False
         with _mem_lock:
             st = _mem_pending.get(session) or {}
             st["running"] = False
+            if ok:
+                st["turns"] = []      # 成功了才清；被打断/失败留着下次重试
             _mem_pending[session] = st
 
 
@@ -328,17 +407,21 @@ def _run_memory_extract(session: str, model: str, cfg: dict) -> None:
 #     num_predict = 300  → done_reason=length，content **一个字都没有**
 #     num_predict = 500  → 同上（_sweep_one 原来是这个值）
 #     num_predict = 1500 → 同上
-#     num_predict = 4000 → done_reason=stop，要点正常输出
+#     num_predict = 4000 → 有时能出（长这样），有时思考超长仍然**空手而归**
+#     num_predict = 8000 → **连跑 3 次全部成功**（2026-09-15 实测）
 # 老代码给 300，于是**每一次自动提炼都在"空结果"上静默 return** ——
 # 只有用户明确说"记住"时走的 remember 工具（聊天路径预算大）才写得进去。
 # 试过 /no_think、系统提示写"不要思考"、把指令写得极简：**全都压不住它**，
 # 唯一的解法就是把思考的额度给够。
-_EXTRACT_TOKENS = 3000
-_EXTRACT_TOKENS_RETRY = 6000
+# 代价：这一步耗时**波动很大（实测 84s ~ 246s）**，跑在后台线程里。
+# 所以下面的 _run_memory_extract 出任何问题都必须打日志 —— 否则用户只看到
+# "怎么又不记事"，而我们手上一点线索都没有。
+_EXTRACT_TOKENS = 8000
+_EXTRACT_TOKENS_RETRY = 12000
 
 
 def _llm_extract(prompt: str, model: str, cfg: dict,
-                 budget: int = _EXTRACT_TOKENS) -> str:
+                 budget: int = _EXTRACT_TOKENS, abort=None) -> str:
     """跑一次"要点抽取"调用，返回模型正文；拿不到就返回空串。
 
     两个必须守住的点：
@@ -347,26 +430,87 @@ def _llm_extract(prompt: str, model: str, cfg: dict,
        而**重载会中断正在进行的生成**。老代码写死 4096 就是这么把回答打断的。
     2. 预算要够思考用（见 _EXTRACT_TOKENS）；万一还是被截断又没出正文，
        自动把预算翻倍重试一次 —— **绝不能静默失败**。
+
+    abort：可选的 `()->bool`。传了就改用**流式**请求，每收到一块问一次；
+    返回 True 说明"用户开始聊天了，让出模型"，立刻断开并返回 ""。
+    背景：Ollama 一次只跑一个请求，提炼动辄 85~250 秒 ——
+    不打断的话，用户这时发消息会**一直卡到提炼跑完**。
     """
     params = dict(cfg)
     params["temperature"] = 0.2
     params["max_tokens"] = budget
     for _ in range(2):
         try:
-            resp = client.chat([{"role": "user", "content": prompt}], model=model,
-                               stream=False, params=params)
-            data = resp.json() if hasattr(resp, "json") else resp
-            msg = data.get("message") or {}
-            text = (msg.get("content") or "").strip()
+            if abort is None:
+                resp = client.chat([{"role": "user", "content": prompt}], model=model,
+                                   stream=False, params=params)
+                data = resp.json() if hasattr(resp, "json") else resp
+                msg = data.get("message") or {}
+                text = (msg.get("content") or "").strip()
+                reason = data.get("done_reason")
+            else:
+                text, reason = _llm_extract_stream(model, prompt, params, abort)
+                if text is None:            # 被中断：直接把机会还给用户，不重试
+                    return ""
             if text:
                 return text
             # 正文为空：多半是思考把额度吃光了 → 加预算再来一次
-            if data.get("done_reason") != "length":
+            if reason != "length":
                 return ""
         except Exception:
+            logging.getLogger("uvicorn.error").warning(
+                "记忆提炼调用失败（model=%s, budget=%s）", model, params.get("max_tokens"),
+                exc_info=True)
             return ""
-        params["max_tokens"] = _EXTRACT_TOKENS_RETRY
+        # ⚠️ 重试的预算必须**不小于**上一次 —— 原来是直接赋 _EXTRACT_TOKENS_RETRY，
+        # 一旦调用方传了更大的 budget（比如 8000），重试反而用回 6000，
+        # 等于"越试越少"，必然还是空。取两者较大的那个。
+        params["max_tokens"] = max(_EXTRACT_TOKENS_RETRY,
+                                   int(params.get("max_tokens") or 0) * 2)
     return ""
+
+
+def _llm_extract_stream(model: str, prompt: str, params: dict, abort):
+    """流式跑提炼，中途可被 abort() 打断。
+
+    返回 (正文, done_reason)；被打断时返回 (None, "")。
+    用流式的唯一目的就是**能中途放手** —— 一旦发现用户开始说话，
+    立刻退出 with 块（连接关闭 → Ollama 停掉这次生成），把显卡让回去。
+    """
+    text = ""
+    reason = ""
+    resp = None
+    try:
+        resp = client.chat([{"role": "user", "content": prompt}], model=model,
+                           stream=True, params=params)
+        # iter_lines 是阻塞读 —— 这里本来就是后台线程，直接读没问题。
+        # chunk_size 给小一点，abort() 的响应才及时（否则要等一大块读完）。
+        for raw in resp.iter_lines(chunk_size=64, decode_unicode=False):
+            if abort and abort():
+                return None, ""
+            line = raw.decode("utf-8", "ignore").strip() if isinstance(raw, bytes) else raw.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            c = (obj.get("message") or {}).get("content")
+            if c:
+                text += c
+            if obj.get("done"):
+                reason = obj.get("done_reason") or ""
+    except Exception:
+        logging.getLogger("uvicorn.error").warning("流式提炼中断/失败", exc_info=True)
+        return (text.strip() or None), reason
+    finally:
+        # 一定要显式关掉：关连接 = 告诉 Ollama 别再算了，把显卡让出来
+        try:
+            if resp is not None:
+                resp.close()
+        except Exception:
+            pass
+    return text.strip(), reason
 
 
 # 判定"该不该记"的标准。要点是**把判断权交给模型**，而不是靠关键词 ——
@@ -392,6 +536,16 @@ _EXTRACT_PROMPT = """你是"用户档案整理员"。阅读下面的对话，挑
 · **不要**推断的：纯客观知识提问（「什么是…」「…的历史」「…分几类」）、
   一次性查资料；也**不要替他把话说满** —— 他说"在考虑"就记"在考虑"，
   别记成"决定要考"（推断过头会让后面的对话全跑偏）
+· ⚠️ **写「（推断）」之前先查【已知信息】里有没有同一件事** ——
+  推断只是补充"他没明说但能看出来的那部分"，**不是换个措辞把已知的事再记一遍**。
+  例：已知信息里已有「计划考自考本科，当前在权衡」，就**不要**再写
+  「（推断）正在权衡是否报考自考本科」—— 这是同一条，重复会把档案撑成同义句堆。
+  判断标准：**去掉「（推断）」后，和已知条目说的是不是同一件事？** 是 → 不写。
+· ⚠️ **同一主题只写一条**（这条最容易犯）：一个话题往往"既有事实又有推断"，
+  这时**只写信息更全的那条，事实优先于推断**。例：本轮已经写了
+  「长期|计划近期考教师资格证，目前正在准备」，就**不要再**补一条
+  「长期|（推断）正在权衡是否报考教师资格证」—— 后者没有新增任何信息，
+  纯属把同一条说了两遍，会白占长期记忆的字数上限。
 
 【绝对不要提取】
 · 寒暄闲聊（你好、谢谢、哈哈）和临时指令（"再短一点""换个说法"）
@@ -533,8 +687,11 @@ def _apply_extract(text: str, session: str, limit: int = 4) -> int:
     return kept
 
 
-def _auto_extract_memory(session: str, turns: list, model: str, cfg: dict) -> None:
+def _auto_extract_memory(session: str, turns: list, model: str, cfg: dict,
+                         abort=None) -> bool:
     """把**最近几轮**对话里的要点提炼进记忆（后台线程，不阻塞回复）。
+
+    返回是否**真的写进了记忆**（调用方据此决定要不要清空待处理队列）。
 
     长期记忆是"久远对话可被清理"的前提 —— 要点沉淀下来后，
     老的聊天记录才可以安全裁剪或清除。**所以释放归档前必须先跑一遍这个沉淀**，
@@ -548,19 +705,26 @@ def _auto_extract_memory(session: str, turns: list, model: str, cfg: dict) -> No
     长期记忆里堆出一串"同义句"（实测见过同一个人被记了三遍），白白吃掉 15000 字上限。
     """
     if not turns:
-        return
+        return False
     convo = "\n".join(
         "%s：%s" % ("用户" if m.get("role") == "user" else "助手",
                     str(m.get("content") or "")[:300])
         for m in turns if (m.get("content") or "").strip())
     if not convo:
-        return
+        return False
     known_long = memory.get_long().strip() or "（暂无）"
     known_short = memory.get_short(session).strip() or "（暂无）"
     prompt = _EXTRACT_PROMPT.format(long=known_long[-2500:], short=known_short[-800:],
                                     convo=convo)
-    text = _llm_extract(prompt, model, cfg)
-    _apply_extract(text, session, limit=4)
+    text = _llm_extract(prompt, model, cfg, abort=abort)
+    if not text:
+        # 模型没吐出任何要点（多为思考吃光额度），或者被用户打断。
+        # 前者原来什么都不说，表现就是"聊了半天，记忆库还是空的"，排查时毫无线索。
+        if not (abort and abort()):
+            logging.getLogger("uvicorn.error").warning(
+                "记忆提炼返回空（session=%s, model=%s）", session, model)
+        return False
+    return _apply_extract(text, session, limit=4) > 0
 
 
 
@@ -854,13 +1018,45 @@ MAX_TOOL_ROUNDS = 10  # 单次对话内最多连续调用工具轮次，防止�
 # （2026-09-15 扩展：原来只管代码。实测「写一篇小作文」这类长文生成会让默认模型
 #   思考吃光额度、正文为空、请求挂 10 分钟以上，所以长文创作也走这里。）
 # 代价是切换模型要重新加载（12GB 显存放不下两个模型），所以只在真需要时才切。
-_CODE_HINTS = (
-    "写代码", "代码", "脚本", "函数", "程序", "报错", "bug", "调试", "跑一下",
-    "正则", "sql", "算法", "数据结构", "排序", "递归", "爬虫", "接口", "重构",
-    "python", "javascript", "typescript", "java", "c++", "c#", "golang", "rust",
-    "html", "css", "shell", "bash", "bat", "powershell", "json", "api",
-    "帮我实现", "实现一个", "写一段", "写个", "单元测试", "帮我改这段",
+# ⚠️ 分「强信号 / 弱信号」两档（2026-09-15 修）。
+# 原来把语言名和"代码/脚本/函数"混在一张表里，只要句子里出现 "python" 就切模型 ——
+# 实测「Python 的列表和元组有什么区别？」这种**纯概念题**被切到代码模型，
+# 而 qwen2.5-coder 不会走原生工具通道，直接把工具调用当 JSON 文本吐出来，
+# 用户看到的是满屏 `{"name": "search_memory", "arguments": …}`，等于答非所问。
+# 规则：**强信号**出现即切；**弱信号**（只是提到了语言/格式名）必须
+# 同时出现动作词才算写代码任务。
+_CODE_STRONG = (
+    "写代码", "代码", "脚本", "报错", "bug", "调试", "跑一下", "运行一下",
+    "正则", "sql", "爬虫", "重构", "单元测试",
+    "帮我实现", "实现一个", "实现个", "写一段", "写个", "写一个",
+    "帮我改这段", "改这段", "这段代码", "注释一下",
 )
+# "递归/算法/数据结构/排序/函数" 这类**既是术语也能当概念题**的词放这一档 ——
+# 「什么是递归？」是知识问答，不能因此切到代码模型；
+# 「用递归实现斐波那契」才真的在要代码。
+_CODE_WEAK = (
+    "python", "javascript", "typescript", "java", "c++", "c#", "golang",
+    "rust", "html", "css", "shell", "bash", "bat", "powershell", "json",
+    "api", "接口", "函数", "排序", "数据库", "递归", "算法", "数据结构",
+)
+_CODE_ACTIONS = (
+    "写", "改", "实现", "调试", "运行", "跑", "报错", "错误", "修复", "优化",
+    "生成", "帮我", "给我", "补全", "完成",
+)
+
+
+def _is_code_task(text: str) -> bool:
+    t = (text or "").lower()
+    if not t:
+        return False
+    if "```" in t:
+        return True
+    if any(k in t for k in _CODE_STRONG):
+        return True
+    # 只是"提到了"Python/JSON 这类词 —— 还要有动作词才算真要写代码
+    if any(k in t for k in _CODE_WEAK):
+        return any(a in t for a in _CODE_ACTIONS)
+    return False
 
 # 长文创作类请求：这些任务**必须一次写出几百上千字**，
 # 默认的思考型模型会把输出额度全烧在思考上（实测两次重试都是空正文、请求挂 10 分钟以上），
@@ -898,15 +1094,6 @@ def _installed_models() -> set:
         return _model_tags_cache["names"]
     _model_tags_cache.update(t=now, names=names)
     return names
-
-
-def _is_code_task(text: str) -> bool:
-    t = (text or "").lower()
-    if not t:
-        return False
-    if "```" in t:
-        return True
-    return any(k in t for k in _CODE_HINTS)
 
 
 def _is_writing_task(text: str) -> bool:
@@ -1318,7 +1505,11 @@ async def chat(req: ChatRequest):
     # 其余 schema 全砍掉，把省下的额度让给正文；同时把输出上限提上去。
     # 为什么要这么绕：默认模型是思考型的，18 个工具的 schema（约 5800 token）
     # 加上思考，会把 num_ctx 挤到写不下几百字的正文，表现就是"想完什么都没写"。
-    writing_mode = bool(_is_writing_task(last_user)) and not images and not _recent_image()
+    writing_mode = (bool(_is_writing_task(last_user))
+                    # ⚠️ 「帮我写一段代码」同时命中写代码与长文创作，必须排除 ——
+                    # 否则会被当成"作文"砍掉工具、又切到代码模型，两头不讨好。
+                    and not _is_code_task(last_user)
+                    and not images and not _recent_image())
     if writing_mode:
         cfg["max_tokens"] = max(int(cfg.get("max_tokens") or 2048), WRITING_MAX_TOKENS)
     tool_schemas = tools.make_schemas(cfg.get("web_enabled", False),
@@ -1369,10 +1560,13 @@ async def chat(req: ChatRequest):
         # session 已在上面定义（记忆按对话隔离，需要提前拿到）
 
         # 空回答重试：qwen3-vl 的思考会吃掉大量 token，偶尔会「想完了但没来得及写正文」，
-        # 表现为思考戛然而止、界面什么都没有。这种情况按上面配置重跑一次并加倍配额。
+        # 表现为思考戛然而止、界面什么都没有。这种情况按上面配置重跑并加倍配额。
+        # 允许**最多 2 次**加倍（原来只给 1 次）：简单问题档只有 3072，
+        # 一次加倍到 6144 仍可能被思考吃光 —— 留第二次才够顶到 12288。
         # 注意：用独立的 gen_params 而不是改 cfg —— 在 gen() 里给 cfg 赋值会让它
         # 变成局部变量，导致前面读取 cfg 时报 UnboundLocalError。
-        retried_empty = False
+        retries_done = 0
+        _MAX_EMPTY_RETRIES = 2
         gen_params = dict(cfg)
 
         for _round in range(MAX_TOOL_ROUNDS):
@@ -1431,19 +1625,22 @@ async def chat(req: ChatRequest):
                 # （思考把配额用尽，正文一个字都没来得及写）。
                 # 这不是模型坏了，纯粹是配额给少了——加倍重试一次。
                 truncated = (done_reason == "length")
-                if truncated and not retried_empty:
-                    retried_empty = True
+                if truncated and retries_done < _MAX_EMPTY_RETRIES:
+                    retries_done += 1
                     boosted = max(int(gen_params.get("max_tokens") or 2048) * 2, 4096)
-                    gen_params["max_tokens"] = min(boosted, MAX_TOKENS_CEILING)
-                    yield json.dumps({"note": (
-                        "上一次生成被输出长度上限截断（思考占用过多），"
-                        "正在以更长的配额重试…")}) + "\n"
-                    continue
+                    nxt = min(boosted, MAX_TOKENS_CEILING)
+                    if nxt > int(gen_params.get("max_tokens") or 0):
+                        gen_params["max_tokens"] = nxt
+                        # 措辞别用"配额不足" —— 用户看到会以为是自己额度用完了，
+                        # 其实是模型把输出空间花在"思考"上了（2026-09-15 用户反馈）
+                        yield json.dumps({"note": (
+                            "模型思考占满了本次输出空间，正在自动加长输出上限重试…")}) + "\n"
+                        continue
                 if truncated and not round_msg["content"].strip():
                     # 重试后仍被思考吃光：如实告知，避免用户看到空白一脸茫然
                     yield json.dumps({"note": (
-                        "回答被输出长度上限截断。可尝试把问题问得更具体，"
-                        "或在界面调大「最大生成长度」。")}) + "\n"
+                        "模型把输出空间都花在思考上了，没能写出正文。"
+                        "换个更具体的问法，或在设置里调大「最大生成长度」再试。")}) + "\n"
                 break  # 本轮无工具调用，得到最终答复
 
             # ---------- 执行工具（Agent loop）----------
@@ -1562,7 +1759,8 @@ async def chat(req: ChatRequest):
                 pass
         yield json.dumps({"done": True, "text": final_text, "thinking": final_thinking}) + "\n"
 
-    return StreamingResponse(gen(), media_type="application/x-ndjson")
+    # 用 _track_chat 包一层：登记"有聊天在跑"，后台记忆提炼会主动让路（见 _chat_busy）
+    return StreamingResponse(_track_chat(gen()), media_type="application/x-ndjson")
 
 
 @app.post("/api/tool/confirm")

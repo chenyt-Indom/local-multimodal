@@ -742,9 +742,11 @@
   // 程序重启后自动恢复上次使用的会话。
   const sessionsListEl = $("#sessionsList");
 
-  // 界面只渲染最近这么多条消息，更早的折叠（要点由长期记忆承载）；
-  // 上下文同样只带最近这些，避免越聊越慢。
-  const RECENT_SHOW = 20;
+  // 界面渲染 + 送给后端的上下文条数。
+  // ⚠️ 原来是 20（=10 轮），实测太短：聊到十几轮以后模型就开始"忘了前面说的话"。
+  // 真正兜底的是后端的 token 预算（_trim_history_to_budget），
+  // 它装不下会自动裁并压成摘要 —— 所以这里可以放心放宽。
+  const RECENT_SHOW = 40;
 
   /** 把历史消息渲染到界面，并同步为上下文。返回实际渲染条数。 */
   function renderHistory(msgs) {
@@ -901,6 +903,22 @@
       const nm = $("#memSessName");
       if (nm) nm.textContent = await currentTitle(sessionId);
     } catch (e) { /* 静默：面板不可用不影响聊天 */ }
+  }
+
+  // ⚠️ 别在对话一结束就立刻 loadMemory()。
+  // 后端提炼记忆是**异步 + 防抖**的：停手 6 秒才启动，
+  // 而提炼本身要跑一次完整推理（思考型模型很慢）——
+  // **实测在 12GB 显卡上从"回答结束"到"记忆落盘"要 ~155 秒**（2026-09-15 实测）。
+  // 答完马上刷新只会读到"还没提炼"的旧内容，用户看到面板没变，
+  // 会误判成"模型没记住"（这正是用户反馈的问题）。
+  // 所以按实测节奏补刷几次，一直覆盖到 3 分钟。
+  let _memTimers = [];
+  function scheduleMemoryRefresh() {
+    _memTimers.forEach(clearTimeout);
+    _memTimers = [10000, 30000, 60000, 120000, 180000].map((ms) => setTimeout(() => {
+      loadMemory();
+      loadMemoryUsage();
+    }, ms));
   }
 
   function bindMemoryPanel() {
@@ -1295,7 +1313,7 @@
     images = []; videoB64 = null; docs = []; renderAttachments();
     inputEl.value = ""; autoGrow();
     await doSend(promptText, media.length ? media : null, docPayload);
-    loadMemory();   // 对话后同步 AI 写入的记忆文段
+    scheduleMemoryRefresh();   // 记忆提炼是后端异步防抖的，延迟补刷面板
   }
 
   async function doSend(promptText, mediaB64, docPayload) {
