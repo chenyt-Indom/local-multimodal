@@ -162,6 +162,87 @@ _GITHUB_PUSH_SCHEMA = {
 }
 
 
+# ---------------------------------------------------------------- 项目管理
+# 「完全自动开发平台」的一组工具：建项目 / 列项目 / 切项目 / 建目录 / 删 / 移动。
+#
+# ⚠️⚠️ 这 6 个的**处理函数和 dispatch 路由早就写好了，但 schema 一直没加到这里** ——
+# 于是只有"代码模型的文本协议"（_TEXT_TOOL_DOCS）看得到它们，
+# **默认模型（原生工具调用）根本看不到**。
+# 用户反馈"模型没有全自动操作平台的能力"，根因就是这个：
+# 平时聊天用的是默认模型，它手里只有 list / read / run / write 四个工具，
+# 建项目、改名、删除这些它压根不知道有。
+# **教训：加一个工具要同时改四处 —— schema、dispatch、处理函数、以及
+#   对应的提示词（原生走 make_schemas，文本协议走 _TEXT_TOOL_DOCS）。漏一处就是白加。**
+_WS_PROJECT_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_new_project",
+            "description": ("【开发工作区】新建一个项目并**立刻切进去**，之后的相对路径都相对它。"
+                            "**从零开始做东西时第一步就调它**；同名项目已存在时会直接切过去，不会报错。"),
+            "parameters": {"type": "object",
+                           "properties": {"name": {"type": "string",
+                                                   "description": "项目名，如 todo-app"}},
+                           "required": ["name"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_projects",
+            "description": "【开发工作区】列出所有项目（· 是当前项目）。不确定现在在哪个项目里就先调它。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_use_project",
+            "description": "【开发工作区】切换到另一个已有项目。",
+            "parameters": {"type": "object",
+                           "properties": {"name": {"type": "string", "description": "项目名"}},
+                           "required": ["name"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_mkdir",
+            "description": ("【开发工作区】新建一个目录。"
+                            "注意：workspace_write 写文件时**父目录会自动创建**，"
+                            "只有确实要一个空目录时才需要它。"),
+            "parameters": {"type": "object",
+                           "properties": {"rel": {"type": "string",
+                                                  "description": "相对路径，如 assets"}},
+                           "required": ["rel"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_delete",
+            "description": ("【开发工作区】删除项目里的文件或目录（会进 _回收站，能捞回来）。"
+                            "清理临时文件、删掉写错的文件时用它。"),
+            "parameters": {"type": "object",
+                           "properties": {"rel": {"type": "string", "description": "相对路径"}},
+                           "required": ["rel"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_move",
+            "description": "【开发工作区】重命名或移动文件 / 目录。",
+            "parameters": {"type": "object",
+                           "properties": {
+                               "rel": {"type": "string", "description": "原路径"},
+                               "to": {"type": "string", "description": "新路径"}},
+                           "required": ["rel", "to"]},
+        },
+    },
+]
+
+
 def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
                  code_exec: bool = False, writing: bool = False) -> list:
     """返回工具 schema 列表。
@@ -391,6 +472,9 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
     schemas.append(_WS_LIST_SCHEMA)
     schemas.append(_WS_READ_SCHEMA)
     schemas.append(_WS_WRITE_SCHEMA)
+    # 项目管理（建项目/切项目/建目录/删/改名）——「全自动开发平台」必需。
+    # ⚠️ 这几个以前**只给了代码模型的文本协议**，默认模型看不到，用户会觉得"它没这个能力"。
+    schemas.extend(_WS_PROJECT_SCHEMAS)
     # ⚠️ `write_code`（让专用代码模型代写代码）**暂时不启用** ——
     # 用户 2026-09-16 试过之后要求换回"按轮切换代码模型"的架构。
     # 原因：这台机器 12GB 显存装不下两个模型，每调一次 write_code 就要重新加载大脑，
@@ -1642,7 +1726,9 @@ def _do_workspace_run(arguments, ui_events=None) -> str:
         return ("这段代码里有需要用户确认的操作（%s），**没有执行**。"
                 "请换成不涉及这些操作的写法，或先跟用户说明再试。" % risk)
     if isinstance(ui_events, list):
-        ui_events.append({"type": "code", "code": _read_text_safe(p),
+        # ⚠️ 一定要带 `rel`：前端要显示「AI 运行结果 · xxx.py」，
+        # 不带的话用户不知道模型刚才跑的是哪个文件（实测反馈过）。
+        ui_events.append({"type": "code", "rel": rel, "code": _read_text_safe(p),
                           "out": r.get("out") or "", "err": r.get("err") or "",
                           "rc": r.get("rc"), "seconds": r.get("seconds"),
                           "risky": r.get("risky") or []})

@@ -939,3 +939,8 @@ body.dragging .drop-overlay,
   background: var(--panel2); color: var(--text); border: 1px solid var(--line);
   border-radius: 6px; padding: 0 6px; }
 
+
+/* 模型跑代码报错时，把「运行结果」面板标红 —— 报错是最该被看到的东西，
+   以前它被丢掉了，用户只看到模型嘴上说"跑过了"。 */
+.studio-out.has-error { border-left: 3px solid #e5534b; }
+.studio-out.has-error .studio-out-head { color: #ff8a80; }

@@ -238,17 +238,15 @@
       await refresh();
       await loadChanges();
       toast("已切到项目：" + project);
-      // ⚠️ **PyCharm 不会跟着换项目**（它是独立桌面程序，我们只能"为某个目录打开它"，
-      // 换不了它当前开着的项目）。这里的当前项目一换，AI 的读写就都在新项目里，
-      // 而用户眼前的 PyCharm 还停在上一个 —— 会以为"AI 把文件弄丢了 / 怎么报文件不存在"。
-      // 实测就踩过：模型读到"文件不存在"，于是干脆不改了。
-      // 所以换完项目必须提醒一句，把"两边对不上"这件事说破。
-      toast("别忘了点「🧠 " + (ideInfo.name || "PyCharm") + "」让 " +
-            (ideInfo.name || "PyCharm") + " 也切到这个项目", "warn");
-      setTimeout(function () {
-        toast("提示：AI 读写的是本项目（" + project + "），" +
-              (ideInfo.name || "PyCharm") + " 需要你点一下按钮才会跟着切", "warn");
-      }, 1600);
+      // 内置 VS Code **不会自己跟着换目录**（code-server 是启动时绑定目录的），
+      // 所以这里必须让它切到新项目 —— 否则用户在编辑器里看到的还是上一个项目的文件，
+      // 会以为"文件丢了"。`ensureVs()` 里比对 project，不一致就自动重启编辑器。
+      //
+      // ⚠️ 以前这里弹的是「别忘了点 🧠 PyCharm 让它也切过去」——
+      // 那是"编辑器是外部 PyCharm"时代的提示（PyCharm 是独立程序，我们切不动它）。
+      // 现在编辑器是**嵌在界面里的 VS Code**，我们自己就能切，不用再麻烦用户。
+      // 残留这种提示会让人以为还要手动操作（用户就是被这个提示问住的）。
+      ensureVs();
     } catch (e) { toast("切换失败：" + e.message); }
   }
 
@@ -582,6 +580,29 @@
     $("stOut").hidden = false;
     $("stOutTitle").textContent = title;
     $("stOutBody").textContent = body;
+  }
+
+  /* 把"模型跑代码"的结果显示到「运行结果」面板。
+     为什么要单独抽出来：聊天区会把它渲染成代码卡片，但**开发台里以前什么都没有** ——
+     用户看不到跑出来什么、更看不到报了什么错，等于模型白跑了。 */
+  function showRunResult(ev) {
+    var bits = [];
+    if (ev.out) bits.push(String(ev.out).replace(/\s+$/, ""));
+    if (ev.err) {
+      bits.push("【" + (ev.rc ? "报错" : "提示") + "】\n" + String(ev.err).replace(/\s+$/, ""));
+    }
+    if (!bits.length) {
+      bits.push("（这次没有输出 —— 代码里要用 print() 才能看到结果）");
+    }
+    var meta = [];
+    if (ev.rc !== null && ev.rc !== undefined) meta.push("退出码 " + ev.rc);
+    if (ev.seconds !== null && ev.seconds !== undefined) meta.push("用时 " + ev.seconds + " 秒");
+    showOut("AI 运行结果" + (ev.rel ? " · " + ev.rel : "") +
+            (meta.length ? "（" + meta.join(" · ") + "）" : ""),
+            bits.join("\n\n"));
+    // 报错时用醒目样式，别让用户漏看
+    var box = $("stOut");
+    if (box) box.classList.toggle("has-error", !!(ev.err && ev.rc));
   }
 
   var runId = "";
@@ -1080,6 +1101,12 @@
     // ① AI 正在往文件里逐字写（生成没结束）—— 只更新进度提示。
     //    内容在我们这边是**边生成边落盘**的，VS Code 看到文件在变就会自己刷出来。
     if (ev.type === "typing") { showTyping(ev); return; }
+    // 模型自己跑了代码（workspace_run）→ 把**真实输出 / 报错**显示到「运行结果」面板。
+    // 以前这里是 `if (ev.type !== "workspace") return;`，把这类事件**整个丢掉了** ——
+    // 于是在开发台里，模型跑完代码一片空白：用户只看到它嘴上说"跑过了"，
+    // 看不到任何输出，**报错更是完全看不见**（等于把调试能力废掉一半）。
+    // 聊天区虽然也有代码卡片，但用户人在开发台，不会回头去聊天里翻。
+    if (ev.type === "code") { showRunResult(ev); return; }
     if (ev.type !== "workspace") return;
     // AI 自己建了项目 / 换了项目 → 项目下拉框和文件树都得跟着换，
     // 否则它明明在写另一个项目，界面上还停在上一个（看起来就像"没生效"）。
