@@ -612,8 +612,15 @@ def open_in_ide(proj: str = "") -> dict:
     return {"ok": True, "ide": name, "exe": exe, "path": d, "project": p}
 
 
-def focus_ide_window(proj: str = "") -> dict:
-    """把本机 IDE（PyCharm）的窗口**拉到前台**。
+def focus_ide_window(proj: str = "", open_rel: str = "") -> dict:
+    """把本机 IDE（PyCharm）的窗口拉到前台，并在里面**打开指定文件**。
+
+    ⚠️ `open_rel` 不是可选项，是**必需**的：PyCharm 只对**已经在编辑器里
+    打开着的文件**做"检测到外部改动 → 重新加载"。
+    光把内容写到磁盘、再把窗口拉到前台 —— 那个文件要是没打开，
+    用户看到的还是原来那个画面，体感就是"AI 说写了，PyCharm 里什么都没有"
+    （用户原话："为什么 PyCharm 没有看到代码，我要他写的时候自动呈现代码"）。
+    所以必须由我们用命令行让 IDE 把文件打开。
 
     为什么要这一步：AI 写代码不是"模拟按键敲进 PyCharm"（那需要装 PyCharm 插件），
     而是**在磁盘上逐字写文件**，由 IDE 检测到外部改动后自己重载显示 ——
@@ -667,12 +674,27 @@ def focus_ide_window(proj: str = "") -> dict:
         if not found:
             return {"ok": False, "error": "没找到 IDE 窗口（可能还没打开）"}
         hwnd = found[0]
+        # ① **先在 IDE 里把这个文件打开**（关键！见下）
+        opened = False
+        if open_rel:
+            try:
+                import subprocess as _sp
+                _abs = abs_path(open_rel, proj)
+                if os.path.exists(_abs):
+                    # JetBrains 的 IDE 是**单实例**的：已经在跑的时候，
+                    # 再执行一次「exe + 文件路径」不会又开一个 IDE，
+                    # 而是把请求**转发给正在运行的实例**去打开这个文件，很快返回。
+                    _sp.Popen([exe, _abs], close_fds=True)
+                    opened = True
+            except Exception:
+                pass
+        # ② 然后把窗口还原并置前
         if user32.IsIconic(hwnd):
             user32.ShowWindow(hwnd, 9)     # SW_RESTORE：最小化了要先还原
         else:
             user32.ShowWindow(hwnd, 5)     # SW_SHOW
         user32.SetForegroundWindow(hwnd)
-        return {"ok": True}
+        return {"ok": True, "opened": opened}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 

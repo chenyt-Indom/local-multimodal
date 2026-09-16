@@ -2348,7 +2348,7 @@ async def chat(req: ChatRequest):
                                 # 放线程里做：Win32 调用别卡住生成流。
                                 threading.Thread(
                                     target=workspace.focus_ide_window,
-                                    kwargs={"proj": _target},
+                                    kwargs={"proj": _target, "open_rel": _rel},
                                     daemon=True).start()
                             # 节流：换文件立刻写；同文件每 60 字或每 0.3 秒写一次。
                             # 太密会把磁盘和 VS Code 的文件监视器打爆；太疏就没有"打字"感。
