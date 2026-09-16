@@ -11,6 +11,7 @@ import re
 import json
 import math
 import time
+import logging
 from . import config
 
 KB_DIR = config.data("data", "kb")
@@ -305,15 +306,43 @@ def delete_document(name: str) -> bool:
         return False
     path = os.path.join(KB_DIR, rel.replace("/", os.sep))
     if os.path.isfile(path):
-        os.remove(path)
-        return True
+        return _remove_file(path)
     # 兜底：只给了文件名时，在子文件夹里找；有歧义就不动
     base = os.path.basename(rel)
     hits = [full for r, full in _iter_docs() if os.path.basename(r) == base]
     if len(hits) == 1:
-        os.remove(hits[0])
+        return _remove_file(hits[0])
+    if not hits:
+        # **一个都没找到 → 文件本来就不在，算成功**。
+        # 实测踩过：用户先在资源管理器里把文件删了，界面上还留着旧列表，
+        # 再点「删除」→ 原来是 404「文档不存在」，用户看着莫名其妙
+        # （"我就是要删它，它没了不正是我要的结果吗"）。
+        # 删除是**幂等**的：目标状态"这个文件不存在"已经达到，就该算成功。
         return True
+    # 多个同名文件：猜错就删掉别人一份资料，宁可让调用方给全路径
     return False
+
+
+def _remove_file(path: str) -> bool:
+    """删掉一个知识库文件；**文件本来就不在也算成功**。
+
+    ⚠️ 这里必须容错 —— 实测踩过（日志里那条 FileNotFoundError 就是它）：
+      ① 用户**先在资源管理器里把文件删了**，再回应用界面点「删除」→
+         `os.remove` 抛 FileNotFoundError → 整个 /api/kb/delete 返回 500。
+         用户看到"删除失败"，可文件明明已经没了，只会一头雾水。
+      ② 本机还有一层"删除走回收站"的拦截，回收站环节失败也会抛别的异常。
+
+    删除应当是**幂等**的：目标状态是"这个文件不存在"，它已经达到了，就该算成功。
+    """
+    try:
+        os.remove(path)
+        return True
+    except FileNotFoundError:
+        return True            # 本来就不在了 = 用户的目的已达成
+    except Exception:
+        logging.getLogger("uvicorn.error").warning(
+            "删除知识库文档失败：%s", path, exc_info=True)
+        return False
 
 
 # ---------- 检索（TF-IDF + 余弦）----------

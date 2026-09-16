@@ -3927,8 +3927,13 @@ async def doc_extract_upload(file: UploadFile):
 # `课程A/第一章/讲义.md` 这种名字里带 `/`，普通的 `{name}` 匹配不上。
 @app.delete("/api/kb/{name:path}")
 def kb_delete(name: str):
+    # ⚠️ `delete_document` 是**幂等**的：文件已经不在了也返回 True。
+    # 实测踩过 —— 用户先在资源管理器里把文件删掉、界面上还留着旧列表，
+    # 再点「删除」时原来是 404「文档不存在」，用户一脸问号
+    # （"我就是要删它，它没了不正是我要的结果吗"）。
+    # 所以这里的 409 只剩一种情况：**同名文件有多个，无法确定删哪一个**。
     if not kb.delete_document(name):
-        raise HTTPException(404, "文档不存在。若子文件夹里有多个同名文件，"
+        raise HTTPException(409, "子文件夹里有多个同名文件，无法确定删哪一个。"
                                  "请带上文件夹路径再删。")
     return {"ok": True}
 
