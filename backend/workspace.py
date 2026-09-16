@@ -748,6 +748,83 @@ def stop_code_server() -> dict:
     return {"ok": True}
 
 
+# code-server（内置 VS Code）的默认设置。
+# 为什么要由我们写：VS Code 出厂那套默认值在这个应用里**是错的** ——
+# 实测用户一打开开发台就看到两个莫名其妙的东西：
+#   ① 一个「GitHub Personal Access Token」输入框糊在屏幕中间
+#      （VS Code 自带的 Copilot/GitHub 认证想登录，可我们要求**完全离线**）；
+#   ② 右侧一个「Build with Agent / Describe what to build」面板 ——
+#      那是 VS Code 自带的 AI 聊天，它有自己的一套模型，跟我们不是一回事，
+#      用户看到会以为"怎么有两个 AI"。
+# 这里的定位很明确：**这个应用里写代码的 AI 只有一个，就是我们自己的本地模型**。
+_VS_SETTINGS = {
+    # 打开就是干净的编辑区，别停在欢迎页
+    "workbench.startupEditor": "none",
+    "workbench.tips.enabled": False,
+    "workbench.enableExperiments": False,
+    "workbench.welcomePage.walkthroughs.openOnInstall": False,
+    # 关掉 VS Code 自带的 AI 聊天（多套候选键名，不同版本叫法不同，未知键无害）
+    "chat.disableAIFeatures": True,
+    "chat.commandCenter.enabled": False,
+    "chat.editor.enabled": False,
+    "workbench.secondarySideBar.defaultVisibility": "hidden",
+    # 别弹 GitHub 登录
+    "github.gitAuthentication": False,
+    "git.autofetch": False,
+    "git.confirmSync": False,
+    "git.openRepositoryInParentFolders": "never",
+    # 一切离线
+    "telemetry.telemetryLevel": "off",
+    "update.mode": "none",
+    "extensions.autoCheckUpdates": False,
+    "extensions.autoUpdate": False,
+}
+
+
+def _vs_user_dir() -> str:
+    """code-server 放 `settings.json` 的目录（各平台默认位置不一样）。"""
+    cands = []
+    if os.name == "nt":
+        la = os.environ.get("LOCALAPPDATA") or ""
+        if la:
+            cands.append(os.path.join(la, "code-server", "Data", "User"))
+    home = os.path.expanduser("~")
+    cands.append(os.path.join(home, ".local", "share", "code-server", "User"))
+    cands.append(os.path.join(home, ".local", "share", "code-server", "User"))
+    for c in cands:
+        if os.path.isdir(os.path.dirname(c)):
+            return c
+    return cands[0]
+
+
+def _ensure_vs_settings() -> None:
+    """把上面那套设置**合并**进 code-server 的 settings.json（保留用户已有的键）。
+
+    每次启动都写一遍：这样"改掉那些怪东西"是可复现的，
+    而不是靠手动改一次文件（Docker 版、换台机器都得重新来一遍）。
+    """
+    import json as _json
+    try:
+        p = os.path.join(_vs_user_dir(), "settings.json")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        cur = {}
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as fh:
+                    cur = _json.load(fh) or {}
+            except Exception:
+                cur = {}
+        if not isinstance(cur, dict):
+            cur = {}
+        if all(cur.get(k) == v for k, v in _VS_SETTINGS.items()):
+            return                      # 已经是我们的设置，不动它
+        cur.update(_VS_SETTINGS)
+        with open(p, "w", encoding="utf-8") as fh:
+            _json.dump(cur, fh, ensure_ascii=False, indent=2)
+    except Exception:
+        pass                            # 写不进去也不该拦住 VS Code 启动
+
+
 def start_code_server(proj: str = "") -> dict:
     """给当前项目起一个内置 VS Code（code-server），返回可访问地址。
 
@@ -760,6 +837,9 @@ def start_code_server(proj: str = "") -> dict:
     exe = find_code_server()
     if not exe:
         return {"ok": False, "error": "没有内置的 code-server（vendor/ 下没找到）"}
+    # 先把"出厂默认值里那些在本应用里不对的"设置写进去（关自带 AI 聊天、
+    # 关 GitHub 登录、关欢迎页、一切离线）—— 见 _VS_SETTINGS 的说明。
+    _ensure_vs_settings()
     p = safe_project(proj) if str(proj or "").strip() else active_project()
     d = root(p)
 

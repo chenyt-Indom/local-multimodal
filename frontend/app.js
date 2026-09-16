@@ -1799,6 +1799,9 @@
         signal: abortCtl.signal,
         body: JSON.stringify({ messages: history, images_b64: mediaB64,
                                docs: (docPayload && docPayload.length) ? docPayload : null,
+                               // 在开发台里说话 = 就是在写代码 → 后端**直接接入编程模型**，
+                               // 不再靠关键词猜意图（用户："自动接入编程的模型"）
+                               studio: !!(window.Studio && window.Studio.opened),
                                stream: true, session_id: sessionId }) });
       if (!resp.ok) {
         const e = await resp.json();

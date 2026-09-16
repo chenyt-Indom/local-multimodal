@@ -808,6 +808,7 @@ class ChatRequest(BaseModel):
     docs: list[dict] | None = None        # 拖进来的文档：[{name, text}]
     stream: bool = True
     session_id: str | None = None         # 会话标识，用于历史会话透视归档
+    studio: bool = False                  # 这轮是从「开发台」发起的（＝在写代码）
 
 
 # ---------- 图片保存 ----------
@@ -1463,14 +1464,20 @@ def _partial_ws_write(buf: str):
         return rel, None
 
 
-def _route_code_model(cfg: dict, text: str, fallback: str, prev_code: bool = False):
-    """代码类请求换用专用代码模型，返回 (模型名，给用户看的提示)。"""
+def _route_code_model(cfg: dict, text: str, fallback: str, prev_code: bool = False,
+                      force: bool = False):
+    """代码类请求换用专用代码模型，返回 (模型名，给用户看的提示)。
+
+    `force=True`（从开发台发起）时**跳过意图猜测**，直接用编程模型 ——
+    用户就坐在代码编辑器旁边说话，这一轮几乎必然是在写代码，
+    再拿通用模型答反而奇怪（用户原话："自动接入编程的模型"）。
+    """
     if not cfg.get("code_auto_route", True):
         return fallback, ""
     want = str(cfg.get("code_model") or "").strip()
     if not want or want == fallback:
         return fallback, ""
-    if not _needs_task_model(text, prev_code=prev_code):
+    if not force and not _needs_task_model(text, prev_code=prev_code):
         return fallback, ""
     if want not in _installed_models():
         # 还没下载 → 静默用回默认模型。配置名留着，用户下载后自动生效，不用改设置。
@@ -1908,7 +1915,10 @@ async def chat(req: ChatRequest):
 
     # 本轮像写代码 → 换专用代码模型（只影响这一轮，下一轮自动回默认模型）
     if not req.model:
-        model, model_note = _route_code_model(cfg, last_user, model, prev_code=prev_code)
+        # 开发台里提问 = 明确在写代码 → **直接接入编程模型**，不用再猜意图
+        model, model_note = _route_code_model(
+            cfg, last_user, model, prev_code=prev_code,
+            force=bool(getattr(req, "studio", False)))
     # 本轮实际用的模型是不是"专用代码模型"？
     # 它不支持原生工具调用，工具定义必须整轮砍掉（见下面 tool_schemas 的处理）。
     _code_model_name = str(cfg.get("code_model") or "").strip()
