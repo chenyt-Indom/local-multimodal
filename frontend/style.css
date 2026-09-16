@@ -924,3 +924,17 @@ body.dragging .drop-overlay,
   font-family: Consolas, monospace; word-break: break-all; max-width: 520px;
   padding: 5px 10px; background: var(--panel2); border-radius: 6px; }
 .studio-ide-path:empty { display: none; }
+
+/* ---------- 融合：让 VS Code 独占操作面 ---------- */
+/* 我们自己那套左侧面板（文件树 + AI 改动）**和 VS Code 自带的重复** ——
+   两套文件树摆在一起，就是"这软件像拼出来的"最主要的原因，
+   而且点击我们这棵树根本不会让 VS Code 打开文件（两边不联动）。
+   所以整块隐藏，文件树/标签/Git 全部交给 VS Code 自己。
+   注意是**隐藏而不是删除 DOM**：JS 里还有不少地方在往 stTree / stChangeList
+   里写内容，删掉节点会一片报错；隐藏则完全无风险。 */
+.studio-side { display: none !important; }
+
+/* 运行目标下拉：藏在工具栏里，和 VS Code 的终端各司其职 */
+.studio-runsel { max-width: 190px; height: 26px; font-size: 12px;
+  background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: 0 6px; }

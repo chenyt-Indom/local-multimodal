@@ -536,8 +536,35 @@
       var d = await jget("/api/ws/tree");
       files = d.files || [];
       project = d.project || project;
-      renderTree();
+      renderTree();          // 树已隐藏，但 AI 改动列表等地方还依赖它渲染的数据
+      fillRunList();
     } catch (e) { toast("读取项目文件失败：" + e.message); }
+  }
+
+  /* 填充"运行哪个文件"的下拉。
+     为什么需要它：我们自己的文件树已经隐藏（和 VS Code 的 EXPLORER 重复），
+     可「▶ 运行」还得知道跑哪个 —— 让用户在下拉里选，比"回树里点一下再回来"直接。 */
+  function fillRunList() {
+    var sel = $("stRunFile");
+    if (!sel) return;
+    var py = (files || []).filter(function (f) { return /\.py$/i.test(f.rel || ""); });
+    var keep = sel.value || cur || "";
+    sel.innerHTML = "";
+    if (!py.length) {
+      var o0 = document.createElement("option");
+      o0.value = "";
+      o0.textContent = "（项目里没有 .py）";
+      sel.appendChild(o0);
+      return;
+    }
+    py.forEach(function (f) {
+      var o = document.createElement("option");
+      o.value = f.rel;
+      o.textContent = f.rel;
+      sel.appendChild(o);
+    });
+    var hit = py.some(function (f) { return f.rel === keep; });
+    sel.value = hit ? keep : py[0].rel;
   }
 
   async function saveCur() {
@@ -632,7 +659,22 @@
       runId = "";
       setRunning(false);
       var body = out.textContent;
-      if (!body.trim()) body = "（没有输出 —— 代码里记得加 print()）";
+      // 没有输出时必须**说清楚是"文件本身没输出"，而不是"运行坏了"** ——
+      // 实测用户看到一行轻飘飘的"（没有输出）"会直接当成 bug 报上来。
+      if (!body.trim()) {
+        var sz = 0;
+        try {
+          var fr = files.filter(function (f) { return f.rel === cur; })[0];
+          sz = fr ? Number(fr.size || 0) : 0;
+        } catch (e) { sz = 0; }
+        if (!sz) {
+          body = "这个文件是【空的】（0 字节），所以没有输出 —— 运行本身是正常的。\n"
+               + "让它有东西可跑：在里面写一行 print(\"hello\") 再点运行即可。";
+        } else {
+          body = "这个文件跑完了，但没有打印任何东西（没有 print）。\n"
+               + "运行本身是正常的 —— 想看到输出，在代码里加 print(...) 即可。";
+        }
+      }
       out.textContent = head + "\n" + "─".repeat(34) + "\n" + body;
       $("stOutTitle").textContent = "运行结果 · " + cur;
       stoppedByUser = false;
@@ -1133,7 +1175,13 @@
     $("stChatToggle").onclick = function () { setChatCollapsed(!chatCollapsed); };
     $("stRefresh").onclick = function () { refresh(); loadChanges(); };
     $("stSave").onclick = saveCur;
-    $("stRun").onclick = runCur;
+    // 「▶ 运行」的目标取自下拉（文件树已隐藏，不再有"当前文件"这个来源）
+    $("stRun").onclick = function () {
+      var sel = $("stRunFile");
+      if (sel && sel.value) cur = sel.value;
+      runCur();
+    };
+    if ($("stRunFile")) $("stRunFile").onchange = function () { if (this.value) cur = this.value; };
     $("stPreview").onclick = previewCur;
     $("stDeploy").onclick = deploy;
     $("stUpload").onclick = uploadProject;

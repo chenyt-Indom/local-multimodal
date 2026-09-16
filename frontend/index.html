@@ -245,7 +245,10 @@
       <span class="studio-acts">
         <button class="btn sm ghost" id="stImport" title="把本地文件/代码导入当前项目（也可以直接拖进来）">📥 导入</button>
         <button class="btn sm ghost" id="stSave" title="保存（Ctrl+S）">💾 保存</button>
-        <button class="btn sm ghost" id="stRun" title="运行（Ctrl+Enter）">▶ 运行</button>
+        <!-- 运行目标：我们自己的文件树已经隐藏（和 VS Code 的 EXPLORER 重复），
+             所以「运行哪个文件」在这里选。 -->
+        <select class="studio-runsel" id="stRunFile" title="选择要运行的 .py 文件"></select>
+        <button class="btn sm ghost" id="stRun" title="运行选中的文件（Ctrl+Enter）">▶ 运行</button>
         <button class="btn sm ghost" id="stPreview" title="在系统浏览器里预览当前 HTML">🌐 预览</button>
         <button class="btn sm ghost" id="stDeploy" title="给当前项目起本地静态服务（多文件前端用）">🚀 部署</button>
         <button class="btn sm ghost" id="stUpload" title="把当前项目提交并上传到 GitHub / Gitee / 自建 Git（用本机 git 凭据）">⬆ 上传</button>
