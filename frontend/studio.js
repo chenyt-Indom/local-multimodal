@@ -85,15 +85,55 @@
     });
   }
 
-  // ---------- 编辑器：本机的 PyCharm（独立窗口） ----------
-  // 演变过程：Monaco（功能太少）→ 内置真 VS Code（code-server）→ **本机 PyCharm**。
+  // ---------- 编辑器：**内置的真 VS Code**（code-server），直接嵌在这个界面里 ----------
+  // 演变过程：Monaco → 本机 PyCharm（独立窗口）→ **回到内置 VS Code**。
   //
-  // 为什么不能像 VS Code 那样嵌进来：**PyCharm 是纯桌面程序，没有可嵌入网页的版本**。
-  // VS Code 能嵌，是因为官方提供了浏览器版（code-server）；
-  // JetBrains 的 Projector（网页版方案）已停更，Code With Me 也在 2026.1 日落。
-  // 所以这里不做"嵌入"，而是做**一键把项目交给本机 PyCharm**：
-  // 打开的就是磁盘上这个目录，和开发台改的是同一批文件（不是副本）。
-  // AI 写的文件 PyCharm 会自己同步（IDE 通用行为；点一下窗口让它获得焦点必定同步）。
+  // 结论：**能"嵌进网页"的专业 IDE 本来就极少**，VS Code 系（code-server）
+  // 是其中最成熟的 —— 有终端 / 断点调试 / 变量监视 / Git 面板，且全程离线。
+  // PyCharm 是桌面程序，结构上就嵌不进来（JetBrains 的 Projector 已停更、
+  // Code With Me 也在 2026.1 日落），只能开独立窗口，用起来要来回切。
+  //
+  // 而"AI 写的代码怎么自动呈现"这件事，内置 VS Code 反而更好做：
+  // 后端会 `code-server <文件>`（走 socket 转发给运行中的实例）去**主动打开**该文件，
+  // 它就嵌在当前窗口里，不用切。
+  var vsReady = false;
+
+  function vsMsg(text) {
+    var m = $("stVsMsg"), c = $("stVsCover");
+    if (m) m.textContent = text;
+    if (c) c.hidden = !text;
+  }
+
+  function vsFrame(url) {
+    var f = $("stVs");
+    if (f && url && f.getAttribute("src") !== url) f.setAttribute("src", url);
+    vsReady = true;
+    vsMsg("");
+  }
+
+  /* 确保内置 VS Code 已就绪、且开的就是当前项目。
+     ⚠️ code-server 是**启动时绑定目录**的，切项目不会自己跟着换 ——
+     不比对项目的话，用户切了项目看到的还是上一个项目的文件，会以为文件丢了。 */
+  async function ensureVs(force) {
+    var st = {};
+    try { st = await jget("/api/ide/status"); } catch (e) { st = {}; }
+    if (!st.installed) {
+      vsMsg("没有找到内置 VS Code。\n\n获取方式见 vendor/ 说明，或使用 Docker 版（已内置）。");
+      return;
+    }
+    if (!force && st.running && st.project === project) { vsFrame(st.url); return; }
+    if (st.running) { vsMsg("正在切换到项目 " + project + " …"); await jpost("/api/ide/stop", {}); }
+    else vsMsg("正在启动内置 VS Code…（第一次要几秒）");
+    var f = $("stVs");
+    if (f) f.setAttribute("src", "about:blank");
+    try {
+      var d = await jpost("/api/ide/start", {});
+      if (!d.ok) { vsMsg("启动失败：" + (d.error || "未知错误")); return; }
+      vsFrame(d.url);
+    } catch (e) { vsMsg("启动失败：" + String(e.message || e)); }
+  }
+
+  // --- 备用：本机 PyCharm（嵌不进来，只能开独立窗口）---
   var ideInfo = { name: "", path: "" };
 
   /* 问后端：本机装了什么 IDE、项目在哪个目录。**只探测，不启动** ——
@@ -484,7 +524,10 @@
      编辑器是本机的 PyCharm，这里只负责探一下"装的是哪个 IDE、项目在哪"，
      好把面板上的按钮文案和路径显示对。 */
   async function initEditor() {
-    await probeIde();
+    // 编辑器 = 内置 VS Code（嵌在界面里）。顺手探一下本机有没有 PyCharm，
+    // 好把那个备用按钮的文案写对。
+    await ensureVs();
+    probeIde();
   }
 
   // ---------- 动作 ----------
@@ -1095,6 +1138,9 @@
     $("stDeploy").onclick = deploy;
     $("stUpload").onclick = uploadProject;
     // 🧠 PyCharm：把当前项目交给本机 IDE（不复制文件，就是打开那个目录）
+    // ⟳ VS Code：重启内置编辑器并重新加载（切了项目、或界面卡住时用）
+    if ($("stVsReload")) $("stVsReload").onclick = function () { ensureVs(true); };
+    // 备用：本机 PyCharm（独立窗口）。嵌不进来，但留着当"重调试"的出口。
     if ($("stPyCharm")) $("stPyCharm").onclick = openInIde;
     if ($("stIdeOpen")) $("stIdeOpen").onclick = openInIde;
     if ($("stIdeFolder")) $("stIdeFolder").onclick = openFolder;

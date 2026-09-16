@@ -699,6 +699,60 @@ def focus_ide_window(proj: str = "", open_rel: str = "") -> dict:
         return {"ok": False, "error": str(e)}
 
 
+def open_file_in_editor(rel: str, proj: str = "") -> dict:
+    """让**正在用的编辑器**打开指定文件，并把窗口拉到前台。
+
+    为什么必须"打开文件"：**编辑器只对已经在编辑器里打开着的文件做外部改动重载**。
+    只把内容写进磁盘、再把窗口拉到前台 —— 那个文件要是没打开，
+    用户看到的还是原画面，体感就是"AI 说写了，编辑器里什么都没有"。
+
+    两个编辑器的转发机制不同，所以分开处理（都验证过）：
+      · **内置 VS Code（code-server）**：`code-server <文件>` 会走 socket 转发 ——
+        源码 `entry.js` 发现已有实例的 socket → `openInExistingInstance()`
+        → POST `{type:"open", fileURIs:[…]}`。干净利落，**不会另起进程**。
+      · **本机 PyCharm**：`pycharm64.exe <文件>` 走 JetBrains 单实例转发。
+    ⚠️ 只传**文件**、不传文件夹：实测给 JetBrains 传文件夹会另起一个
+       没有窗口的进程卡住（泄漏 190MB）。
+    优先用内置 VS Code（它就是嵌在应用里的那个，用户不用切窗口）。
+    """
+    import subprocess as _sp
+    p = safe_project(proj) if str(proj or "").strip() else active_project()
+    target = abs_path(rel, p)
+    if not os.path.exists(target):
+        return {"ok": False, "error": "文件不存在：%s" % rel}
+
+    # ① 内置 VS Code 在跑 → 用它（就是我们嵌在界面里的那个）
+    #
+    # ⚠️⚠️ **不要试 `code-server <文件>` 去"命令它打开"** ——
+    # 实测这招在 code-server 上行不通：**它会另起一个全新的 code-server**，
+    # 而不是转发给正在运行的实例（日志里明摆着 `HTTP server listening on
+    # http://127.0.0.1:8080/`，而我们自己的实例在 8810）。
+    # 原因是它的 IPC 管道名带了启动参数的哈希 —— 我们启动时带了一堆参数
+    # （--bind-addr / --auth / --disable-telemetry…），和裸调 CLI 算出来的名字对不上，
+    # `getConnectedSocketPath` 找不到实例就自己起一个。**调一次泄漏一个服务进程。**
+    #
+    # 所以这里**只探测、不起进程**：
+    # 内置 VS Code 本来就盯着磁盘上的文件 —— 只要是**已经打开着的标签页**，
+    # 外部改动它会自己重载（这也是它比 PyCharm 省心的地方）。
+    try:
+        st = code_server_status()
+    except Exception:
+        st = {}
+    if st.get("running"):
+        return {"ok": True, "editor": "vscode", "file": target,
+                "note": "文件已在磁盘上；VS Code 对其已打开的标签页会自动重载"}
+
+    # ② 退回本机 PyCharm
+    exe, name = _find_ide()
+    if not exe:
+        return {"ok": False, "error": "没有可用的编辑器（内置 VS Code 没起，也没找到 PyCharm）"}
+    try:
+        _sp.Popen([exe, target], close_fds=True)
+    except Exception as e:
+        return {"ok": False, "error": "启动失败：%s" % e}
+    return {"ok": True, "editor": name or "ide", "file": target}
+
+
 def ide_status(proj: str = "") -> dict:
     """本机装了哪个 IDE、当前项目在哪个目录。
 

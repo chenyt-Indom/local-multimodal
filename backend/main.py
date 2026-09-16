@@ -1495,6 +1495,22 @@ def _partial_ws_write(buf: str):
         return rel, None, proj
 
 
+def _show_writing_file(rel: str, proj: str = "") -> None:
+    """AI 开始写某个文件时：让编辑器**打开这个文件**，必要时把窗口拉到前台。
+
+    这是"AI 边写、用户边看"的关键一步，缺了它用户会以为"AI 说写了，编辑器里啥也没有"：
+    编辑器只对**已经打开着的文件**做外部改动重载。
+    优先用内置 VS Code（它嵌在应用界面里，用户不用切窗口）；
+    退回本机 PyCharm 时才需要额外把窗口置前。
+    """
+    try:
+        r = workspace.open_file_in_editor(rel, proj)
+        if r.get("editor") != "vscode":
+            workspace.focus_ide_window(proj)
+    except Exception:
+        logger.warning("让编辑器打开 %s 失败（不影响写入）", rel, exc_info=True)
+
+
 def _reconcile_streamed(state: dict, ui_events: list, final: bool = False) -> list:
     """给"流式预览"和"正式写入"对账，返回要讲给用户听的话。
 
@@ -2342,13 +2358,12 @@ async def chat(req: ChatRequest):
                             # 直接写会落进上一个项目里（实测踩到，留下孤儿文件）。
                             _target = _newproj or workspace.active_project()
                             if _fresh and cfg.get("ide_focus_on_write", True):
-                                # 刚开始写一个新文件 → 把 PyCharm 拉到前台。
-                                # JetBrains 什么时候查磁盘改动跟窗口活跃度有关，
-                                # 不拉前台用户可能要自己点一下才看到刷新。
-                                # 放线程里做：Win32 调用别卡住生成流。
+                                # 刚开始写一个新文件 → 让编辑器**把它打开**、
+                                # 并把窗口拉到前台（见 _show_writing_file 的说明）。
+                                # 放线程里做：起进程 / Win32 调用别卡住生成流。
                                 threading.Thread(
-                                    target=workspace.focus_ide_window,
-                                    kwargs={"proj": _target, "open_rel": _rel},
+                                    target=_show_writing_file,
+                                    kwargs={"rel": _rel, "proj": _target},
                                     daemon=True).start()
                             # 节流：换文件立刻写；同文件每 60 字或每 0.3 秒写一次。
                             # 太密会把磁盘和 VS Code 的文件监视器打爆；太疏就没有"打字"感。
