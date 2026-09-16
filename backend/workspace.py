@@ -90,6 +90,10 @@ def set_active_project(name: str) -> str:
     n = safe_project(name)
     os.makedirs(os.path.join(base(), n), exist_ok=True)
     _ACTIVE = n                       # 先认内存，config 只是持久化副本
+    import logging as _lg
+    _lg.getLogger("uvicorn.error").warning(
+        "[ws] set_active_project -> %r (dir=%s base=%s)", n,
+        os.path.isdir(os.path.join(base(), n)), base())
     try:
         cfg = config.load_config() or {}
         cfg["active_project"] = n

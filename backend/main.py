@@ -1443,14 +1443,27 @@ def _partial_ws_write(buf: str):
     `text` 可能只有一半（甚至停在转义符中间），所以这里全部走容错解析：
     能解析多少给多少，解析不了就返回 None（这一帧不写盘，等下一帧）。
 
-    返回 (rel, text)；rel 可能为 None（名字还没打完），text 为 None 表示还没有正文。
+    返回 (rel, text, project)：
+      · rel 可能为 None（文件名还没打完）
+      · text 为 None 表示还没有正文
+      · project 是"这一轮里 workspace_new_project 要建的新项目名"（没有则 None）
+        —— **必须带上它**：模型常常在同一轮里先建项目再写文件，
+        而工具要等模型把整轮说完才执行，此时 `active_project()` 还是**旧项目**，
+        预览就会写进上一个项目里，留下不认识这个文件的孤儿目录（实测踩到）。
     """
     if not buf or "workspace_write" not in buf:
-        return None, None
+        return None, None, None
     m = _WS_WRITE_NAME_RE.search(buf)
     if not m:
-        return None, None
+        return None, None, None
     seg = buf[m.end():]
+    # 同一轮里如果还要新建项目，预览就该直接写进那个新项目
+    proj = None
+    mn = re.search(r'"name"\s*:\s*"workspace_new_project"', buf[:m.start()])
+    if mn:
+        mp = re.search(r'"name"\s*:\s*"([^"\\]{1,64})"', buf[mn.end():])
+        if mp:
+            proj = mp.group(1)
     rel = None
     mr = re.search(r'"rel"\s*:\s*"((?:[^"\\]|\\.)*)"', seg)
     if mr:
@@ -1460,7 +1473,7 @@ def _partial_ws_write(buf: str):
             rel = None
     mt = re.search(r'"text"\s*:\s*"', seg)
     if not mt:
-        return rel, None          # 正文还没开始
+        return rel, None, proj    # 正文还没开始
     rest = seg[mt.end():]
     out = []
     i = 0
@@ -1477,9 +1490,9 @@ def _partial_ws_write(buf: str):
         out.append(c)
         i += 1
     try:
-        return rel, json.loads('"%s"' % "".join(out))
+        return rel, json.loads('"%s"' % "".join(out)), proj
     except Exception:
-        return rel, None
+        return rel, None, proj
 
 
 def _route_code_model(cfg: dict, text: str, fallback: str, prev_code: bool = False,
@@ -2179,6 +2192,10 @@ async def chat(req: ChatRequest):
         _MAX_EMPTY_RETRIES = 2
         gen_params = dict(cfg)
 
+        # 【完整性兜底】整次生成共用一份"预览过哪些文件、当时写进了哪个项目"的记录。
+        # 必须放在轮次循环**外面**：模型常常第 1 轮建项目+预览、第 2 轮才正式写入，
+        # 每轮清空就看不出"预览写到 A 项目、正式写入落在 B 项目"，孤儿文件清不掉。
+        _streamed = {}
         for _round in range(MAX_TOOL_ROUNDS):
             # 工具调用中间轮不再重复附图片
             attach_images = images if _round == 0 else None
@@ -2195,9 +2212,11 @@ async def chat(req: ChatRequest):
             # 边生成边落盘的进度（见 _partial_ws_write）：文件 / 已落盘字数 / 上次时刻
             _ws_rel, _ws_len, _ws_t = "", 0, 0.0
             # 【完整性兜底】流式落盘只是"给编辑器看的预览"，**不是正式写入**。
-            # 这里记下每个被预览过的文件"原本长什么样"（None = 本来不存在），
-            # 好在一轮结束时把"没被正式写入"的残file撤掉 —— 见下面那段。
-            _streamed = {}
+            # 记下每个被预览过的文件"原本长什么样 + 预览时写进了哪个项目"。
+            # ⚠️ `_streamed` **跨轮累计，不能每轮清空**：实测模型经常
+            # "第 1 轮建项目 + 预览文件、第 2 轮才正式写入" ——
+            # 每轮清空的话，第 2 轮看不到第 1 轮留下的预览记录，
+            # 孤儿文件就永远清不掉（实测正是这么漏的）。
             tool_calls = None
             done_reason = ""
             # 注意：必须用 _stream_lines（子线程读 + 队列），
@@ -2238,10 +2257,15 @@ async def chat(req: ChatRequest):
                         #   我们把已经生成的部分先落盘 → 内置 VS Code 的文件监视器
                         #   看到文件在变，编辑器里就是代码一点点长出来。
                         #   不落盘的话，用户只能等生成完"啪"地出现一整份文件。
-                        _rel, _partial = _partial_ws_write(round_msg["content"])
+                        _rel, _partial, _newproj = _partial_ws_write(round_msg["content"])
                         if _rel and _partial is not None:
                             _now = time.time()
                             _fresh = _rel != _ws_rel
+                            # **这一轮要写进哪个项目**：模型如果同时发了
+                            # workspace_new_project，就写进那个新项目 —— 因为工具要等
+                            # 模型把整轮说完才执行，此刻 active_project() 还是旧项目，
+                            # 直接写会落进上一个项目里（实测踩到，留下孤儿文件）。
+                            _target = _newproj or workspace.active_project()
                             if _fresh and cfg.get("ide_focus_on_write", True):
                                 # 刚开始写一个新文件 → 把 PyCharm 拉到前台。
                                 # JetBrains 什么时候查磁盘改动跟窗口活跃度有关，
@@ -2249,33 +2273,33 @@ async def chat(req: ChatRequest):
                                 # 放线程里做：Win32 调用别卡住生成流。
                                 threading.Thread(
                                     target=workspace.focus_ide_window,
-                                    kwargs={"proj": workspace.active_project()},
+                                    kwargs={"proj": _target},
                                     daemon=True).start()
                             # 节流：换文件立刻写；同文件每 60 字或每 0.3 秒写一次。
                             # 太密会把磁盘和 VS Code 的文件监视器打爆；太疏就没有"打字"感。
                             if (_fresh or len(_partial) - _ws_len >= 60
                                     or _now - _ws_t >= 0.30):
                                 if _fresh and _rel not in _streamed:
-                                    # 第一次预览这个文件 → 先记下它原来的内容，
-                                    # 万一这轮没能正式写完，好把它还原回去
+                                    # 第一次预览这个文件 → 先记下"它原本长什么样、
+                                    # 在哪个项目里"，万一这轮没能正式写完，好还原回去
                                     try:
-                                        _p = workspace.abs_path(_rel)
+                                        _p = workspace.abs_path(_rel, _target)
                                         if os.path.exists(_p):
                                             with open(_p, "r", encoding="utf-8",
                                                       errors="replace") as _fh:
-                                                _streamed[_rel] = _fh.read()
+                                                _streamed[_rel] = (_fh.read(), _target)
                                         else:
-                                            _streamed[_rel] = None
+                                            _streamed[_rel] = (None, _target)
                                     except Exception:
-                                        _streamed[_rel] = None
+                                        _streamed[_rel] = (None, _target)
                                 try:
-                                    workspace.stream_write(_rel, _partial)
+                                    workspace.stream_write(_rel, _partial, _target)
                                 except Exception:
                                     pass      # 落盘失败不影响模型继续生成，结束时还会正式写一次
                                 yield json.dumps({"ui": {
                                     "type": "typing", "rel": _rel,
                                     "chars": len(_partial), "reset": _fresh,
-                                    "project": workspace.active_project(),
+                                    "project": _target,
                                 }}) + "\n"
                                 _ws_rel, _ws_len, _ws_t = _rel, len(_partial), _now
                     else:
@@ -2385,6 +2409,13 @@ async def chat(req: ChatRequest):
             # 最后再按原顺序合并，保证前端看到的次序稳定。
             async def _run_one(idx, name, args):
                 ev = []
+                # 诊断：把"每个工具执行那一刻的当前项目"打出来。
+                # 排查"AI 建完项目、文件却落进上一个项目"时必须看这个 ——
+                # 光看工具调用顺序是看不出来的，关键是**执行时**的 active_project。
+                if name in _SERIAL_TOOLS:
+                    logger.warning("[ws] 执行 %s 前 active_project=%s args=%s",
+                                   name, workspace.active_project(),
+                                   json.dumps(args, ensure_ascii=False)[:160])
                 try:
                     # dispatch 里都是阻塞逻辑（网络/文件/推理），必须丢线程池，
                     # 否则会占住事件循环、把流式输出又憋成"一次性返回"。
@@ -2392,16 +2423,50 @@ async def chat(req: ChatRequest):
                                                   dict(ctx))
                 except Exception as e:
                     res = f"[工具执行失败] {name}：{e}"
+                if name in _SERIAL_TOOLS:
+                    logger.warning("[ws] 执行 %s 后 active_project=%s 结果=%s",
+                                   name, workspace.active_project(),
+                                   str(res)[:90])
                 return idx, name, res, ev
 
-            if len(calls) > 1:
+            # ⚠️⚠️ **有"状态相关"工具时，整轮必须按顺序串行执行。**
+            #
+            # 踩过的坑（用户报的"AI 建完项目，里面却是空的"）：
+            # 模型在同一轮里既发 `workspace_new_project`（建项目并切进去）
+            # 又发 `workspace_write`（往**当前**项目写文件），而工具是
+            # `asyncio.gather` **同时开跑**的 —— 写文件可能在切项目**之前**
+            # 就读到了旧的 `active_project`，文件于是落进了**上一个项目**。
+            # 注意：`gather` 只保证"**结果**按原顺序合并给前端"，
+            # **副作用早就以任意顺序发生了** —— 这是最容易看走眼的地方。
+            #
+            # 所以：本轮只要出现会改共享状态、或依赖"当前项目"的工具，
+            # 就整轮串行（顺序＝模型给出的顺序，前后依赖才成立）；
+            # 纯读类的（查知识库 / 联网 / 看时间…）仍然并行，不损失速度。
+            _SERIAL_TOOLS = {
+                "workspace_new_project", "workspace_use_project",
+                "workspace_write", "workspace_mkdir", "workspace_delete",
+                "workspace_move", "workspace_run", "run_python",
+                "save_file", "library", "github_push",
+            }
+            _serial = any(n in _SERIAL_TOOLS for n, _a in calls)
+            if _serial and len(calls) > 1:
+                yield json.dumps({"note": "本轮有写文件/切项目这类操作，按顺序执行"}) + "\n"
+
+            async def _run_serial():
+                out = []
+                for _i, (_n, _a) in enumerate(calls):
+                    out.append(await _run_one(_i, _n, _a))
+                return out
+
+            if len(calls) > 1 and not _serial:
                 yield json.dumps({"tool_parallel": len(calls)}) + "\n"
             # ⚠️ 不能用裸的 `await asyncio.gather(...)`：
             # 那样要等**所有工具跑完**才有机会往外吐东西，
             # 而"询问用户是否继续"的弹窗必须立刻出现在界面上（工具那会儿正阻塞等着答复）。
             # 所以改成边等工具、边把实时事件推给前端。
-            _tool_task = asyncio.ensure_future(asyncio.gather(
+            _runner = (_run_serial() if _serial else asyncio.gather(
                 *[_run_one(i, n, a) for i, (n, a) in enumerate(calls)]))
+            _tool_task = asyncio.ensure_future(_runner)
             while not _tool_task.done():
                 try:
                     _evt = await asyncio.wait_for(live_ui.get(), timeout=0.2)
@@ -2447,6 +2512,25 @@ async def chat(req: ChatRequest):
                     for _u in ui_events:
                         if isinstance(_u, dict) and _u.get("act") == "write":
                             _written.add(_u.get("rel"))
+                    # 【孤儿预览文件】模型常在同一轮里先"建项目"再"写文件"，
+                    # 而预览是在**流式过程中**就落了盘的，那时项目还没切过去 ——
+                    # 于是旧项目里会多出一份只属于新项目的文件。
+                    # 精准清理：**我们这轮新建的** + **正式写入落在了别的项目** → 删掉旧项目里那份。
+                    # （两个条件缺一不可：既不碰本来就在那儿的文件，也不碰正式写入自己写的那份。）
+                    _real_proj = {}
+                    for _u in ui_events:
+                        if (isinstance(_u, dict) and _u.get("act") == "write"
+                                and _u.get("rel")):
+                            _real_proj[_u["rel"]] = str(_u.get("project") or "")
+                    for _r, (_before, _used) in list(_streamed.items()):
+                        _rp = _real_proj.get(_r)
+                        if _before is None and _rp and _used and _rp != _used:
+                            try:
+                                os.remove(workspace.abs_path(_r, _used))
+                                logger.info("清掉孤儿预览文件：%s/%s（正式写入在 %s）",
+                                            _used, _r, _rp)
+                            except Exception:
+                                pass
                     # ⚠️ **只有"这一轮一次正式写入都没有"时才动手**。
                     # 第一版是按"每个文件有没有被正式写"逐个判的，结果误伤：
                     # 模型明明在这一轮正式写过文件，但下一轮又预览了别的文件，
@@ -2454,8 +2538,10 @@ async def chat(req: ChatRequest):
                     # 项目目录清空了。**宁可漏判，也不能删用户的文件。**
                     _left = [] if _written else list(_streamed)
                     for _r in _left:
-                        _p = workspace.abs_path(_r)
-                        _before = _streamed[_r]
+                        # 用**当初预览时记下的项目**，不能用当前的 active_project() ——
+                        # 这一轮可能刚切过项目，两个值不是一回事
+                        _before, _proj = _streamed[_r]
+                        _p = workspace.abs_path(_r, _proj)
                         if _before is None:
                             if os.path.exists(_p):
                                 os.remove(_p)

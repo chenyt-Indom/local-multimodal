@@ -1630,6 +1630,20 @@ def _do_workspace_new_project(arguments, ui_events=None) -> str:
         return "建项目失败：要给一个项目名（如 todo-app）。"
     r = _ws.create_project(name)
     if not r.get("ok"):
+        # ⚠️⚠️ **同名项目已经存在时，必须"切过去"，绝不能"报错返回"。**
+        # 这是实测抓到的真 bug（原来就是直接 return 错误）：
+        # 模型随后照常调 workspace_write，而当前项目**压根没切**，
+        # 于是文件全落进了上一个项目 —— 用户看到的正是
+        # "项目建了、里面是空的，文件跑到别的项目去了"。
+        # 而用户/模型的意图很明确：叫这个名字的，就用它。
+        if "已存在" in str(r.get("error") or ""):
+            real = _ws.set_active_project(name)
+            if isinstance(ui_events, list):
+                ui_events.append({"type": "workspace", "act": "project",
+                                  "project": real})
+            return ("项目「%s」已经存在，已**直接切过去使用**（没有新建）。"
+                    "接着用 workspace_write 往里写文件即可，路径相对项目根。"
+                    % real)
         return "建项目失败：%s" % r.get("error")
     real = r.get("name") or name
     _ws.set_active_project(real)          # 建完就切过去，后续文件都写进新项目
