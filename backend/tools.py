@@ -17,6 +17,7 @@ import re
 import sys
 import time
 import glob
+import json
 import urllib.parse
 
 from . import t2i
@@ -64,12 +65,40 @@ _WS_WRITE_SCHEMA = {
     "function": {
         "name": "workspace_write",
         "description": ("【开发工作区】把内容写进工作区文件（存在则覆盖，旧版自动进回收站）。"
-                        "**要给整份文件内容**，不要只给片段。写完用户会在「开发台」里看到。"),
+                        "**要给整份文件内容**，不要只给片段。写完用户会在「开发台」里看到。"
+                        "⚠️ **只用来写「非代码」内容（README、配置、数据、txt/md/json），"
+                        "或者你自己动手改一两行**；"
+                        "**要写/改一个代码文件（.py/.js/.ts/.html/.java…）请改用 write_code** ——"
+                        "由本机专用代码模型来写，代码质量和长度都更有保障。"),
         "parameters": {"type": "object",
                        "properties": {
                            "rel": {"type": "string", "description": "工作区内的相对路径"},
                            "text": {"type": "string", "description": "文件的完整内容"}},
                        "required": ["rel", "text"]},
+    },
+}
+
+
+_WS_CODE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "write_code",
+        "description": (
+            "【写代码专用 · **只要目标文件是代码（.py/.js/.ts/.html/.java/.go/.rs…）就用它**】"
+            "把「要写什么」交给本机的**专用代码模型**，由它写出代码并**直接落到项目文件**。"
+            "**你不需要、也不应该自己把代码敲出来** —— 你只负责决定「写哪个文件、要什么功能」。"
+            "改已有文件时：先 workspace_read 读一遍，再在这里说明要改成什么样。"
+            "写完用 workspace_run 跑一遍验证。"
+            "（例外：只改一两个字符、或写 README/配置/数据这类非代码文件，才用 workspace_write。）"),
+        "parameters": {"type": "object",
+                       "properties": {
+                           "rel": {"type": "string",
+                                   "description": "要写入的项目内相对路径，如 app.py"},
+                           "instruction": {"type": "string",
+                                           "description": "需求：这个文件要做什么 / 要改成什么样。说清楚。"},
+                           "context": {"type": "string",
+                                       "description": "可选：补充背景（相关接口、数据格式、约束等）"}},
+                       "required": ["rel", "instruction"]},
     },
 }
 
@@ -354,6 +383,9 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
     schemas.append(_WS_LIST_SCHEMA)
     schemas.append(_WS_READ_SCHEMA)
     schemas.append(_WS_WRITE_SCHEMA)
+    # 写代码这件事交给专用代码模型去做（见 _do_write_code）——它是纯本地调用，
+    # 不涉及"在本机执行代码"，所以**不受 code_exec 开关限制**，始终可用。
+    schemas.append(_WS_CODE_SCHEMA)
     if code_exec:
         # 跑工作区文件同样属于"在本机执行代码"，跟着同一个开关走
         schemas.append(_WS_RUN_SCHEMA)
@@ -646,6 +678,9 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
         return _do_workspace_write(arguments, ui_events)
     if name == "workspace_run":
         return _do_workspace_run(arguments, ui_events)
+    # 「写代码」单独交给专用代码模型（见 _do_write_code 的说明：那是实测出来的分工）
+    if name == "write_code":
+        return _do_write_code(arguments, ui_events, context)
     # ---- 下面这组是"完全自动开发项目"必需的：建项目 / 建目录 / 删 / 移动 / 切项目 ----
     # 这些能力 workspace 模块**早就有了**（create_project / mkdir / remove / rename），
     # 只是以前没交给模型 —— 所以它只能改已有文件，没法从零把项目搭起来。
@@ -1710,6 +1745,143 @@ def _do_workspace_move(arguments, ui_events=None) -> str:
         ui_events.append({"type": "workspace", "act": "move",
                           "rel": rel, "to": r.get("rel")})
     return "已把 %s 移到 %s" % (rel, r.get("rel"))
+
+
+def _strip_code_fence(text: str) -> str:
+    """去掉模型爱加的 ```python … ``` 外壳，拿到纯代码。"""
+    t = (text or "").strip()
+    if not t.startswith("```"):
+        return t
+    lines = t.splitlines()
+    if lines and lines[0].lstrip().startswith("```"):
+        lines = lines[1:]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _do_write_code(arguments, ui_events=None, context=None) -> str:
+    """把"要写什么"交给**专用代码模型**，由它写出代码并直接落盘。
+
+    为什么要有这么个工具（**这是实测出来的架构结论，别改回去**）：
+      · `qwen2.5-coder` **不支持 Ollama 的原生工具调用通道**，只能走"文本协议"
+        （让它自己吐 ```tool 块）。实测多轮对话里它会**不吐工具块**、还会
+        声称「我无法读取本地文件系统」，越聊越跑偏；
+      · `qwen3-vl` / 默认模型是**原生支持工具调用**的，读文件、跑代码、做决策都稳。
+    所以分工是：**大脑用默认模型（原生工具），写代码这一步单独交给代码模型。**
+    额外的好处：整份代码不经过大脑的上下文 —— 省 token，也不会被转述时丢掉细节。
+
+    **边收边落盘**：代码模型是流式回来的，每收到一块就先写进文件（预览），
+    编辑器（内置 VS Code）盯着磁盘，于是照样能看到代码一个个字长出来。
+    """
+    from . import workspace as _ws
+    from . import config as _config
+    # ⚠️ ollama 客户端实例是 main.py 里的**单例**（`main.client`），
+    # ollama_client 模块本身只有类 —— 直接写 `ollama_client.client` 会 AttributeError。
+    # 用**函数内延迟导入**拿它：模块级导入会形成 tools ↔ main 的循环导入。
+    from . import main as _main
+
+    a = arguments or {}
+    rel = str(a.get("rel") or "").strip()
+    inst = str(a.get("instruction") or a.get("task") or "").strip()
+    extra = str(a.get("context") or "").strip()
+    if not rel:
+        return "写代码失败：必须给出要写入的相对路径 rel（如 app.py）。"
+    if not inst:
+        return "写代码失败：必须说明要写什么 instruction，比如「一个倒计时脚本，从10数到0」。"
+    try:
+        rel = _ws.safe_rel(rel)
+    except ValueError as e:
+        return "写代码失败：%s" % e
+
+    cfg = _config.load_config()
+    model = str(cfg.get("code_model") or "").strip() or cfg.get("default_model")
+    # ⚠️ 必须用 main._installed_models()（它把 /api/tags 的**字典列表**转成了名字列表）。
+    # 直接 `model not in client.list_models()` 会因为拿字典跟字符串比而**永远不相等**，
+    # 于是模型被悄悄换成默认模型（思考型）—— 输出额度全烧在思考上，最后一个字都没有，
+    # 症状是"写代码失败：代码模型这次没有输出内容"。实测踩过。
+    try:
+        installed = _main._installed_models()
+    except Exception:
+        installed = []
+    if installed and model not in installed:
+        model = cfg.get("default_model")
+
+    # 改已有文件 → 把原内容一并给代码模型，让它"在真实内容上改"
+    old = ""
+    try:
+        r = _ws.read_text(rel)
+        if r.get("ok"):
+            old = (r.get("text") or "").strip()
+    except Exception:
+        old = ""
+
+    lang = os.path.splitext(rel)[1].lstrip(".").lower() or "python"
+    parts = ["你是资深程序员。请直接输出**完整、可运行**的代码，不要解释、不要 Markdown 说明。",
+             "目标文件：%s（%s）" % (rel, lang), "需求：%s" % inst]
+    if extra:
+        parts.append("补充背景：%s" % extra)
+    if old:
+        parts.append("这是该文件**当前的内容**，请在此基础上修改，并输出修改后的**整份**内容：\n"
+                     "```\n%s\n```" % old[:6000])
+    parts.append("只输出代码本身（一个代码块或纯代码均可），不要写用法说明。")
+    prompt = "\n\n".join(parts)
+
+    params = {"temperature": 0.2,
+              "max_tokens": int(cfg.get("code_max_tokens") or 8192),
+              "num_ctx": int(cfg.get("num_ctx") or 8192)}
+    buf, wrote_any, last_t, last_n = "", False, 0.0, 0
+    try:
+        resp = _main.client.chat([{"role": "user", "content": prompt}],
+                               model=model, stream=True, params=params)
+        for raw in resp.iter_lines():
+            if not raw:
+                continue
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", "replace")
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            piece = ((o.get("message") or {}).get("content") or "")
+            if piece:
+                buf += piece
+                now = time.time()
+                # 节流预览：同文件每 60 字或每 0.3 秒写一次
+                if now - last_t >= 0.30 or len(buf) - last_n >= 60:
+                    prev = _strip_code_fence(buf)
+                    if prev:
+                        try:
+                            _ws.stream_write(rel, prev)
+                            wrote_any = True
+                        except Exception:
+                            pass
+                    last_t, last_n = now, len(buf)
+            if o.get("done"):
+                break
+    except Exception as e:
+        if not wrote_any:
+            return "写代码失败（调用代码模型出错）：%s" % e
+
+    code = _strip_code_fence(buf)
+    if not code.strip():
+        return ("写代码失败：代码模型这次没有输出内容（可能是被截断）。"
+                "把需求说得更具体一点，或换个文件名重试。")
+
+    w = _ws.write_text(rel, code, by="ai")
+    if not w.get("ok"):
+        return "写代码失败：%s" % w.get("error")
+    if isinstance(ui_events, list):
+        ui_events.append({"type": "workspace", "act": "write", "rel": rel,
+                          "chars": len(code), "project": _ws.active_project()})
+    head = code.splitlines()[0][:60] if code.splitlines() else ""
+    return ("已把代码写进 %s（%d 字，模型=%s）。首行：%s\n"
+            "建议接着用 workspace_run 跑一遍验证。" % (rel, len(code), model, head))
 
 
 def _do_web_read(arguments) -> str:

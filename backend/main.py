@@ -1583,23 +1583,26 @@ def _reconcile_streamed(state: dict, ui_events: list, final: bool = False) -> li
 
 def _route_code_model(cfg: dict, text: str, fallback: str, prev_code: bool = False,
                       force: bool = False):
-    """代码类请求换用专用代码模型，返回 (模型名，给用户看的提示)。
+    """**聊天这一轮永远用默认模型**（保留函数只为兼容调用点）。
 
-    `force=True`（从开发台发起）时**跳过意图猜测**，直接用编程模型 ——
-    用户就坐在代码编辑器旁边说话，这一轮几乎必然是在写代码，
-    再拿通用模型答反而奇怪（用户原话："自动接入编程的模型"）。
+    ⚠️⚠️ 这里以前是"代码类请求就切到 qwen2.5-coder"，**2026-09-16 改掉了**，
+    原因是实测复现的硬伤：
+
+      · qwen2.5-coder **不支持 Ollama 的原生工具调用通道**，只能走"文本协议"
+        （要求它自己吐 ```tool 块）；
+      · 一旦历史里没出现过工具块，它就照着历史"只回答、不调工具"，
+        连着几轮之后会**理直气壮地说「我无法读取本地文件系统」**——
+        实测：用户问"读一下 hello.py"→"看有没有错误"→"你看不到吗？？"，
+        越答越离谱。真正的问题不是它读不到，是**它以为自己没有这个能力**。
+      · 而默认模型（qwen3-vl）**原生支持工具调用**，读文件/跑代码/做决策都稳。
+
+    所以现在的分工（用户提的架构，已验证）：
+      **大脑 = 默认模型**（决策、读文件、跑代码、串联流程）
+      **打字员 = 代码模型**（只在需要"写出代码"时，由 `write_code` 工具单独调用它）
+
+    详见 tools.py 的 `_do_write_code`。
     """
-    if not cfg.get("code_auto_route", True):
-        return fallback, ""
-    want = str(cfg.get("code_model") or "").strip()
-    if not want or want == fallback:
-        return fallback, ""
-    if not force and not _needs_task_model(text, prev_code=prev_code):
-        return fallback, ""
-    if want not in _installed_models():
-        # 还没下载 → 静默用回默认模型。配置名留着，用户下载后自动生效，不用改设置。
-        return fallback, ""
-    return want, "已切到专用模型 %s（写代码：它不思考，不会把输出额度烧在思考上）" % want
+    return fallback, ""
 
 
 # =====================================================================
@@ -2194,6 +2197,25 @@ async def chat(req: ChatRequest):
                     "用户可以在界面上切换项目，切过来就是另一套完全独立的文件）。\n\n"
                     "本轮可用工具：\n" % workspace.active_project()
                     + _tt_docs + "\n\n"
+                    # ⚠️⚠️ 这段是为一个**实测复现过**的坑加的，别删：
+                    # 用户连着问"读一下 hello.py"→"看有没有错误"→"项目1里的 hello.py"→
+                    # "你看不到吗？？"，模型越答越自信地说「我无法读取本地文件系统」。
+                    # 真相是**它有能力，但忘了**：
+                    #   · 第 1 轮用了默认模型（原生工具通道），workspace_read 正常；
+                    #   · 第 1 轮回答里带了 ``` 代码块 → 命中"上一轮有代码就继续用代码模型"，
+                    #     第 2 轮起换到 qwen2.5-coder，只能走文本协议；
+                    #   · 而历史里的助手消息**从来没出现过 ```tool 块**，
+                    #     模型就照着历史"只回答、不调工具"，越往后越笃定自己没有文件能力。
+                    # 光在开头说一句"你改用文本协议"不够 —— 要有**针对症状**的硬规则。
+                    "⚠️ **最重要**：你**有**读文件的能力（workspace_read）。"
+                    "用户只要提到文件名或路径（如 hello.py、src/app.js），"
+                    "**就必须先用 workspace_read 把它读出来**再回答，"
+                    "**绝不允许**说「我无法读取本地文件」「请把内容粘贴给我」"
+                    "「也不要凭记忆猜文件里写了什么」。\n"
+                    "例：用户说「看一下 hello.py 有没有错误」→ 你这一步只输出：\n"
+                    "```tool\n"
+                    '{"name": "workspace_read", "arguments": {"rel": "hello.py"}}\n'
+                    "```\n\n"
                     # 「完全自动开发项目」的作业流程。不写这一段的话，模型就算
                     # 手里有 workspace_new_project 也想不到要先建项目、
                     # 更不会自己"跑→看报错→改→再跑"地把项目做完整。
