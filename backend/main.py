@@ -2201,6 +2201,15 @@ async def chat(req: ChatRequest):
                         if _rel and _partial is not None:
                             _now = time.time()
                             _fresh = _rel != _ws_rel
+                            if _fresh and cfg.get("ide_focus_on_write", True):
+                                # 刚开始写一个新文件 → 把 PyCharm 拉到前台。
+                                # JetBrains 什么时候查磁盘改动跟窗口活跃度有关，
+                                # 不拉前台用户可能要自己点一下才看到刷新。
+                                # 放线程里做：Win32 调用别卡住生成流。
+                                threading.Thread(
+                                    target=workspace.focus_ide_window,
+                                    kwargs={"proj": workspace.active_project()},
+                                    daemon=True).start()
                             # 节流：换文件立刻写；同文件每 60 字或每 0.3 秒写一次。
                             # 太密会把磁盘和 VS Code 的文件监视器打爆；太疏就没有"打字"感。
                             if (_fresh or len(_partial) - _ws_len >= 60

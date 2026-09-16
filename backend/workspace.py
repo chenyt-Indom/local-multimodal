@@ -608,6 +608,71 @@ def open_in_ide(proj: str = "") -> dict:
     return {"ok": True, "ide": name, "exe": exe, "path": d, "project": p}
 
 
+def focus_ide_window(proj: str = "") -> dict:
+    """把本机 IDE（PyCharm）的窗口**拉到前台**。
+
+    为什么要这一步：AI 写代码不是"模拟按键敲进 PyCharm"（那需要装 PyCharm 插件），
+    而是**在磁盘上逐字写文件**，由 IDE 检测到外部改动后自己重载显示 ——
+    效果一样，但不用插件、不怕丢断点、改的也确实是同一份文件。
+    而 JetBrains 什么时候去查磁盘上的改动，**跟窗口是否活跃有关**：
+    不拉前台的话，有时要用户自己点一下 PyCharm 窗口才会刷新。
+    所以 AI 开始写某个文件时把它拉到前台，用户就能**看着**代码一个字一个字长出来。
+
+    找不到窗口就静默返回（IDE 没开 / 平台不支持），绝不能让这一步挡住生成。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        exe, _name = _find_ide()
+        if not exe:
+            return {"ok": False, "error": "本机没找到 IDE"}
+        # ⚠️ **按进程认窗口，别按标题认**：实测 PyCharm 的窗口标题是
+        # 「1 – dwf.py」（"项目名 – 文件名"），**压根不含 "PyCharm"** ——
+        # 按标题匹配会永远找不到窗口，而且不会报错，只是"这个功能好像没生效"。
+        want = os.path.basename(exe).lower()          # 例如 pycharm64.exe
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        found = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        def _cb(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            if user32.GetWindowTextLengthW(hwnd) <= 0:
+                return True          # 没标题的多半是隐藏窗口，跳过
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if not pid.value:
+                return True
+            # 取这个窗口所属进程的可执行文件名
+            h = kernel32.OpenProcess(0x1000, False, pid.value)   # QUERY_LIMITED_INFORMATION
+            if not h:
+                return True
+            try:
+                buf = ctypes.create_unicode_buffer(1024)
+                size = ctypes.c_ulong(1024)
+                if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                    if os.path.basename(buf.value).lower() == want:
+                        found.append(hwnd)
+                        return False         # 找到一个就够了
+            finally:
+                kernel32.CloseHandle(h)
+            return True
+
+        user32.EnumWindows(_cb, 0)
+        if not found:
+            return {"ok": False, "error": "没找到 IDE 窗口（可能还没打开）"}
+        hwnd = found[0]
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 9)     # SW_RESTORE：最小化了要先还原
+        else:
+            user32.ShowWindow(hwnd, 5)     # SW_SHOW
+        user32.SetForegroundWindow(hwnd)
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def ide_status(proj: str = "") -> dict:
     """本机装了哪个 IDE、当前项目在哪个目录。
 
