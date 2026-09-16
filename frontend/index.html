@@ -249,8 +249,7 @@
         <button class="btn sm ghost" id="stPreview" title="在系统浏览器里预览当前 HTML">🌐 预览</button>
         <button class="btn sm ghost" id="stDeploy" title="给当前项目起本地静态服务（多文件前端用）">🚀 部署</button>
         <button class="btn sm ghost" id="stUpload" title="把当前项目提交并上传到 GitHub / Gitee / 自建 Git（用本机 git 凭据）">⬆ 上传</button>
-        <button class="btn sm ghost" id="stVsCode" title="重启内置 VS Code 并重新加载（切了项目、或界面卡住时用）">⟳ VS Code</button>
-        <button class="btn sm ghost" id="stVsTerm" title="在 VS Code 里打开终端跑命令（Ctrl+`）—— 运行、装包、调试都在那儿">⌨ 终端</button>
+        <button class="btn sm" id="stPyCharm" title="用本机已装的 PyCharm 打开当前项目 —— 断点调试、变量监视、重构、代码导航都在那边；改的是同一批文件">🧠 PyCharm</button>
         <button class="btn sm ghost" id="stFolder" title="在资源管理器里打开项目文件夹">📂</button>
         <button class="btn sm ghost" id="stDebug" title="运行并检查：有报错就把完整 traceback 交给 AI 去修">🔧 调试</button>
         <button class="btn sm ghost" id="stZip" title="把整个项目打包成 zip 下载">📦 打包</button>
@@ -284,17 +283,25 @@
           <button class="btn sm ghost st-askai" id="stAskAi"
             title="把当前文件交给 AI 改（会明确要求它先读磁盘上的最新内容）">🤖 交给 AI 改</button>
         </div>
-        <!-- 编辑器 = **内置的真 VS Code**（code-server）本身。
-             以前这里挂的是 Monaco：只有"文本编辑"，没有终端、没有调试器、
-             没有 Git 面板 —— 用户原话是"调试和运行比不上 PyCharm 和 Trae 这类"。
-             所以整个换掉：**全应用只保留这一个编辑器**（Monaco 已删除）。
-             AI 写文件时是**边生成边落盘**的，VS Code 的文件监视器能看到内容
-             一点点长出来 —— 也就是"AI 自己逐字敲进编辑器"。 -->
+        <!-- 编辑器 = **本机的 PyCharm**（独立窗口，改的是同一批文件）。
+             为什么不是嵌进来：PyCharm 是纯桌面程序，**没有可嵌入网页的版本** ——
+             VS Code 能嵌是因为官方提供浏览器版（code-server）；
+             JetBrains 的 Projector 已停更、Code With Me 也在 2026.1 日落。
+             所以这里当"项目驾驶舱"：一键把项目交给本机 PyCharm。
+             AI 写的文件 PyCharm 自己会同步（IDE 的常规行为），
+             断点调试 / 变量监视 / 重构 / 代码导航都在那边。 -->
         <div class="studio-editor" id="stEditor">
-          <iframe class="studio-vs" id="stVs" title="内置 VS Code"
-                  src="about:blank" allow="clipboard-read; clipboard-write"></iframe>
-          <div class="studio-vs-cover" id="stVsCover">
-            <div class="studio-vs-msg" id="stVsMsg">正在启动内置 VS Code…</div>
+          <div class="studio-ide" id="stIdePanel">
+            <div class="studio-ide-ico">🧠</div>
+            <div class="studio-ide-title">用本机 PyCharm 打开这个项目</div>
+            <div class="studio-ide-desc" id="stIdeDesc">
+              项目就在本机磁盘上，PyCharm 里改的就是同一批文件（不是副本）。
+            </div>
+            <div class="studio-ide-acts">
+              <button class="btn" id="stIdeOpen">🧠 用 PyCharm 打开</button>
+              <button class="btn sm ghost" id="stIdeFolder">📂 资源管理器</button>
+            </div>
+            <div class="studio-ide-path" id="stIdePath"></div>
           </div>
         </div>
         <div class="studio-out" id="stOut" hidden>

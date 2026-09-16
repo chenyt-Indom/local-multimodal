@@ -85,45 +85,57 @@
     });
   }
 
-  // ---------- 编辑器：内置的真 VS Code（code-server） ----------
-  // **Monaco 已经删掉**。原因：它只有"文本编辑"这一层，没有终端、没有调试器、
-  // 没有 Git 面板 —— 用户的原话是"调试和运行比不上 PyCharm 和 Trae 这类"。
-  // VS Code 本体全都自带，而且同样是**完全离线**跑在本机 127.0.0.1 上。
-  // 所以全应用**只保留这一个编辑器**，不再自己维护一套半成品。
-  var vsReady = false;
+  // ---------- 编辑器：本机的 PyCharm（独立窗口） ----------
+  // 演变过程：Monaco（功能太少）→ 内置真 VS Code（code-server）→ **本机 PyCharm**。
+  //
+  // 为什么不能像 VS Code 那样嵌进来：**PyCharm 是纯桌面程序，没有可嵌入网页的版本**。
+  // VS Code 能嵌，是因为官方提供了浏览器版（code-server）；
+  // JetBrains 的 Projector（网页版方案）已停更，Code With Me 也在 2026.1 日落。
+  // 所以这里不做"嵌入"，而是做**一键把项目交给本机 PyCharm**：
+  // 打开的就是磁盘上这个目录，和开发台改的是同一批文件（不是副本）。
+  // AI 写的文件 PyCharm 会自己同步（IDE 通用行为；点一下窗口让它获得焦点必定同步）。
+  var ideInfo = { name: "", path: "" };
 
-  function vsMsg(text) {
-    var m = $("stVsMsg"), c = $("stVsCover");
-    if (m) m.textContent = text;
-    if (c) c.hidden = !text;
-  }
-
-  function vsFrame(url) {
-    var f = $("stVs");
-    if (f && url && f.getAttribute("src") !== url) f.setAttribute("src", url);
-    vsReady = true;
-    vsMsg("");
-  }
-
-  /* 确保内置 VS Code 已就绪、且开的就是当前项目。
-     ⚠️ code-server 是**启动时绑定目录**的，切项目不会自己跟着换 ——
-     不比对项目的话，用户切了项目看到的还是上一个项目的文件，会以为文件丢了。 */
-  async function ensureVs(force) {
-    var st = {};
-    try { st = await jget("/api/ide/status"); } catch (e) { st = {}; }
-    if (!st.installed) {
-      vsMsg("没有找到内置 VS Code。\n\n获取方式见 vendor/ 说明，或使用 Docker 版（已内置）。");
-      return;
-    }
-    if (!force && st.running && st.project === project) { vsFrame(st.url); return; }
-    if (st.running) { vsMsg("正在切换到项目 " + project + " …"); await jpost("/api/ide/stop", {}); }
-    else vsMsg("正在启动内置 VS Code…（第一次要几秒）");
-    $("stVs").setAttribute("src", "about:blank");
+  /* 问后端：本机装了什么 IDE、项目在哪个目录。**只探测，不启动** ——
+     用户没点之前不该擅自弹出个 PyCharm 窗口。 */
+  async function probeIde() {
     try {
-      var d = await jpost("/api/ide/start", {});
-      if (!d.ok) { vsMsg("启动失败：" + (d.error || "未知错误")); return; }
-      vsFrame(d.url);
-    } catch (e) { vsMsg("启动失败：" + String(e.message || e)); }
+      var d = await jget("/api/ws/ide/status");
+      ideInfo = { name: d.name || "", path: d.path || "" };
+    } catch (e) { ideInfo = { name: "", path: "" }; }
+    renderIdePanel();
+  }
+
+  function renderIdePanel() {
+    var t = $("stIdeDesc"), p = $("stIdePath"), b = $("stIdeOpen"), btn = $("stPyCharm");
+    var nm = ideInfo.name || "PyCharm";
+    if (t) {
+      t.textContent = ideInfo.name
+        ? "已检测到本机 " + ideInfo.name + "。项目就在本机磁盘上，"
+          + "那边改的就是同一批文件（不是副本）。AI 写的文件它会自己同步。"
+        : "本机没检测到 PyCharm / VS Code。可以先用「📂 资源管理器」打开项目目录，"
+          + "或在设置里装一个。";
+    }
+    if (p) p.textContent = ideInfo.path || "";
+    if (b) {
+      b.textContent = "🧠 用 " + nm + " 打开";
+      b.disabled = !ideInfo.name;
+    }
+    if (btn) btn.textContent = "🧠 " + nm;
+  }
+
+  /* 一键把当前项目交给本机 PyCharm。**不复制文件** —— 就是打开那个目录本身。 */
+  async function openInIde() {
+    try {
+      var d = await jpost("/api/ws/open_ide", {});
+      if (!d.ok) { toast(d.error || "没找到 PyCharm / VS Code"); return; }
+      toast("已用 " + (d.ide || d.name || "PyCharm") + " 打开项目：" + (d.project || ""));
+      if (d.path) showOut("已在本机 IDE 中打开",
+        "项目目录：\n" + d.path + "\n\n" +
+        "· 打开的就是**磁盘上这个目录**，和开发台改的是同一批文件（不是副本）；\n" +
+        "· AI 写的文件它会自己同步过来（点一下 IDE 窗口让它获得焦点即可刷新）；\n" +
+        "· 断点调试、变量监视、重构、代码导航都在 PyCharm 里用。");
+    } catch (e) { toast("打开失败：" + String(e.message || e)); }
   }
 
   function themeName() {
@@ -457,10 +469,11 @@
   }
 
   // ---------- 编辑器 ----------
-  /* 保留这个函数名（很多地方在 await initEditor()），但**不再建 Monaco 编辑器** ——
-     现在"编辑器"就是那个 VS Code iframe，这里只负责把它准备好。 */
+  /* 保留这个函数名（很多地方在 await initEditor()），但**不建任何内嵌编辑器** ——
+     编辑器是本机的 PyCharm，这里只负责探一下"装的是哪个 IDE、项目在哪"，
+     好把面板上的按钮文案和路径显示对。 */
   async function initEditor() {
-    await ensureVs();
+    await probeIde();
   }
 
   // ---------- 动作 ----------
@@ -931,7 +944,6 @@
     if (!rel) return;
     if (!opened) await open();
     await refresh();                       // 让文件树认到这个（可能是刚建出来的）文件
-    await ensureVs();
     if (tabs.indexOf(rel) < 0) tabs.push(rel);
     cur = rel;
     renderTabs(); renderTree();
@@ -1063,14 +1075,10 @@
     $("stPreview").onclick = previewCur;
     $("stDeploy").onclick = deploy;
     $("stUpload").onclick = uploadProject;
-    // ⟳ VS Code：重启并重新加载内置编辑器（切了项目、或界面卡住时用）
-    $("stVsCode").onclick = function () { ensureVs(true); };
-    // ⌨ 终端：把焦点送进 VS Code，用户按 Ctrl+` 就能开终端跑命令
-    if ($("stVsTerm")) $("stVsTerm").onclick = function () {
-      var f = $("stVs");
-      if (f) { try { f.focus(); } catch (e) {} }
-      toast("按 Ctrl+` 打开终端；运行、装包、调试都在 VS Code 里");
-    };
+    // 🧠 PyCharm：把当前项目交给本机 IDE（不复制文件，就是打开那个目录）
+    if ($("stPyCharm")) $("stPyCharm").onclick = openInIde;
+    if ($("stIdeOpen")) $("stIdeOpen").onclick = openInIde;
+    if ($("stIdeFolder")) $("stIdeFolder").onclick = openFolder;
     $("stFolder").onclick = openFolder;
     $("stRunStop").onclick = stopRun;
     $("stDebug").onclick = debugCur;

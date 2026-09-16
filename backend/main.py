@@ -2908,6 +2908,12 @@ def ws_warm(body: dict):
     return {"ok": True, "models": models}
 
 
+@app.get("/api/ws/ide/status")
+def ws_ide_status():
+    """本机装了哪个 IDE（PyCharm / VS Code）+ 当前项目目录。**只探测，不启动。**"""
+    return workspace.ide_status()
+
+
 @app.post("/api/ws/open_ide")
 def ws_open_ide(body: dict):
     """用本机已装的 PyCharm / VS Code 打开当前项目。

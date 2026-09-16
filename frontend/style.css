@@ -908,3 +908,19 @@ body.dragging .drop-overlay,
   background: var(--panel2); border: 1px solid var(--accent); color: var(--accent);
   font-size: 12px; white-space: nowrap; }
 .st-vs-typing[hidden] { display: none; }
+
+/* ---------- 开发台主区：本机 PyCharm 的"驾驶舱" ---------- */
+/* PyCharm 是桌面程序、没有可嵌入的网页版，所以这块不做 iframe，
+   而是一个说明 + 一键把项目交给本机 PyCharm 的面板。 */
+.studio-ide { position: absolute; inset: 0; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 10px; text-align: center;
+  padding: 28px; background: var(--bg); }
+.studio-ide-ico { font-size: 46px; line-height: 1; }
+.studio-ide-title { font-size: 16px; font-weight: 600; }
+.studio-ide-desc { max-width: 460px; color: var(--muted); font-size: 13px; line-height: 1.75; }
+.studio-ide-acts { display: flex; gap: 8px; margin-top: 6px; flex-wrap: wrap;
+  justify-content: center; }
+.studio-ide-path { margin-top: 10px; font-size: 12px; color: var(--muted);
+  font-family: Consolas, monospace; word-break: break-all; max-width: 520px;
+  padding: 5px 10px; background: var(--panel2); border-radius: 6px; }
+.studio-ide-path:empty { display: none; }

@@ -608,6 +608,22 @@ def open_in_ide(proj: str = "") -> dict:
     return {"ok": True, "ide": name, "exe": exe, "path": d, "project": p}
 
 
+def ide_status(proj: str = "") -> dict:
+    """本机装了哪个 IDE、当前项目在哪个目录。
+
+    **只探测，不启动** —— 用户没点之前不该擅自弹出个 PyCharm 窗口（又慢又突兀）。
+    前端拿它把按钮文案写成「🧠 PyCharm」并显示项目路径。
+    """
+    p = safe_project(proj) if str(proj or "").strip() else active_project()
+    d = root(p)
+    try:
+        exe, name = _find_ide()
+    except Exception:
+        exe, name = "", ""
+    return {"ok": True, "name": name or "", "exe": exe or "",
+            "path": d, "project": p}
+
+
 def open_folder(proj: str = "") -> dict:
     """在资源管理器里打开项目文件夹（找不到 IDE 时的兜底）。"""
     p = safe_project(proj) if str(proj or "").strip() else active_project()
