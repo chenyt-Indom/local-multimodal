@@ -190,6 +190,11 @@
       <label class="pill" data-cfg="auto_memorize"><i class="sw"></i>自动记忆</label>
       <label class="pill" data-cfg="code_auto_route" title="写代码或写长文时，自动换用专用模型（qwen2.5-coder，非思考型，更稳更快）"><i class="sw"></i>专用模型</label>
       <label class="pill" data-cfg="code_exec_enabled" title="让模型在本机真跑 Python 把结果算出来（默认关闭；开启后模型写的代码会在你电脑上执行）"><i class="sw"></i>本地算代码</label>
+      <!-- 模型**全自动选择**，这里不放选择器。
+           一度加过"手动指定模型"的下拉，用户试用后反馈：
+           "算了，我还是想要自动选择，手动太麻烦了" —— 于是移除。
+           后端的 `ChatRequest.model` 覆盖能力**一直保留着**（传了就强制用），
+           哪天想加回手动选择，前端补一个下拉、把 model 字段带上即可。 -->
     </div>
 
     <div class="messages" id="messages">

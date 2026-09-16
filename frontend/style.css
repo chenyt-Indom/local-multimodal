@@ -938,3 +938,4 @@ body.dragging .drop-overlay,
 .studio-runsel { max-width: 190px; height: 26px; font-size: 12px;
   background: var(--panel2); color: var(--text); border: 1px solid var(--line);
   border-radius: 6px; padding: 0 6px; }
+
