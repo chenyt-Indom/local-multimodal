@@ -793,8 +793,20 @@
       return [];
     }
     const list = (data && data.sessions) || [];
+    // ⚠️⚠️ 这里会**悄悄换掉当前会话**：localStorage 里没有 id、或那个会话已经不在
+    // 列表里时，自动切到最新的一条。它和文件末尾的 loadMemory() 是**并发**跑的：
+    //   ① loadMemory 先用「旧的（可能是空）sessionId」把请求发了出去
+    //   ② loadSessions 回来，把 sessionId 改成另一条
+    //   ③ 那个响应回来时 `d.session_id !== sessionId` → 被判成"用户已切走"**整条丢弃**：
+    //      不填任何字段、不报错、也不会重试
+    // → 界面就**一直停在灰色占位符**上，看着像"记忆一个字都没记住"。
+    // 实测复现过：DOM 里 #memLongMeta / #memShortMeta 全空、#memSessName 还是初始的「—」。
+    // 所以：只要真的换了会话，这里必须**补刷一次 loadMemory()**。
     if (!sessionId || !list.some((s) => s.id === sessionId)) {
-      setSessionId(list.length ? list[0].id : "");
+      const next = list.length ? list[0].id : "";
+      const changed = next !== sessionId;
+      setSessionId(next);
+      if (changed) loadMemory();
     }
     renderSessions(list);
     return list;

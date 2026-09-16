@@ -133,8 +133,12 @@ def _autostart_voice() -> None:
 
 def main() -> None:
     config.load_config()
+    # log_level="info" → 打开 **access log**（每个请求一行，含状态码）。
+    # 原来用 "warning"，后端一个字都不记请求 —— 排查"界面第一次打开某项是空的/
+    # 灰的"这类问题时，完全看不到前端到底发没发请求、请求是成功还是失败，
+    # 只能靠猜。日志落在 %TEMP%\mm_backend.log，排查完可以调回 "warning"。
     server = uvicorn.Server(uvicorn.Config(app, host=HOST, port=PORT,
-                                           log_level="warning"))
+                                           log_level="info"))
     t = threading.Thread(target=_serve, args=(server,), daemon=True)
     t.start()
 
