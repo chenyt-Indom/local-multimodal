@@ -19,6 +19,14 @@ dist/
 dist-lite/
 *.spec.bak
 
+# 改代码前留的本地备份（main.py.bak 这类）—— 只是回滚用，不进版本库
+# （.dockerignore 里也有同样两条，别只改一边）
+*.bak
+*.bak-*
+
+# 端到端测试用的临时数据目录（独立端口验证时用 MM_DATA_DIR 指过来）
+.webtest-data/
+
 # 运行时数据（记忆/会话/知识库/保存图片，随各机器独立，不入版本库）
 data/
 

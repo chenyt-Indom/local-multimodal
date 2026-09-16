@@ -14,13 +14,59 @@ WEB_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    # 主动声明只接受这两种 —— **别写 br**：本机没有 brotli 库，
+    # 一旦服务器真按 br 返回就彻底读不出内容（宁可要未压缩的）。
+    "Accept-Encoding": "gzip, deflate",
 }
+
+
+def _read_body(resp, max_bytes: int = 0) -> bytes:
+    """读响应体，并按 Content-Encoding **自己解压**。
+
+    ⚠️ 为什么必须自己解：urllib 不像 requests 那样自动解 gzip。
+    实测 `https://www.python.org/downloads/` —— 我们没声明要压缩，
+    但 nginx 仍然返回 `content-encoding: gzip`，于是
+    `resp.read().decode('utf-8')` 拿到的是一堆乱码，
+    `fetch_page_text` 还会把这堆乱码当正文交给模型（表面看是"能读"，其实全是废字符）。
+    更糟的是它同时会让 `re.findall('<p>')` 全部落空，正文提取逻辑一起失效。
+
+    brotli 只在装了库时才解，没装就返回空 —— 由调用方按"抓不到"处理，
+    绝不能让乱码流到模型那里。
+    """
+    import gzip
+    import zlib
+
+    raw = resp.read(max_bytes) if max_bytes else resp.read()
+    enc = (resp.headers.get("Content-Encoding") or "").lower().strip()
+    if not enc or enc == "identity":
+        return raw
+    try:
+        if "gzip" in enc or "x-gzip" in enc:
+            try:
+                return gzip.decompress(raw)
+            except Exception:
+                return zlib.decompress(raw, -zlib.MAX_WBITS)
+        if "deflate" in enc:
+            try:
+                return zlib.decompress(raw)
+            except Exception:
+                return zlib.decompress(raw, -zlib.MAX_WBITS)
+        if "br" in enc:
+            try:
+                import brotli
+                return brotli.decompress(raw)
+            except Exception:
+                return b""
+    except Exception:
+        # 解压失败时**不要**把压缩体当原文返回，否则又是一堆乱码。
+        return b""
+    return raw
 
 
 def _fetch(url: str, timeout: int = 15) -> str:
     req = urllib.request.Request(url, headers=WEB_HEADERS)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", errors="ignore")
+        return _read_body(resp).decode("utf-8", errors="ignore")
 
 
 def _clean(s: str) -> str:
@@ -485,10 +531,16 @@ def fetch_page_text(url: str, limit: int = 1200, timeout: int = 8) -> str:
         })
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             ctype = (resp.headers.get("Content-Type") or "").lower()
-            if "html" not in ctype and "text" not in ctype:
+            # 除了网页，也放行 json/xml —— 用户贴一个 API 地址时同样能读到内容
+            # （之前只认 html/text，贴 https://api.github.com/... 一律返回"抓不到"）。
+            if ctype and not any(k in ctype for k in
+                                 ("html", "text", "json", "xml")):
                 return ""
-            raw = resp.read(600 * 1024)            # 上限 600KB，防止超大页面
+            # 上限 600KB（压缩体）→ 解压后再限 4MB，防止解压炸弹
+            raw = _read_body(resp, 600 * 1024)[:4 * 1024 * 1024]
     except Exception:
+        return ""
+    if not raw:
         return ""
 
     for enc in ("utf-8", "gbk", "gb18030"):
@@ -575,9 +627,10 @@ _WEATHER_CODE = {
 
 
 def _json_get(url: str, timeout: int = 20) -> dict:
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0",
+                                               "Accept-Encoding": "gzip, deflate"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8", errors="ignore"))
+        return json.loads(_read_body(resp).decode("utf-8", errors="ignore"))
 
 
 def geocode_city(city: str, count: int = 5) -> list:
@@ -851,7 +904,7 @@ def call_external_api(config: dict, tool: str, params: dict) -> dict:
             req = urllib.request.Request(url, headers=headers, method=method)
             try:
                 with urllib.request.urlopen(req, timeout=15) as resp:
-                    raw = resp.read().decode("utf-8", errors="ignore")
+                    raw = _read_body(resp).decode("utf-8", errors="ignore")
                 # 尝试 JSON 解析，失败则返回原文
                 try:
                     return {"ok": True, "data": json.loads(raw)}
