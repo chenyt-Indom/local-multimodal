@@ -1438,12 +1438,14 @@
       card.innerHTML =
         `<div class="code-head"><span class="code-title">${escapeHtml(title || "🐍 本地执行的代码")}</span>${risk}` +
         `<span class="code-meta">${escapeHtml(meta.join(" · "))}</span>` +
-        `<span class="code-btns"><button class="btn sm ghost code-edit">✏ 编辑</button>` +
+        `<span class="code-btns"><button class="btn sm ghost code-ws" title="直接写进开发台当前项目，并立刻在编辑器里打开 —— 不用手动复制粘贴">📝 写进开发台</button>` +
+        `<button class="btn sm ghost code-edit">✏ 编辑</button>` +
         `<button class="btn sm ghost code-run">▶ 运行</button>` +
         `<button class="btn sm ghost code-save">💾 存到文库</button>` +
         `<button class="btn sm ghost code-copy">📋 复制</button></span></div>` +
         `<pre class="code-body"><code></code></pre><div class="code-out"></div>`;
       const codeEl = card.querySelector(".code-body code");
+      const wsBtn = card.querySelector(".code-ws");
       const editBtn = card.querySelector(".code-edit");
       const runBtn = card.querySelector(".code-run");
       const saveBtn = card.querySelector(".code-save");
@@ -1541,11 +1543,63 @@
           showToast("复制失败，请手动选中", "warn");
         }
       };
+      // 写进开发台：一步落盘到**当前工作区项目**并立刻在编辑器里打开。
+      // 为什么要有它：开发台的 workspace_write 只有模型自己能调，
+      // 模型在聊天里贴的代码块是纯文本 —— 原来只能「📋 复制」再手动粘进编辑器，
+      // 等于把 AI 的输出又搬一遍。文件名优先用用户点名的那个（"就叫 stats.py"）。
+      wsBtn.onclick = async () => {
+        const code = grab();
+        if (!code.trim()) { showToast("代码是空的", "warn"); return; }
+        current = code;
+        if (!window.Studio || !window.Studio.reveal) {
+          showToast("开发台还没就绪，稍后再试", "warn"); return;
+        }
+        wsBtn.disabled = true;
+        const oldText = wsBtn.textContent;
+        wsBtn.textContent = "写入中…";
+        try {
+          const r = await api("/api/ws/code", {
+            method: "POST",
+            body: JSON.stringify({ code, language: ui.lang || "",
+                                   user_text: ui.userText || "" }),
+          });
+          showToast((r.overwrote ? "已覆盖并写进开发台：" : "已写进开发台：") + r.rel, "ok");
+          await window.Studio.reveal(r.rel);
+        } catch (e) {
+          showToast("写入失败：" + String(e.message || e), "warn");
+        } finally {
+          wsBtn.disabled = false;
+          wsBtn.textContent = oldText;
+        }
+      };
+      return card;
+    };
+
+    /* AI 真的把文件写到磁盘上、而开发台没开着时给的提示卡片。
+       为什么不直接弹开发台：用户可能只是在聊天里问问题，AI 顺手存了个文件，
+       整页盖上去会很打扰。但也不能什么都不说 —— 那样用户根本不知道文件在哪，
+       只能去聊天里复制粘贴。所以给一张卡片，点一下就到。 */
+    const makeWsCard = (ui) => {
+      const card = document.createElement("div");
+      card.className = "ws-card";
+      card.innerHTML =
+        `<span class="ws-ico">📄</span>` +
+        `<span class="ws-txt">AI 写入了 <b>${escapeHtml(ui.rel)}</b>` +
+        (ui.chars ? `（${ui.chars} 字）` : "") + `</span>` +
+        `<button class="btn sm ghost ws-open">在开发台打开</button>`;
+      const go = async () => {
+        if (window.Studio && window.Studio.reveal) {
+          await window.Studio.reveal(ui.rel);
+          card.classList.add("done");
+        } else showToast("开发台还没就绪，稍后再试", "warn");
+      };
+      card.querySelector(".ws-open").onclick = (e) => { e.stopPropagation(); go(); };
+      card.onclick = go;
       return card;
     };
 
     // 模型回答里的 ```代码块```：渲染成同样的可编辑卡片（不然只能干看着文本）
-    const renderAnswerWithCode = (bubble, text) => {
+    const renderAnswerWithCode = (bubble, text, userText) => {
       const parts = [];
       const re = /```([a-zA-Z0-9_+#.-]*)[ \t]*\n([\s\S]*?)```/g;
       let last = 0, m;
@@ -1565,7 +1619,9 @@
           d.textContent = p.v;
           bubble.appendChild(d);
         } else {
-          bubble.appendChild(makeCodeCard({ code: p.v, lang: p.lang }, "📄 代码（可编辑后直接运行）"));
+          bubble.appendChild(makeCodeCard(
+            { code: p.v, lang: p.lang, userText: userText || "" },
+            "📄 代码（可编辑后直接运行）"));
         }
       });
     };
@@ -1778,8 +1834,14 @@
               messagesEl.scrollTop = messagesEl.scrollHeight;
             }
             else if (obj.ui.type === "workspace") {
-              // 模型改了工作区文件 → 开发台刷新（当前打开的就是它的话会重载内容）
+              // 模型改了工作区文件：
+              // · 开发台开着 → notify 直接把那个文件切到编辑器里，用户不用复制
+              // · 开发台没开 → **不强行弹出来打断阅读**，给一张卡片，点一下才打开
               if (window.Studio && window.Studio.notify) window.Studio.notify(obj.ui);
+              if (obj.ui.act === "write" && window.Studio && !window.Studio.opened) {
+                answerWrap.appendChild(makeWsCard(obj.ui));
+                messagesEl.scrollTop = messagesEl.scrollHeight;
+              }
             } else addMedia(obj.ui);
           }
           if (obj.note) { notes.push(obj.note); showToast(obj.note, "warn"); }
@@ -1789,7 +1851,7 @@
       }
       finishThinking();
       // 回答里带代码块的话渲染成可编辑卡片；否则维持原来的纯文本（不改变原有观感）
-      if (answer && answer.indexOf("```") >= 0) renderAnswerWithCode(answerBubble, answer);
+      if (answer && answer.indexOf("```") >= 0) renderAnswerWithCode(answerBubble, answer, promptText);
       else answerBubble.textContent = answer;
       if (!answer) {
         // 别把空白气泡藏起来让用户一脸茫然——明确说明发生了什么

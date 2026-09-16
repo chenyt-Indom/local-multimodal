@@ -929,6 +929,37 @@
     }
   }
 
+  /* 让某个文件**出现在编辑器里**：开发台没开就打开，开了就切过去。
+     这是"AI 写完不用我复制"的关键一步 ——
+     原来只有"AI 改的正好是你当前打开的那个文件"才会更新，
+     它新建一个文件时界面上什么都不会发生，用户只能自己去文件树里找。 */
+  async function revealFile(rel, opts) {
+    opts = opts || {};
+    if (!rel) return;
+    if (!opened) await open();
+    await refresh();                       // 先让文件树认到这个新文件
+    // AI 刚刚改过磁盘上的内容 —— 即使模型已存在也要重新读，否则编辑器里还是旧文本
+    if (models[rel] && opts.reload !== false) {
+      try {
+        var f = await jget("/api/ws/file?rel=" + encodeURIComponent(rel));
+        if (f.ok && f.text !== null && f.text !== models[rel].getValue()) {
+          var pos = editor ? editor.getPosition() : null;
+          models[rel].setValue(f.text || "");
+          if (pos && editor) editor.setPosition(pos);
+          delete dirty[rel];
+        }
+      } catch (e) { /* 读不到就维持原样 */ }
+    } else {
+      await openFile(rel);
+      return;
+    }
+    if (tabs.indexOf(rel) < 0) tabs.push(rel);
+    cur = rel;
+    showTab(rel);
+    renderTabs(); renderTree();
+    lintCur();
+  }
+
   function close() {
     var el = $("studio");
     unmountChat();
@@ -943,18 +974,12 @@
   function notify(ev) {
     if (!ev || ev.type !== "workspace") return;
     if (ev.act === "write") {
-      if (ev.rel === cur && models[cur]) {
-        jget("/api/ws/file?rel=" + encodeURIComponent(ev.rel)).then(function (d) {
-          if (d.ok && d.text !== models[cur].getValue()) {
-            var pos = editor ? editor.getPosition() : null;
-            models[cur].setValue(d.text);
-            if (pos && editor) editor.setPosition(pos);
-          }
-          delete dirty[ev.rel];
-          renderTabs();
-        });
+      // 开发台开着 → **直接把 AI 刚写的那个文件切到编辑器里**。
+      // 不这么做的话：AI 改的是别的文件（尤其是新建文件）时，界面上一点动静都没有，
+      // 用户会以为"它只是嘴上说了说"，然后自己去聊天里复制粘贴。
+      if (opened) {
+        revealFile(ev.rel).then(function () { loadChanges(); });
       }
-      if (opened) { refresh(); loadChanges(); }
       toast("AI 更新了项目文件：" + ev.rel);
     }
   }
@@ -1162,7 +1187,10 @@
   window.Studio = {
     open: open, close: close, toggle: toggle, refresh: refresh, notify: notify,
     onDropFiles: onDropFiles, loadChanges: loadChanges,
+    // 打开开发台并把某个文件摆到编辑器里（聊天区的"写进开发台"按钮用它）
+    reveal: revealFile, openFile: openFile,
     get current() { return cur; },
-    get project() { return project; }
+    get project() { return project; },
+    get opened() { return opened; }
   };
 })();

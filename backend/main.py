@@ -2950,6 +2950,39 @@ def code_save(body: dict):
     return {"ok": True, "rel": rel}
 
 
+@app.post("/api/ws/code")
+def ws_code(body: dict):
+    """代码卡片里的「📝 写进开发台」：把这段代码直接写进**当前工作区项目**。
+
+    为什么需要它：开发台的 `workspace_write` 只有**模型自己能调**，
+    而模型在聊天里贴出来的代码块是"文本" —— 用户原来只能点「📋 复制」再手动粘进
+    编辑器，等于把 AI 的输出又搬一遍。这个端点让按钮一步落盘；顺带返回 change_id，
+    于是开发台那套"AI 改动 / 一键撤销"也照常生效。
+    """
+    b = body or {}
+    code = str(b.get("code") or "")
+    if not code.strip():
+        raise HTTPException(status_code=400, detail="代码是空的")
+    lang = str(b.get("language") or "").strip()
+    rel = str(b.get("rel") or "").strip()
+    if not rel:
+        # 复用"存到文库"那套命名：优先用户点名的文件名，否则按语言猜
+        rel = _guess_code_filename(code, lang, str(b.get("user_text") or ""))
+        if "." not in os.path.basename(rel):
+            rel += _LANG_EXT.get(lang.lower(), ".txt")
+    try:
+        r = workspace.write_text(rel, code, by="ai")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="写入失败：%s" % e)
+    if not r.get("ok"):
+        raise HTTPException(status_code=400, detail=r.get("error") or "写入失败")
+    return {"ok": True, "rel": r["rel"], "chars": r.get("chars", 0),
+            "change_id": r.get("change_id") or "",
+            # 有 backup 说明覆盖了已有文件（旧版已进回收站）——前端据此换个说法
+            "overwrote": bool(r.get("backup")),
+            "project": workspace.active_project()}
+
+
 @app.post("/api/chat/stop")
 def chat_stop(body: dict | None = None):
     """终止当前正在进行的生成（界面上的「■ 终止」按钮）。

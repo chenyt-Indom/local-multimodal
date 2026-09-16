@@ -877,3 +877,15 @@ body.dragging .drop-overlay,
 .vsproj { color: var(--muted); font-weight: 400; }
 .vsbar .head-acts { margin-left: auto; display: flex; gap: 6px; }
 .vsframe { flex: 1; width: 100%; border: none; background: #1e1e1e; }
+
+/* ---------- “AI 写入了 xxx” 卡片（开发台没开着时） ---------- */
+.ws-card { display: flex; align-items: center; gap: 10px; margin: 8px 0;
+  padding: 9px 12px; background: var(--panel2); border: 1px solid var(--border);
+  border-left: 3px solid var(--accent); border-radius: 8px; cursor: pointer;
+  font-size: 13px; transition: background .15s, border-color .15s; }
+.ws-card:hover { background: var(--panel); border-color: var(--accent); }
+.ws-card.done { opacity: .6; cursor: default; }
+.ws-ico { font-size: 16px; }
+.ws-txt { flex: 1; color: var(--muted); min-width: 0; }
+.ws-txt b { color: var(--text); font-family: Consolas, monospace; word-break: break-all; }
+.ws-open { flex: none; }
