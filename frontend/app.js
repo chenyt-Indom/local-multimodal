@@ -1395,7 +1395,11 @@
       thinkPending += delta;
       if (thinkTimer === null) {
         thinkTimer = setInterval(() => {
-          const STEP = 5;                       // 每帧播放字速
+          // ⚠️ 每帧字数**不能写死**。原来固定 5 字/26ms ≈ 190 字/秒，
+          // 模型思考一旦比这快，待播队列就越积越长 —— 表现是"思考半天不动、
+          // 结束前突然刷一大段"，正是用户说的"不是逐字"。
+          // 改成跟着积压量自适应：积压越多每帧吐越多，既保持平滑又**永远不落后**。
+          const STEP = Math.max(5, Math.ceil(thinkPending.length / 10));
           if (thinkPending) {
             const take = Math.min(STEP, thinkPending.length);
             thinking += thinkPending.slice(0, take);
@@ -2039,6 +2043,55 @@
     }
     renderSessions(list);
   })();
+
+  // ---------- 界面自更新：改了前端不用用户手动刷新 ----------
+  // 这个应用是 WebView2 窗口，**没有地址栏、也没有刷新按钮** ——
+  // 原来每次改完界面都要让用户"自己刷新一下才看得到"，等于把开发成本转嫁给用户。
+  // 现在后台比对前端的版本号（mtime+size），变了就自己重载。
+  //
+  // ⚠️ 三条**必须满足**才敢重载，否则宁可不更新：
+  //   ① 没有正在生成 —— 中途重载会把这一轮回答打断，用户会以为"又崩了"；
+  //   ② 输入框是空的 —— 否则用户打了一半的字会被冲掉；
+  //   ③ 开发台没有未保存的改动 —— 否则改了一半的文件会丢。
+  // 不满足就把 pendingReload 挂起，等下一轮轮询条件够了再重载（回答结束后会自动恢复聊天记录）。
+  let feVersion = "";
+  let pendingReload = false;
+  let reloading = false;
+
+  const canReload = () => {
+    if (streaming) return false;
+    const box = document.getElementById("input");
+    if (box && box.value.trim()) return false;
+    if (window.Studio && window.Studio.hasUnsaved && window.Studio.hasUnsaved()) return false;
+    return true;
+  };
+
+  async function checkFrontendVersion() {
+    if (reloading) return;
+    let v = "";
+    try {
+      const d = await api("/api/frontend/version");
+      v = d.version || "";
+    } catch (e) { return; }          // 探测失败不影响使用
+    if (!feVersion) { feVersion = v; return; }
+    if (v === feVersion) return;
+    feVersion = v;
+    if (!canReload()) {
+      if (!pendingReload) {
+        pendingReload = true;
+        showToast("界面有新版本，等这一轮结束会自动更新", "ok");
+      }
+      return;
+    }
+    reloading = true;
+    showToast("界面已更新，正在重新加载…", "ok");
+    // 给 toast 一点时间被看见，再重载（重载后会恢复聊天记录）
+    setTimeout(() => location.reload(), 900);
+  }
+
+  setInterval(checkFrontendVersion, 3000);
+  // 挂起中时，每轮生成结束后立刻再试一次（不用干等下一个 3 秒）
+  setInterval(() => { if (pendingReload) checkFrontendVersion(); }, 1200);
 
   // ---------- 绘图计算设备：徽标 + 切换菜单 ----------
   // 文生图与图片微改共用同一个 torch 环境，设备一致。

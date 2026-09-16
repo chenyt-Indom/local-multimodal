@@ -3790,4 +3790,24 @@ def index():
     return resp
 
 
+# ---------- 界面自更新：改了前端不用用户手动刷新 ----------
+# 这个应用跑在 WebView2 窗口里 —— **没有地址栏、也没有刷新按钮**。
+# 每次改完前端都要求用户"手动刷新才看到新界面"，等于把开发成本转嫁给用户
+# （实测就是这么被投诉的）。所以前端每隔几秒来问一次"界面文件变了没"。
+# 只看 mtime+size，不读文件内容，开销可以忽略。
+_FE_FILES = ("index.html", "app.js", "studio.js", "style.css")
+
+
+@app.get("/api/frontend/version")
+def frontend_version():
+    parts = []
+    for name in _FE_FILES:
+        try:
+            st = os.stat(os.path.join(FRONTEND_DIR, name))
+            parts.append("%s:%d:%d" % (name, int(st.st_mtime), st.st_size))
+        except OSError:
+            parts.append("%s:-" % name)
+    return {"version": "|".join(parts)}
+
+
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")

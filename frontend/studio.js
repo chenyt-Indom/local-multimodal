@@ -1189,6 +1189,12 @@
     onDropFiles: onDropFiles, loadChanges: loadChanges,
     // 打开开发台并把某个文件摆到编辑器里（聊天区的"写进开发台"按钮用它）
     reveal: revealFile, openFile: openFile,
+    // 有没有还没保存的改动 —— 界面自更新要重载页面前必须先问，
+    // 否则会把用户改了一半的文件冲掉。
+    hasUnsaved: function () {
+      try { return Object.keys(dirty).some(function (k) { return dirty[k]; }); }
+      catch (e) { return false; }
+    },
     get current() { return cur; },
     get project() { return project; },
     get opened() { return opened; }

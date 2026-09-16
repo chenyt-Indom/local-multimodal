@@ -889,3 +889,5 @@ body.dragging .drop-overlay,
 .ws-txt { flex: 1; color: var(--muted); min-width: 0; }
 .ws-txt b { color: var(--text); font-family: Consolas, monospace; word-break: break-all; }
 .ws-open { flex: none; }
+
+/* 界面自更新验证：改动这行会让已打开的窗口自动重载（不用手动刷新） */
