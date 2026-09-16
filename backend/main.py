@@ -1495,6 +1495,76 @@ def _partial_ws_write(buf: str):
         return rel, None, proj
 
 
+def _reconcile_streamed(state: dict, ui_events: list, final: bool = False) -> list:
+    """给"流式预览"和"正式写入"对账，返回要讲给用户听的话。
+
+    背景：AI 写文件是**边生成边落盘**的（这样编辑器里能看到代码一个个字长出来），
+    但那个落盘只是**预览**，真正算数的写入是模型调 `workspace_write` 那一次。
+    两者对不上时就会出问题，这里负责收拾：
+
+      ① **孤儿预览**：预览写进了项目 A（那一刻还没切项目），
+         正式写入却落在项目 B —— 于是 A 里多出一份只属于 B 的文件。
+         条件（**两个都必须满足**才删，缺一不可）：
+           · 这份文件是**我们这次新建的**（`before is None`），不是本来就有的；
+           · 正式写入确实落在了**另一个**项目。
+         这样既不会碰用户原有的文件，也不会碰正式写入自己写的那份。
+
+      ② **只有预览、没有正式写入**（模型输出被截断，或它压根没走写文件工具）：
+         磁盘上会剩下**半截文件**，而界面上看起来"AI 正在写"，用户以为成功了。
+         这是最坑的一种，必须在整次生成结束时撤掉（新建的删掉、老文件还原）。
+
+    `final=True` 表示整次生成已经结束 —— 只有这时才做②，
+    因为中途每一轮都可能"这一轮没有写入"而下一轮才写（跨轮对账，
+    所以 `state` 必须整次生成共用一份，不能按轮清空）。
+
+    ⚠️ 之前这里踩过两次坑，都写进注释免得再犯：
+      · 清理太激进（按"每个文件有没有被正式写"逐个判）→ **误删**，
+        把上一轮刚写好的项目目录清空了；
+      · 记录按轮清空 → 跨轮的孤儿文件**永远清不掉**。
+    """
+    streamed = state.setdefault("streamed", {})     # rel -> (before 内容或 None, 预览写进的项目)
+    written = state.setdefault("written", {})       # rel -> 正式写入落在的项目
+    notices = []
+    try:
+        for u in ui_events:
+            if (isinstance(u, dict) and u.get("act") == "write" and u.get("rel")):
+                written[u["rel"]] = str(u.get("project") or "")
+        # ① 孤儿预览
+        for rel, (before, used) in list(streamed.items()):
+            rp = written.get(rel)
+            if before is None and rp and used and rp != used:
+                try:
+                    p = workspace.abs_path(rel, used)
+                    if os.path.exists(p):
+                        os.remove(p)
+                        logger.info("清掉孤儿预览文件：%s/%s（正式写入在 %s）", used, rel, rp)
+                except Exception:
+                    pass
+        # ② 只有预览、没有正式写入 —— 只在整次生成结束时收拾
+        if final:
+            left = [r for r in streamed if r not in written]
+            for rel in left:
+                before, used = streamed[rel]
+                try:
+                    p = workspace.abs_path(rel, used)
+                    if before is None:
+                        if os.path.exists(p):
+                            os.remove(p)
+                    else:
+                        with open(p, "w", encoding="utf-8", newline="") as fh:
+                            fh.write(before)
+                except Exception:
+                    pass
+            if left:
+                notices.append(
+                    "模型这次没能把文件写完（输出被截断，或没走写文件工具），"
+                    "已撤掉不完整的文件 %s —— 让它重试一次即可。" % "、".join(left))
+            streamed.clear()
+    except Exception:
+        logger.warning("对流式预览与正式写入对账失败", exc_info=True)
+    return notices
+
+
 def _route_code_model(cfg: dict, text: str, fallback: str, prev_code: bool = False,
                       force: bool = False):
     """代码类请求换用专用代码模型，返回 (模型名，给用户看的提示)。
@@ -2195,7 +2265,7 @@ async def chat(req: ChatRequest):
         # 【完整性兜底】整次生成共用一份"预览过哪些文件、当时写进了哪个项目"的记录。
         # 必须放在轮次循环**外面**：模型常常第 1 轮建项目+预览、第 2 轮才正式写入，
         # 每轮清空就看不出"预览写到 A 项目、正式写入落在 B 项目"，孤儿文件清不掉。
-        _streamed = {}
+        _wsstate = {"streamed": {}, "written": {}}
         for _round in range(MAX_TOOL_ROUNDS):
             # 工具调用中间轮不再重复附图片
             attach_images = images if _round == 0 else None
@@ -2279,7 +2349,7 @@ async def chat(req: ChatRequest):
                             # 太密会把磁盘和 VS Code 的文件监视器打爆；太疏就没有"打字"感。
                             if (_fresh or len(_partial) - _ws_len >= 60
                                     or _now - _ws_t >= 0.30):
-                                if _fresh and _rel not in _streamed:
+                                if _fresh and _rel not in _wsstate["streamed"]:
                                     # 第一次预览这个文件 → 先记下"它原本长什么样、
                                     # 在哪个项目里"，万一这轮没能正式写完，好还原回去
                                     try:
@@ -2287,11 +2357,11 @@ async def chat(req: ChatRequest):
                                         if os.path.exists(_p):
                                             with open(_p, "r", encoding="utf-8",
                                                       errors="replace") as _fh:
-                                                _streamed[_rel] = (_fh.read(), _target)
+                                                _wsstate["streamed"][_rel] = (_fh.read(), _target)
                                         else:
-                                            _streamed[_rel] = (None, _target)
+                                            _wsstate["streamed"][_rel] = (None, _target)
                                     except Exception:
-                                        _streamed[_rel] = (None, _target)
+                                        _wsstate["streamed"][_rel] = (None, _target)
                                 try:
                                     workspace.stream_write(_rel, _partial, _target)
                                 except Exception:
@@ -2506,59 +2576,20 @@ async def chat(req: ChatRequest):
             # 实测就踩到：生成出来的 todo.py 停在 `print(f'{index}. {task[`，
             # 一跑就 SyntaxError。**半成品冒充成品，比"什么都没写"更糟。**
             # 所以：新文件 → 删掉；老文件 → 还原成本轮之前的内容。
-            if _streamed:
-                try:
-                    _written = set()
-                    for _u in ui_events:
-                        if isinstance(_u, dict) and _u.get("act") == "write":
-                            _written.add(_u.get("rel"))
-                    # 【孤儿预览文件】模型常在同一轮里先"建项目"再"写文件"，
-                    # 而预览是在**流式过程中**就落了盘的，那时项目还没切过去 ——
-                    # 于是旧项目里会多出一份只属于新项目的文件。
-                    # 精准清理：**我们这轮新建的** + **正式写入落在了别的项目** → 删掉旧项目里那份。
-                    # （两个条件缺一不可：既不碰本来就在那儿的文件，也不碰正式写入自己写的那份。）
-                    _real_proj = {}
-                    for _u in ui_events:
-                        if (isinstance(_u, dict) and _u.get("act") == "write"
-                                and _u.get("rel")):
-                            _real_proj[_u["rel"]] = str(_u.get("project") or "")
-                    for _r, (_before, _used) in list(_streamed.items()):
-                        _rp = _real_proj.get(_r)
-                        if _before is None and _rp and _used and _rp != _used:
-                            try:
-                                os.remove(workspace.abs_path(_r, _used))
-                                logger.info("清掉孤儿预览文件：%s/%s（正式写入在 %s）",
-                                            _used, _r, _rp)
-                            except Exception:
-                                pass
-                    # ⚠️ **只有"这一轮一次正式写入都没有"时才动手**。
-                    # 第一版是按"每个文件有没有被正式写"逐个判的，结果误伤：
-                    # 模型明明在这一轮正式写过文件，但下一轮又预览了别的文件，
-                    # 于是把上一轮写好的东西也一起撤了 —— 实测把一个刚建好的
-                    # 项目目录清空了。**宁可漏判，也不能删用户的文件。**
-                    _left = [] if _written else list(_streamed)
-                    for _r in _left:
-                        # 用**当初预览时记下的项目**，不能用当前的 active_project() ——
-                        # 这一轮可能刚切过项目，两个值不是一回事
-                        _before, _proj = _streamed[_r]
-                        _p = workspace.abs_path(_r, _proj)
-                        if _before is None:
-                            if os.path.exists(_p):
-                                os.remove(_p)
-                        else:
-                            with open(_p, "w", encoding="utf-8", newline="") as _fh:
-                                _fh.write(_before)
-                    if _left:
-                        yield json.dumps({
-                            "note": "模型这次没能把文件写完（输出被截断，或没走写文件工具），"
-                                    "已撤掉不完整的文件 %s —— 让它重试一次即可。"
-                                    % "、".join(_left)}) + "\n"
-                except Exception:
-                    logger.warning("撤掉残缺文件失败", exc_info=True)
+            # 每轮都对一次账：更新"正式写入落在哪个项目"，并清掉跨项目的孤儿预览。
+            # 撤销残缺文件留到整次生成结束时做（见下面的 final=True）。
+            for _n in _reconcile_streamed(_wsstate, ui_events):
+                yield json.dumps({"note": _n}) + "\n"
 
             # 3) 把前端副作用事件透出
             for ui in ui_events:
                 yield json.dumps({"ui": ui}) + "\n"
+
+        # 整次生成结束 —— **这时候才**收拾"只被预览过、从没正式写入"的残缺文件。
+        # 为什么不能每轮收：模型经常"这一轮只预览、下一轮才正式写"，每轮收会误伤
+        # （上一版就是这么把一个刚建好的项目目录清空的）。
+        for _n in _reconcile_streamed(_wsstate, [], final=True):
+            yield json.dumps({"note": _n}) + "\n"
 
         # 对话结束：归档历史会话（供记忆检索）+ 保存会话文件（供重启后恢复）
         # **必须用 all_messages（完整历史）**，不能用裁剪后的 messages，
