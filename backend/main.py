@@ -1083,22 +1083,47 @@ MAX_TOOL_ROUNDS = 10  # 单次对话内最多连续调用工具轮次，防止�
 # 规则：**强信号**出现即切；**弱信号**（只是提到了语言/格式名）必须
 # 同时出现动作词才算写代码任务。
 _CODE_STRONG = (
-    "写代码", "代码", "脚本", "报错", "bug", "调试", "跑一下", "运行一下",
-    "正则", "sql", "爬虫", "重构", "单元测试",
-    "帮我实现", "实现一个", "实现个", "写一段", "写个", "写一个",
-    "帮我改这段", "改这段", "这段代码", "注释一下",
+    "写代码", "调试", "重构", "单元测试", "爬虫",
+    "帮我实现", "实现一个", "实现个",
+    "帮我改这段", "改这段", "注释一下",
 )
-# "递归/算法/数据结构/排序/函数" 这类**既是术语也能当概念题**的词放这一档 ——
-# 「什么是递归？」是知识问答，不能因此切到代码模型；
+# ⚠️ 下面这一档是"**既是术语/现象、也能是日常问法**"的词 —— 必须配上动作词才算要写代码。
+#
+# 2026-09-16 从 _CODE_STRONG **降级**下来的一批。用户反馈："明明只是日常对话，
+# 却给我显示模型不思考（切到了代码模型）" —— 元凶就是它们单独命中就切：
+#     「写个总结」        ← 命中 "写个"
+#     「这段代码是什么意思」← 命中 "代码" / "这段代码"
+#     「为什么会报错」     ← 命中 "报错"
+#     「跑一下看看」       ← 命中 "跑一下"
+# 现在它们必须配上"写/改/实现/帮我"这类动作词才算。
+# 另外「什么是递归？」是知识问答，不能因此切到代码模型；
 # 「用递归实现斐波那契」才真的在要代码。
 _CODE_WEAK = (
     "python", "javascript", "typescript", "java", "c++", "c#", "golang",
     "rust", "html", "css", "shell", "bash", "bat", "powershell", "json",
     "api", "接口", "函数", "排序", "数据库", "递归", "算法", "数据结构",
+    # —— 从 strong 降级下来的（单独出现多为问答）——
+    "代码", "脚本", "报错", "错误", "bug", "正则", "sql",
+    "这段代码",
 )
+# ⚠️ 「跑一下 / 运行一下」**不放 weak、也不放 strong** ——
+# 它们身上根本没有技术特征，纯是动作：「跑一下看看什么情况」不该切代码模型。
+# 真要跑代码时旁边一定有别的信号（「帮我跑一下这个脚本」→ weak 命中"脚本"）。
+# 同理「报错 / 错误」不能放动作词（见下），否则「为什么会报错」会被判成代码任务。
+# ⚠️ "报错 / 错误" **不能放在动作词里** —— 它们是"现象描述"不是"动作"，
+# 否则「为什么会报错」会同时命中 weak 与 actions，又被判成代码任务。
+# 「帮我修一下这个报错」里有 "帮我" 兜着，不会漏。
 _CODE_ACTIONS = (
-    "写", "改", "实现", "调试", "运行", "跑", "报错", "错误", "修复", "优化",
+    "写", "改", "实现", "调试", "运行", "跑", "修复", "优化",
     "生成", "帮我", "给我", "补全", "完成",
+)
+
+# "接着上一轮继续改"的意图词 —— 用来判断"上一轮写过代码，这轮还在改它"。
+# 只放明确的**接续/修改**词：日常寒暄、问概念都不会命中，也就不会被误切到代码模型。
+_CONTINUE_HINTS = (
+    "再", "继续", "接着", "然后", "还有", "另外",
+    "改", "加", "换成", "替换", "调整", "优化",
+    "去掉", "删", "补", "新增",
 )
 
 # ⚠️ **大白话的"造东西"需求**（2026-09-16 补，vibecoding 场景）
@@ -2068,15 +2093,24 @@ async def chat(req: ChatRequest):
 
     last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
 
-    # ⚠️ 迭代轮次：上一轮回答里如果有代码块，这一轮就算用户只说「再改两处」，
-    # 也仍然是在改代码 —— 必须继续用代码模型。只看本句会把这类请求漏掉。
-    prev_code = False
+    # ⚠️ 迭代轮次：上一轮刚写过代码时，这轮用户可能只说「再改两处」——
+    # 里面一个代码关键词都没有，只按本句判定就会掉回默认模型。
+    #
+    # ⚠️⚠️ 但**不能只看"上一轮回答里有没有 ```"** —— 两个坑：
+    #   ① 太宽：助手解释一下、贴个示例都会带代码块，用户只是接着聊别的也会被切；
+    #   ② **会自锁**：切到代码模型后，它的回答**必然**带代码块 →
+    #      下一轮 `prev_code` 又是真 → **永远切不回来**。
+    #      用户实测反馈："明明只是日常对话，却一直显示模型不思考"。
+    # → 现在要求**两个条件同时成立**：上一轮确实有代码块，**并且**这一轮带着
+    #   "接着改"的意图（再/继续/改/加…）。日常寒暄、问概念都不满足，不会误切。
+    prev_code_raw = False
     _last_u = next((i for i in range(len(messages) - 1, -1, -1)
                     if messages[i].get("role") == "user"), len(messages))
     for _m in reversed(messages[:_last_u]):
         if _m.get("role") == "assistant":
-            prev_code = "```" in str(_m.get("content") or "")
+            prev_code_raw = "```" in str(_m.get("content") or "")
             break
+    prev_code = prev_code_raw and any(w in str(last_user) for w in _CONTINUE_HINTS)
 
     # 本轮像写代码 → 换专用代码模型（只影响这一轮，下一轮自动回默认模型）
     if not req.model:
@@ -3190,6 +3224,53 @@ def ide_start(body: dict):
 @app.post("/api/ide/stop")
 def ide_stop():
     return workspace.stop_code_server()
+
+
+@app.post("/api/ide/run_in_terminal")
+async def ide_run_in_terminal(body: dict):
+    """在**内置 VS Code 的集成终端**里运行一个 .py —— 用户点「▶ 运行」走这条。
+
+    为什么改成走终端：那是**真正的终端**，`input()` 天然可用、能交互、能跑任意命令；
+    我们自己在后端跑、再靠界面"喂标准输入"只是权宜之计。
+    （AI 自动跑代码那条路**不走这里** —— 它要拿真实输出做自我修正，见 workspace_run。）
+    """
+    b = body or {}
+    rel = str(b.get("rel") or "").strip()
+    if not rel:
+        return {"ok": False, "error": "没指定要运行的文件"}
+    proj = str(b.get("project") or "").strip() or workspace.active_project()
+    # ① 终端在 VS Code 里面，先确保它开着
+    try:
+        st = workspace.code_server_status()
+    except Exception:
+        st = {}
+    if not st.get("running"):
+        r0 = workspace.start_code_server(proj)
+        if not r0.get("ok"):
+            return {"ok": False,
+                    "error": "得先启动内置 VS Code 才能用它的终端：%s" % r0.get("error")}
+    # ② 算绝对路径（终端的 cwd 就是项目根，但用绝对路径最稳）
+    try:
+        p = workspace.abs_path(rel, proj)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    if not os.path.isfile(p):
+        return {"ok": False, "error": "文件不存在：%s" % rel}
+    # ③ 拼命令送进终端
+    q = '"'
+    cmd = "python %s%s%s" % (q, p, q)
+    _args = str(b.get("args") or "").strip()
+    if _args:
+        cmd += " " + _args
+    try:
+        _cwd = workspace.root(proj)
+    except Exception:
+        _cwd = ""
+    r = workspace.send_to_vscode_terminal(cmd, _cwd)
+    if r.get("ok"):
+        r["cmd"] = cmd
+        r["note"] = "已送进 VS Code 终端（没自动弹出来的话按 Ctrl+`）。"
+    return r
 
 
 @app.post("/api/ws/warm")

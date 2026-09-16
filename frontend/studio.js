@@ -613,14 +613,6 @@
     if (s) s.hidden = !on;
     var b = $("stRun");
     if (b) { b.disabled = !!on; b.textContent = on ? "▶ 运行中…" : "▶ 运行"; }
-    // 运行时把输入框的提示改成"现在就该用它"，否则用户看到程序停着不动
-    // 会以为卡死了 —— input() 会一直等，界面上不会有任何输出。
-    var inp = $("stRunIn");
-    if (inp) {
-      inp.placeholder = on
-        ? "程序若在用 input()，就在这里输入后回车（会以 » 回显）"
-        : "程序里用 input() 时在这里输入后回车；也可以运行前先填好";
-    }
   }
 
   /* 运行 = **流式**（像终端一样边跑边出字），不是跑完才给结果。
@@ -628,122 +620,32 @@
      而且超时被强杀时那段时间打印的内容全丢（实测番茄钟跑满 25 秒 →
      界面显示"（没有输出）"）。见后端 ws_run_stream 的注释。 */
 
-  /* 标准输入：程序里 `input()` 读的就是这里。
-     后端是 GUI 启动的、**没有终端** —— 运行的进程不接管道时，一句 input() 直接
-     `EOFError: EOF when reading a line`（实测），用户点运行只看到一个报错，
-     程序根本跑不起来。现在进程的 stdin 接成了管道，这里输入什么就喂什么。 */
-  async function sendRunInput() {
-    var box = $("stRunIn");
-    if (!box) return;
-    var v = box.value;
-    if (!v) return;
+  /* 运行 = 送进**内置 VS Code 的集成终端**里跑。
+     为什么不用我们自己那套（后端跑 + 在界面上喂标准输入）：
+     VS Code 的终端是**真终端** —— input() 天然可用、能交互、能跑任意命令。
+     桥接方式：双方用一个**信箱文件**（~/.mm_terminal_cmd.json），
+     装在 VS Code 里的小扩展（vscode-ext/mm-bridge）读到就在终端里执行。
+     ⚠️ AI 自动跑代码**不走这里** —— 它要拿真实输出做自我修正，见后端 workspace_run。 */
+  async function runCur() {
+    if (!cur) { toast("先打开一个文件"); return; }
+    if (!/\.py$/i.test(cur)) { toast("目前只有 .py 能直接运行；前端项目请点「🚀 部署」"); return; }
+    if (dirty[cur]) await saveCur();
     try {
-      var r = await fetch("/api/ws/run_input", {
+      var r = await fetch("/api/ide/run_in_terminal", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: runId, data: v })
+        body: JSON.stringify({ rel: cur, project: project,
+                               args: (($("stRunArgs") || {}).value || "") })
       });
       var d = {};
       try { d = await r.json(); } catch (e) {}
       if (!r.ok || d.ok === false) {
-        toast("送不进去：" + ((d && d.error) || ("HTTP " + r.status)));
+        toast("运行失败：" + ((d && d.error) || ("HTTP " + r.status)));
         return;
       }
-      // 程序自己不会把输入回显出来（不像终端），这里补一行，
-      // 用户才看得到"我送出去的是什么"。加 `» ` 前缀区分"这是我们回显的"。
-      var out = $("stOutBody");
-      if (out) { out.textContent += "» " + v + "\n"; out.scrollTop = out.scrollHeight; }
-      box.value = "";
-    } catch (e) { toast("送不进去：" + e.message); }
-  }
-
-  async function runCur() {
-    if (runId) { toast("已经有一个在跑了，先点「■ 停止」"); return; }
-    if (!cur) { toast("先打开一个文件"); return; }
-    if (!/\.py$/i.test(cur)) { toast("目前只有 .py 能直接运行；前端项目请点「🚀 部署」"); return; }
-    if (dirty[cur]) await saveCur();
-
-    var out = $("stOutBody");
-    $("stOut").hidden = false;
-    $("stOutTitle").textContent = "运行中 · " + cur + "（实时输出）";
-    out.textContent = "";
-    runId = "r" + Date.now();
-    stoppedByUser = false;
-    setRunning(true);
-    var t0 = Date.now();
-    var head = "";
-    try {
-      var resp = await fetch("/api/ws/run_stream", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        // 带上命令行参数：argparse 这类工具不给参数就什么都不做，
-        // 界面会显示"跑完了但没有输出"，用户会以为程序坏了。
-        // stdin：运行前在「输入」框里填的内容作为**预置输入**先喂进去，
-        // 一行对应一次 input()。发送后清空输入框 —— 那批内容已经送出去了。
-        body: JSON.stringify({ rel: cur, id: runId,
-                               args: (($("stRunArgs") || {}).value || ""),
-                               stdin: (($("stRunIn") || {}).value || "") })
-      });
-      if (($("stRunIn") || {}).value) $("stRunIn").value = "";
-      if (!resp.ok) throw new Error("HTTP " + resp.status);
-      var reader = resp.body.getReader();
-      var dec = new TextDecoder();
-      var tail = "";
-      while (true) {
-        var chunk = await reader.read();
-        if (chunk.done) break;
-        tail += dec.decode(chunk.value, { stream: true });
-        var lines = tail.split("\n");
-        tail = lines.pop();
-        for (var i = 0; i < lines.length; i++) {
-          var s = lines[i];
-          if (!s.trim()) continue;
-          var o;
-          try { o = JSON.parse(s); } catch (e) { continue; }
-          if (o.t === "out") {
-            out.textContent += o.data;
-            out.scrollTop = out.scrollHeight;      // 自动滚到底，像终端
-          } else if (o.t === "start") {
-            if (o.risky && o.risky.length) {
-              out.textContent += "[注意] 这段代码含：" + o.risky.join("、") + "\n";
-            }
-          } else if (o.t === "end") {
-            var secs = ((Date.now() - t0) / 1000).toFixed(2);
-            if (o.ok === false) {
-              head = "启动失败";
-              out.textContent += "\n" + (o.error || "未知错误");
-            } else {
-              head = "退出码 " + o.rc + "   用时 " + secs + " 秒"
-                + (stoppedByUser ? "   （你手动停止了）" : "");
-            }
-          }
-        }
-      }
-    } catch (e) {
-      head = "运行出错";
-      out.textContent += "\n" + (e.message || e);
-    } finally {
-      runId = "";
-      setRunning(false);
-      var body = out.textContent;
-      // 没有输出时必须**说清楚是"文件本身没输出"，而不是"运行坏了"** ——
-      // 实测用户看到一行轻飘飘的"（没有输出）"会直接当成 bug 报上来。
-      if (!body.trim()) {
-        var sz = 0;
-        try {
-          var fr = files.filter(function (f) { return f.rel === cur; })[0];
-          sz = fr ? Number(fr.size || 0) : 0;
-        } catch (e) { sz = 0; }
-        if (!sz) {
-          body = "这个文件是【空的】（0 字节），所以没有输出 —— 运行本身是正常的。\n"
-               + "让它有东西可跑：在里面写一行 print(\"hello\") 再点运行即可。";
-        } else {
-          body = "这个文件跑完了，但没有打印任何东西（没有 print）。\n"
-               + "运行本身是正常的 —— 想看到输出，在代码里加 print(...) 即可。";
-        }
-      }
-      out.textContent = head + "\n" + "─".repeat(34) + "\n" + body;
-      $("stOutTitle").textContent = "运行结果 · " + cur;
-      stoppedByUser = false;
-    }
+      toast("已在 VS Code 终端里运行：" + cur);
+      // 把编辑器调出来 —— 否则用户在聊天界面点运行，终端在开发台里他根本看不见
+      if (typeof ensureVs === "function") { try { ensureVs(); } catch (e) {} }
+    } catch (e) { toast("运行失败：" + e.message); }
   }
 
   async function stopRun() {
@@ -1265,10 +1167,6 @@
     if ($("stIdeFolder")) $("stIdeFolder").onclick = openFolder;
     $("stFolder").onclick = openFolder;
     $("stRunStop").onclick = stopRun;
-    if ($("stRunInSend")) $("stRunInSend").onclick = sendRunInput;
-    if ($("stRunIn")) $("stRunIn").addEventListener("keydown", function (e) {
-      if (e.key === "Enter") { e.preventDefault(); sendRunInput(); }
-    });
     $("stDebug").onclick = debugCur;
     $("stOutFix").onclick = function () {
       var body = ($("stOutBody").textContent || "").trim();

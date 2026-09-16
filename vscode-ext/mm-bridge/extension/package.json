@@ -1,0 +1,19 @@
+{
+  "name": "mm-bridge",
+  "displayName": "助手桥接",
+  "description": "让本机「本地多模态助手」把命令送进 VS Code 的终端里执行（纯本地，不联网）",
+  "version": "1.0.0",
+  "publisher": "local",
+  "engines": { "vscode": "^1.80.0" },
+  "categories": ["Other"],
+  "main": "./extension.js",
+  "activationEvents": ["*"],
+  "contributes": {
+    "commands": [
+      {
+        "command": "mmBridge.runLast",
+        "title": "助手桥接：重跑上一条命令"
+      }
+    ]
+  }
+}

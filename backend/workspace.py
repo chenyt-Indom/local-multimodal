@@ -20,9 +20,11 @@
 拒绝盘符、`..`、`/` 开头、`~` 开头 —— 否则模型一句 "../../config.json" 就能改到别处。
 """
 import io
+import json
 import os
 import re
 import shutil
+import time
 import sys
 import time
 import zipfile
@@ -553,6 +555,56 @@ def start_run(rel: str, proj: str = "", run_id: str = "",
             pass      # 喂不进去不影响启动，用户还可以在运行中输入
     _RUNS[run_id] = proc
     return {"ok": True, "proc": proc, "rel": safe_rel(rel), "risky": risky}
+
+
+def send_to_vscode_terminal(cmd: str, cwd: str = "", proj: str = "") -> dict:
+    """把一条命令送进**内置 VS Code 的集成终端**里执行。
+
+    为什么绕这一下：VS Code **不接受"从外部命令它开终端并执行"** ——
+    官方 CLI 没这个能力，实测 `code-server <文件>` 还会另起一个服务进程。
+    所以配了一个极小的扩展（`vscode-ext/mm-bridge`）：双方用**一个文件当信箱**，
+    这里写 `~/.mm_terminal_cmd.json`（带递增的 ts），扩展每 0.7 秒读一次，
+    发现 ts 变大就在终端里执行。**纯本地、不联网、不开端口。**
+
+    为什么值得：这样跑的就是**真正的终端** ——
+    `input()` 天然可用、能交互、能跑任意命令，比我们自己那个"喂标准输入"的土办法强。
+    """
+    cmd = str(cmd or "").strip()
+    if not cmd:
+        return {"ok": False, "error": "命令是空的"}
+    # ⚠️ 信箱放在**系统临时目录**，不用 `~` ——
+    # 实测扩展宿主进程的 `os.homedir()` 并不是用户主目录，写 `~/.xxx` 会静默失败
+    # （VS Code 日志显示"扩展已激活"，但外部程序什么都等不到，最难查）。
+    # 而 `os.tmpdir()`(Node) 和 `tempfile.gettempdir()`(Python) 拿到的**是同一个路径**。
+    import tempfile
+    path = os.path.join(tempfile.gettempdir(), "mm_bridge_cmd.json")
+    try:
+        # ts 用纳秒级：扩展靠"ts 变大"判断有新命令，秒级会漏掉连续的两次运行
+        payload = {"ts": time.time_ns(), "cmd": cmd, "cwd": str(cwd or "")}
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, path)      # 原子替换：扩展不会读到写了一半的 JSON
+        return {"ok": True, "cmd": cmd, "mailbox": path}
+    except Exception as e:
+        return {"ok": False, "error": "送不进终端：%s" % e}
+
+
+def read_bridge_alive() -> dict:
+    """读扩展写的存活/回执标记 —— 用来判断"桥接到底有没有在工作"。"""
+    import tempfile
+    base = tempfile.gettempdir()
+    out = {}
+    for key, name in (("diag", "mm_bridge_diag.txt"), ("alive", "mm_bridge_alive.txt")):
+        try:
+            with open(os.path.join(base, name), "r", encoding="utf-8") as f:
+                out[key] = json.load(f)
+        except Exception:
+            out[key] = None
+    ok = bool(out.get("diag"))
+    if not ok:
+        out["hint"] = "扩展还没激活过 —— 打开一次开发台（或点「🧩 VS Code」）试试"
+    return {"ok": ok, **out}
 
 
 def send_run_input(run_id: str, data: str) -> dict:

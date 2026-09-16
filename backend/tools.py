@@ -36,6 +36,17 @@ from . import docx_write
 # 为什么必须单独给"工作区"工具，而不是让模型用 read_file/write_file 传绝对路径：
 # 那样模型得先猜出工作区在哪，实测它猜不准，还会把文件写到应用安装目录里去。
 # 工作区工具的路径一律是**相对路径**，由后端拼，模型不可能写到外面。
+_WS_PACK_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "workspace_pack",
+        "description": ("【打包】把当前项目的**所有文件**打成一个 zip，给用户一个能直接点的下载链接。"
+                        "用户说「打包 / 导出 / 我要拿走 / 发我一份」时用它。"
+                        "返回里带下载链接，**原样告诉用户**即可。"),
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
 _WS_LIST_SCHEMA = {
     "type": "function",
     "function": {
@@ -483,6 +494,7 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
     # 项目管理（建项目/切项目/建目录/删/改名）——「全自动开发平台」必需。
     # ⚠️ 这几个以前**只给了代码模型的文本协议**，默认模型看不到，用户会觉得"它没这个能力"。
     schemas.extend(_WS_PROJECT_SCHEMAS)
+    schemas.append(_WS_PACK_SCHEMA)
     # ⚠️ `write_code`（让专用代码模型代写代码）**暂时不启用** ——
     # 用户 2026-09-16 试过之后要求换回"按轮切换代码模型"的架构。
     # 原因：这台机器 12GB 显存装不下两个模型，每调一次 write_code 就要重新加载大脑，
@@ -799,6 +811,8 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
         return _do_workspace_delete(arguments, ui_events)
     if name == "workspace_move":
         return _do_workspace_move(arguments, ui_events)
+    if name == "workspace_pack":
+        return _do_workspace_pack(arguments)
     if name == "web_read":
         return _do_web_read(arguments)
     if name == "github_push":
@@ -1878,6 +1892,37 @@ def _do_workspace_move(arguments, ui_events=None) -> str:
         ui_events.append({"type": "workspace", "act": "move",
                           "rel": rel, "to": r.get("rel")})
     return "已把 %s 移到 %s" % (rel, r.get("rel"))
+
+
+def _do_workspace_pack(arguments=None) -> str:
+    """把当前项目打包成 zip，给用户一个能直接点的下载链接。
+
+    用户要求「通过 AI 打包」—— 所以做成工具，而不是界面按钮：
+    界面上那个「📦 打包」随开发台一起去掉了，**能力保留在这里**。
+    """
+    from . import workspace as _ws
+    a = arguments or {}
+    proj = str(a.get("project") or "").strip() or _ws.active_project()
+    try:
+        data, name = _ws.export_zip(proj)
+    except Exception as e:
+        return "打包失败：%s" % e
+    # 同时在磁盘上留一份：用户想直接在文件管理器里拿也行
+    saved = ""
+    try:
+        out_dir = os.path.join(os.path.dirname(_ws.root(proj)), "_导出")
+        os.makedirs(out_dir, exist_ok=True)
+        fp = os.path.join(out_dir, name)
+        with open(fp, "wb") as f:
+            f.write(data)
+        saved = fp
+    except Exception:
+        pass
+    lines = ["已把项目「%s」打包好：%s（%.1f KB）。" % (proj, name, len(data) / 1024.0)]
+    lines.append("下载链接（直接点就能存下来）：/api/ws/zip?proj=%s" % proj)
+    if saved:
+        lines.append("文件也在：%s" % saved)
+    return "\n".join(lines)
 
 
 def _strip_code_fence(text: str) -> str:
