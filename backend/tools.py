@@ -88,7 +88,11 @@ _WS_CODE_SCHEMA = {
             "把「要写什么」交给本机的**专用代码模型**，由它写出代码并**直接落到项目文件**。"
             "**你不需要、也不应该自己把代码敲出来** —— 你只负责决定「写哪个文件、要什么功能」。"
             "改已有文件时：先 workspace_read 读一遍，再在这里说明要改成什么样。"
-            "写完用 workspace_run 跑一遍验证。"
+            "**写完它会顺手跑一遍并把真实输出一起还给你**，"
+            "所以你**不用再单独调 workspace_run**（多绕一轮要多花一分钟）。"
+            "只有它跑失败了、你要换个方式再试时才自己调。"
+            "⚠️ 报错要重写时：把**完整报错 + 要改成什么样**一次说清再调，"
+            "**最多重写 2 次**；之后如实说明哪里还不行，别无限重试。"
             "（例外：只改一两个字符、或写 README/配置/数据这类非代码文件，才用 workspace_write。）"),
         "parameters": {"type": "object",
                        "properties": {
@@ -97,7 +101,11 @@ _WS_CODE_SCHEMA = {
                            "instruction": {"type": "string",
                                            "description": "需求：这个文件要做什么 / 要改成什么样。说清楚。"},
                            "context": {"type": "string",
-                                       "description": "可选：补充背景（相关接口、数据格式、约束等）"}},
+                                       "description": "可选：补充背景（相关接口、数据格式、约束等）"},
+                           "run": {"type": "boolean",
+                                   "description": "写完是否顺手跑一遍（.py 默认 true）。"
+                                                  "真实运行结果会一并返回给你，"
+                                                  "所以**不要再单独调 workspace_run**。"}},
                        "required": ["rel", "instruction"]},
     },
 }
@@ -1880,8 +1888,23 @@ def _do_write_code(arguments, ui_events=None, context=None) -> str:
         ui_events.append({"type": "workspace", "act": "write", "rel": rel,
                           "chars": len(code), "project": _ws.active_project()})
     head = code.splitlines()[0][:60] if code.splitlines() else ""
-    return ("已把代码写进 %s（%d 字，模型=%s）。首行：%s\n"
-            "建议接着用 workspace_run 跑一遍验证。" % (rel, len(code), model, head))
+    out = ("已把代码写进 %s（%d 字，模型=%s）。首行：%s\n"
+           % (rel, len(code), model, head))
+    # 【为什么把"跑一遍"并进来】两个模型在 12GB 显存里**装不下**，
+    # 每调一次代码模型就会把大脑挤出去、下一轮大脑得**重新加载**（十几秒起）。
+    # 原流程是 write_code → 大脑 → workspace_run → 大脑 ——
+    # **一轮循环 = 两次模型切换 + 两轮大脑生成**，实测一个小工具绕了 5 轮、花了 10 分钟。
+    # 写完顺手跑掉，等于把每轮的开销砍掉一半。
+    want_run = a.get("run")
+    if want_run is None:
+        want_run = rel.lower().endswith(".py")
+    if want_run and rel.lower().endswith(".py"):
+        try:
+            out += "\n【顺手跑了一遍，真实输出如下 —— **不用再单独调 workspace_run**】\n"
+            out += _do_workspace_run({"rel": rel})
+        except Exception as e:
+            out += "\n（自动运行失败：%s，你可以用 workspace_run 手动再试）" % e
+    return out
 
 
 def _do_web_read(arguments) -> str:
