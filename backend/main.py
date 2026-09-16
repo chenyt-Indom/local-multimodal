@@ -2110,7 +2110,13 @@ async def chat(req: ChatRequest):
         if _m.get("role") == "assistant":
             prev_code_raw = "```" in str(_m.get("content") or "")
             break
-    prev_code = prev_code_raw and any(w in str(last_user) for w in _CONTINUE_HINTS)
+    prev_code = (prev_code_raw
+                 and any(w in str(last_user) for w in _CONTINUE_HINTS)
+                 # ⚠️ 写作请求不受上一轮代码影响 ——
+                 # 「帮我写一篇作文，再改一下开头」里有"再/改"，上一轮又刚写过代码的话，
+                 # 光看前两个条件会被切到**代码模型**去写作文（它会跑偏，实测过）。
+                 # 写作和代码本来就是互斥的，这里跟 writing_mode 用同一个判断。
+                 and not _is_writing_task(last_user))
 
     # 本轮像写代码 → 换专用代码模型（只影响这一轮，下一轮自动回默认模型）
     if not req.model:
