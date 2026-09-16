@@ -637,7 +637,10 @@
     try {
       var resp = await fetch("/api/ws/run_stream", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ rel: cur, id: runId })
+        // 带上命令行参数：argparse 这类工具不给参数就什么都不做，
+        // 界面会显示"跑完了但没有输出"，用户会以为程序坏了。
+        body: JSON.stringify({ rel: cur, id: runId,
+                               args: (($("stRunArgs") || {}).value || "") })
       });
       if (!resp.ok) throw new Error("HTTP " + resp.status);
       var reader = resp.body.getReader();

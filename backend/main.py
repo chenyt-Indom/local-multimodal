@@ -3074,7 +3074,11 @@ async def ws_run_stream(body: dict):
     b = body or {}
     rid = str(b.get("id") or "")
     workspace.kill_all_runs()             # 一次只跑一个，免得进程越堆越多
-    r = workspace.start_run(str(b.get("rel") or ""), run_id=rid)
+    # `args`：命令行参数（界面上有个「参数」框可以填）。
+    # argparse 这类工具**不给参数就什么都不做**，界面只会显示"跑完了但没有输出"，
+    # 用户会以为程序坏了 —— 实测就是这么被问到的。
+    r = workspace.start_run(str(b.get("rel") or ""), run_id=rid,
+                            args=str(b.get("args") or ""))
     if not r.get("ok"):
         async def _bad():
             yield json.dumps({"t": "end", "ok": False,

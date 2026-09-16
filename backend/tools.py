@@ -119,8 +119,13 @@ _WS_RUN_SCHEMA = {
                         "工作目录就是该文件所在目录，所以脚本里的相对路径是对的。"
                         "写完文件后**用它验证**，不要凭空猜运行结果。"),
         "parameters": {"type": "object",
-                       "properties": {"rel": {"type": "string",
-                                              "description": "工作区内的相对路径，如 app.py"}},
+                       "properties": {
+                           "rel": {"type": "string",
+                                   "description": "工作区内的相对路径，如 app.py"},
+                           "args": {"type": "string",
+                                    "description": "可选：命令行参数（空格分隔），如 \"add 张三 138\"。"
+                                                   "argparse 这类工具**不给参数就什么都不做**，"
+                                                   "要验它们就得传参数。"}},
                        "required": ["rel"]},
     },
 }
@@ -1594,7 +1599,7 @@ def run_code(code: str, allow_risky: bool = False) -> dict:
             "rc": rc, "seconds": round(time.time() - t0, 2)}
 
 
-def run_file(path: str, allow_risky: bool = False) -> dict:
+def run_file(path: str, allow_risky: bool = False, args: str = "") -> dict:
     """运行**磁盘上真实存在的** .py 文件（工作区里的项目文件）。
 
     和 `run_code` 的区别：这里 **cwd 设成文件所在目录**，并且直接跑原文件 ——
@@ -1628,7 +1633,16 @@ def run_file(path: str, allow_risky: bool = False) -> dict:
         # 用 Popen + communicate（而不是 subprocess.run）：超时分支里还能
         # **拿到已经打印出来的内容**。run 的 TimeoutExpired 会把缓冲一起丢掉，
         # 于是"跑满 25 秒的计时器"在界面上显示成"（没有输出）"—— 实测踩过。
-        pr = _sp.Popen([sys.executable, "-X", "utf8", "-u", os.path.basename(p)],
+        # 命令行参数：像 argparse 这种工具，**不给参数就什么都不做** ——
+        # 模型会以为"跑通了没问题"，其实根本没验到东西。让它可以传参。
+        import shlex as _shlex
+        _extra = []
+        if str(args or "").strip():
+            try:
+                _extra = _shlex.split(str(args), posix=True)
+            except ValueError:
+                _extra = []
+        pr = _sp.Popen([sys.executable, "-X", "utf8", "-u", os.path.basename(p)] + _extra,
                        cwd=os.path.dirname(p) or ".", env=env,
                        stdout=_sp.PIPE, stderr=_sp.PIPE,
                        text=True, encoding="utf-8", errors="replace")
@@ -1719,7 +1733,7 @@ def _do_workspace_run(arguments, ui_events=None) -> str:
     if not rel.lower().endswith(".py"):
         return ("当前只能直接运行 .py 文件。如果你想验证网页，"
                 "写好后让用户点开发台上的「🌐 预览」。")
-    r = run_file(p, allow_risky=False)
+    r = run_file(p, allow_risky=False, args=str((arguments or {}).get("args") or ""))
     if r.get("needs_confirm"):
         ask = (arguments or {}).get("__confirm__")
         risk = "、".join(r.get("risky") or [])

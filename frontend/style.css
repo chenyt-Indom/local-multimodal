@@ -944,3 +944,10 @@ body.dragging .drop-overlay,
    以前它被丢掉了，用户只看到模型嘴上说"跑过了"。 */
 .studio-out.has-error { border-left: 3px solid #e5534b; }
 .studio-out.has-error .studio-out-head { color: #ff8a80; }
+
+/* 「参数」输入框：和运行目标下拉并排，宽度小一点别挤到别的按钮 */
+.studio-runargs { width: 130px; height: 26px; font-size: 12px;
+  background: var(--panel2, #23262d); color: var(--text, #e6e6e6);
+  border: 1px solid var(--line, #3a3f47); border-radius: 6px; padding: 0 6px; }
+.studio-runargs::placeholder { color: #8a8a8a; }
+.studio-runargs:focus { outline: none; border-color: var(--accent, #4a9eff); }

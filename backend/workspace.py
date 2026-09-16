@@ -478,7 +478,7 @@ def norm_upload_name(filename: str) -> str:
 _RUNS = {}          # run_id -> Popen
 
 
-def start_run(rel: str, proj: str = "", run_id: str = "") -> dict:
+def start_run(rel: str, proj: str = "", run_id: str = "", args: str = "") -> dict:
     """启动工作区里的 .py，返回 Popen —— 输出由调用方边读边推给前端。
 
     与 `tools.run_file` 的分工：
@@ -509,9 +509,19 @@ def start_run(rel: str, proj: str = "", run_id: str = "") -> dict:
     env["PYTHONUNBUFFERED"] = "1"          # ⚠️ 关键：不加这个子进程会缓冲，看不到实时输出
     env.pop("MM_DATA_DIR", None)
     try:
+        # 命令行参数：像 argparse / 需要位置参数的工具，**不给参数就是什么都不做**
+        # （实测用户点运行一个 argparse 脚本，界面显示"跑完了但没有输出"，以为坏了）。
+        # 用 shlex 切分，用户写 `add 张三 138` 或 `--len 16` 都行，带引号的也能正确切开。
+        import shlex
+        extra = []
+        if str(args or "").strip():
+            try:
+                extra = shlex.split(str(args), posix=True)
+            except ValueError as e:
+                return {"ok": False, "error": "参数写法有问题：%s" % e}
         proc = _sp.Popen(
             # -u 同样是为了**关掉子进程缓冲**，否则 print 会攒成一块再吐
-            [sys.executable, "-X", "utf8", "-u", os.path.basename(p)],
+            [sys.executable, "-X", "utf8", "-u", os.path.basename(p)] + extra,
             cwd=os.path.dirname(p) or ".", env=env,
             stdout=_sp.PIPE, stderr=_sp.STDOUT,
             text=True, encoding="utf-8", errors="replace", bufsize=1)

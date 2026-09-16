@@ -253,6 +253,10 @@
         <!-- 运行目标：我们自己的文件树已经隐藏（和 VS Code 的 EXPLORER 重复），
              所以「运行哪个文件」在这里选。 -->
         <select class="studio-runsel" id="stRunFile" title="选择要运行的 .py 文件"></select>
+        <!-- 命令行参数：argparse / 需要位置参数的工具**不给参数就什么都不做**，
+             界面只会显示"跑完了但没有输出"，看着像坏了。这里填上就能跑起来。 -->
+        <input class="studio-runargs" id="stRunArgs" type="text" placeholder="参数（可选）"
+               title="传给脚本的命令行参数，例如：add 张三 138   或  --len 16">
         <button class="btn sm ghost" id="stRun" title="运行选中的文件（Ctrl+Enter）">▶ 运行</button>
         <button class="btn sm ghost" id="stPreview" title="在系统浏览器里预览当前 HTML">🌐 预览</button>
         <button class="btn sm ghost" id="stDeploy" title="给当前项目起本地静态服务（多文件前端用）">🚀 部署</button>
