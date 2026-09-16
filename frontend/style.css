@@ -855,3 +855,14 @@ body.dragging .drop-overlay,
 .st-dialog-input:focus { border-color: var(--accent); }
 .st-dialog-acts { display: flex; justify-content: flex-end; gap: 8px; }
 .studio-tabs .st-askai { margin-left: auto; border: none; }
+
+/* ---------- 开发台的右键菜单（项目 / 文件） ---------- */
+.st-menu { position: fixed; z-index: 600; min-width: 150px; padding: 4px;
+  background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.45); font-size: 13px; }
+.st-menu-item { padding: 7px 12px; border-radius: 5px; cursor: pointer; white-space: nowrap; }
+.st-menu-item:hover { background: var(--accent); color: #fff; }
+.st-menu-item.danger { color: var(--danger); }
+.st-menu-item.danger:hover { background: var(--danger); color: #fff; }
+.st-menu-sep { height: 1px; margin: 4px 6px; background: var(--border); }
+.st-tip { color: var(--muted); font-size: 11px; padding: 4px 12px 2px; }

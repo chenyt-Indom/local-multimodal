@@ -240,39 +240,147 @@
                       (dirty[f.rel] ? '<span class="st-dot">●</span>' : "");
         d.querySelector(".st-name").textContent = f.rel.split("/").pop();
         d.onclick = function () { openFile(f.rel); };
-        d.oncontextmenu = function (e) { e.preventDefault(); fileMenu(f.rel); };
+        d.oncontextmenu = function (e) {
+          e.preventDefault();
+          fileMenu(f.rel, e.clientX, e.clientY);
+        };
         box.appendChild(d);
       });
     }
     build(root, 0);
     var rec = document.createElement("div");
     rec.className = "st-rec";
-    rec.textContent = "覆盖/删除的文件会进 _回收站/，不会真丢";
+    rec.textContent = "右键文件可「重命名 / 删除」；右键这块空白可新建/导入。" +
+      "覆盖或删除的东西都进 _回收站/，不会真丢。";
     box.appendChild(rec);
   }
 
-  async function fileMenu(rel) {
-    var act = await askText("「" + rel + "」—— 输入 rename / delete / 留空取消",
-      "rename 或 delete", "");
-    if (act === "rename") {
-      var to = await askText("重命名为（相对路径）", "新路径", rel);
-      if (!to) return;
-      var d = await jpost("/api/ws/rename", { rel: rel, to: to });
-      if (!d.ok) { toast(d.error || "重命名失败"); return; }
-      if (models[rel]) { models[rel].dispose(); delete models[rel]; }
-      tabs = tabs.filter(function (r) { return r !== rel; });
-      if (cur === rel) cur = "";
-      await refresh();
-    } else if (act === "delete") {
-      if (!confirm("删除「" + rel + "」?（会进回收站）")) return;
-      var r = await jpost("/api/ws/delete", { rel: rel });
-      if (!r.ok) { toast(r.error || "删除失败"); return; }
-      if (models[rel]) { models[rel].dispose(); delete models[rel]; }
-      tabs = tabs.filter(function (x) { return x !== rel; });
-      if (cur === rel) { cur = tabs.length ? tabs[tabs.length - 1] : ""; }
-      renderTabs();
-      await refresh();
-    }
+  /* ---------- 右键菜单 ----------
+     之前只有"右键"这一个入口，而且文件那个还要你**手打 rename** —— 等于没有。
+     现在做成正经的浮动菜单：项目（重命名/删除）和文件（打开/重命名/删除）都能点。 */
+  function closeMenu() {
+    var old = document.getElementById("stMenu");
+    if (old && old.parentNode) old.parentNode.removeChild(old);
+  }
+
+  function showMenu(x, y, items) {
+    closeMenu();
+    var m = document.createElement("div");
+    m.className = "st-menu";
+    m.id = "stMenu";
+    items.forEach(function (it) {
+      if (it.sep) {
+        var s = document.createElement("div");
+        s.className = "st-menu-sep";
+        m.appendChild(s);
+        return;
+      }
+      if (it.tip) {
+        var tp = document.createElement("div");
+        tp.className = "st-tip";
+        tp.textContent = it.tip;
+        m.appendChild(tp);
+        return;
+      }
+      var b = document.createElement("div");
+      b.className = "st-menu-item" + (it.danger ? " danger" : "");
+      b.textContent = it.label;
+      b.onmousedown = function (ev) { ev.stopPropagation(); };
+      b.onclick = function (ev) {
+        ev.stopPropagation();
+        closeMenu();
+        try { it.run && it.run(); } catch (e) { toast(String(e.message || e)); }
+      };
+      m.appendChild(b);
+    });
+    m.style.left = "-9999px";
+    m.style.top = "-9999px";
+    document.body.appendChild(m);
+    var r = m.getBoundingClientRect();
+    m.style.left = Math.max(4, Math.min(x, window.innerWidth - r.width - 8)) + "px";
+    m.style.top = Math.max(4, Math.min(y, window.innerHeight - r.height - 8)) + "px";
+  }
+
+  function fileMenu(rel, x, y) {
+    showMenu(x, y, [
+      { label: "📄 打开", run: function () { openFile(rel); } },
+      {
+        label: "✏️ 重命名 / 移动", run: async function () {
+          var to = await askText("重命名「" + rel + "」", "新路径（可以带目录，如 sub/x.py）", rel);
+          if (!to || to === rel) return;
+          var d = await jpost("/api/ws/rename", { rel: rel, to: to });
+          if (!d.ok) { toast(d.error || "重命名失败"); return; }
+          if (models[rel]) { models[rel].dispose(); delete models[rel]; }
+          tabs = tabs.filter(function (r) { return r !== rel; });
+          if (cur === rel) cur = "";
+          await refresh(); await loadChanges();
+          toast("已重命名为 " + d.rel);
+        }
+      },
+      { sep: true },
+      {
+        label: "🗑 删除", danger: true, run: async function () {
+          if (!confirm("删除「" + rel + "」?\n\n（会进 _回收站/，可以捞回来）")) return;
+          var r = await jpost("/api/ws/delete", { rel: rel });
+          if (!r.ok) { toast(r.error || "删除失败"); return; }
+          if (models[rel]) { models[rel].dispose(); delete models[rel]; }
+          tabs = tabs.filter(function (x2) { return x2 !== rel; });
+          if (cur === rel) { cur = tabs.length ? tabs[tabs.length - 1] : ""; }
+          renderTabs();
+          await refresh(); await loadChanges();
+          toast("已删除 " + rel + "（在回收站里）");
+        }
+      }
+    ]);
+  }
+
+  function treeMenu(x, y) {
+    showMenu(x, y, [
+      { tip: "项目：" + project },
+      { label: "＋ 新建文件", run: function () { newEntry("file"); } },
+      { label: "＋ 新建文件夹", run: function () { newEntry("dir"); } },
+      { sep: true },
+      { label: "📥 导入本地文件", run: function () { $("stFileInput").click(); } },
+      { label: "⟳ 刷新", run: function () { refresh(); loadChanges(); } }
+    ]);
+  }
+
+  function projMenu(x, y) {
+    showMenu(x, y, [
+      { tip: "当前项目：" + project },
+      {
+        label: "✏️ 重命名项目", run: async function () {
+          var to = await askText("重命名项目「" + project + "」", "新项目名", project);
+          if (!to || to === project) return;
+          var d = await jpost("/api/ws/projects/rename", { old: project, new: to });
+          if (!d.ok) { toast(d.error || "重命名失败"); return; }
+          tabs.forEach(function (r) { if (models[r]) models[r].dispose(); });
+          tabs = []; models = {}; dirty = {}; cur = "";
+          if (editor) editor.setModel(null);
+          renderTabs();
+          await loadProjects(); await refresh(); await loadChanges();
+          toast("项目已重命名为 " + d.name);
+        }
+      },
+      {
+        label: "🗑 删除项目", danger: true, run: async function () {
+          if (!confirm("删除项目「" + project + "」?\n\n" +
+                       "整个项目会移进 _回收站/（可以捞回来），但界面上就不显示了。")) return;
+          var d = await jpost("/api/ws/projects/delete", { name: project });
+          if (!d.ok) { toast(d.error || "删除失败"); return; }
+          tabs.forEach(function (r) { if (models[r]) models[r].dispose(); });
+          tabs = []; models = {}; dirty = {}; cur = "";
+          if (editor) editor.setModel(null);
+          renderTabs();
+          await loadProjects();
+          await useProject(($("stProj") || {}).value || "");
+          toast("项目已删除（在回收站里）");
+        }
+      },
+      { sep: true },
+      { label: "🧠 用 IDE 打开", run: openIde },
+      { label: "📂 在资源管理器打开", run: openFolder }
+    ]);
   }
 
   // ---------- 标签 ----------
@@ -949,7 +1057,22 @@
     $("stAskAi").onclick = askAi;
     $("stProj").onchange = function () { useProject(this.value); };
     $("stProjNew").onclick = newProject;
-    $("stProj").oncontextmenu = function (e) { e.preventDefault(); delProject(); };
+    $("stProjMenu").onclick = function (e) {
+      var r = this.getBoundingClientRect();
+      projMenu(r.left, r.bottom + 4);
+    };
+    $("stProj").oncontextmenu = function (e) { e.preventDefault(); projMenu(e.clientX, e.clientY); };
+    $("stTree").oncontextmenu = function (e) {
+      // 点在文件行上时交给文件菜单处理（那个已经 preventDefault 了）
+      if (e.target.closest && e.target.closest(".st-file")) return;
+      e.preventDefault();
+      treeMenu(e.clientX, e.clientY);
+    };
+    // 点别处 / 按 Esc 就收起菜单
+    document.addEventListener("click", closeMenu);
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape") closeMenu();
+    });
     $("stNewFile").onclick = function () { newEntry("file"); };
     $("stNewDir").onclick = function () { newEntry("dir"); };
     $("stImport").onclick = function () { $("stFileInput").click(); };
