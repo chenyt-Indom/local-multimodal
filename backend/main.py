@@ -1600,9 +1600,28 @@ def _route_code_model(cfg: dict, text: str, fallback: str, prev_code: bool = Fal
       **大脑 = 默认模型**（决策、读文件、跑代码、串联流程）
       **打字员 = 代码模型**（只在需要"写出代码"时，由 `write_code` 工具单独调用它）
 
-    详见 tools.py 的 `_do_write_code`。
+    ⚠️ **2026-09-16 这里一度被改成"永远返回默认模型 + write_code 工具代办"**
+    （大脑用 qwen3-vl 决策、代码模型只负责写）。原因是这台机器 12GB 显存
+    **装不下两个模型**，每调一次代码模型就得把大脑重新加载，实测一个任务绕了 10 分钟。
+    用户试过之后要求**换回本架构（按轮切换）**，所以恢复了。
+    **两种架构的取舍，留着以后别再走回头路：**
+      · 本架构（按轮切）：简单、单轮快；代价是切到代码模型后只能走"文本协议"，
+        多轮里它可能不吐工具块 —— 下面那段「你有读文件的能力」的硬规则就是为它加的。
+      · write_code 架构：决策与写码分离、更稳；代价是模型来回切、总时长可能长几倍。
+    要重新启用 write_code：把 tools.make_schemas 里的 _WS_CODE_SCHEMA 加回去即可
+    （_do_write_code 一直保留着，没删）。
     """
-    return fallback, ""
+    if not cfg.get("code_auto_route", True):
+        return fallback, ""
+    want = str(cfg.get("code_model") or "").strip()
+    if not want or want == fallback:
+        return fallback, ""
+    if not force and not _needs_task_model(text, prev_code=prev_code):
+        return fallback, ""
+    if want not in _installed_models():
+        # 还没下载 → 静默用回默认模型。配置名留着，用户下载后自动生效，不用改设置。
+        return fallback, ""
+    return want, "已切到专用模型 %s（写代码：它不思考，不会把输出额度烧在思考上）" % want
 
 
 # =====================================================================

@@ -391,9 +391,12 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
     schemas.append(_WS_LIST_SCHEMA)
     schemas.append(_WS_READ_SCHEMA)
     schemas.append(_WS_WRITE_SCHEMA)
-    # 写代码这件事交给专用代码模型去做（见 _do_write_code）——它是纯本地调用，
-    # 不涉及"在本机执行代码"，所以**不受 code_exec 开关限制**，始终可用。
-    schemas.append(_WS_CODE_SCHEMA)
+    # ⚠️ `write_code`（让专用代码模型代写代码）**暂时不启用** ——
+    # 用户 2026-09-16 试过之后要求换回"按轮切换代码模型"的架构。
+    # 原因：这台机器 12GB 显存装不下两个模型，每调一次 write_code 就要重新加载大脑，
+    # 实测一个任务绕了 10 分钟。代码（`_do_write_code`）保留着，没删 ——
+    # 想启用只需把下面这行加回来：
+    #     schemas.append(_WS_CODE_SCHEMA)
     if code_exec:
         # 跑工作区文件同样属于"在本机执行代码"，跟着同一个开关走
         schemas.append(_WS_RUN_SCHEMA)
