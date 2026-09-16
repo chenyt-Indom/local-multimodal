@@ -61,44 +61,33 @@ RUN pip install --index-url "${PIP_INDEX}" -r requirements-image.txt
 COPY backend/ ./backend/
 COPY frontend/ ./frontend/
 
-# ---------- 内置的真 VS Code（code-server）----------
-# 和本机源码模式保持一致：开发台的「🧩 VS Code」按钮要在容器里也能用。
-# 绿色包自带 Node，解压即用。
+# ---------- 这里原本内置了 code-server（真 VS Code）----------
+# 2026-09-17 **已移除**：前端那个「开发台」整个去掉了，界面回到纯聊天，
+# 容器里再带一份 VS Code 就是纯占体积（解压后约 500MB）＋ 白等一次解压。
 #
-# ⚠️ **优先用构建上下文里预置的包**，别再默认走网络：
-#    这是"离线一键部署包"，构建期联网是自相矛盾的 —— 而且实测会挂：
-#    直连 github release 是 302 到 objects.githubusercontent.com，
-#    网络一差就卡住 40+ 分钟（`--retry 3` 只会更慢）。
-#    把 code-server-<版本>-linux-amd64.tar.gz 放进 docker/vendor-assets/ 即可，
-#    构建变成纯本地、几秒钟过；没预置才回退到联网下载。
-# ⚠️ 不要写成 `COPY docker/code-server-*.tar.gz` —— 文件不在时会让**整个构建失败**；
-#    改成 COPY 一个**目录**（总存在），再用 shell 判断。
-ARG CS_VER=4.137.0
-COPY docker/vendor-assets/ /tmp/vendor-assets/
-RUN set -eux; \
-    if [ -f /tmp/vendor-assets/code-server-linux-amd64.tar.gz ]; then \
-        echo "== 使用 vendor-assets 里预置的 code-server（不联网）=="; \
-        cp /tmp/vendor-assets/code-server-linux-amd64.tar.gz /tmp/cs.tgz; \
-    else \
-        echo "== 未预置，联网下载 code-server =="; \
-        curl -fsSL --connect-timeout 15 --max-time 300 --retry 2 -o /tmp/cs.tgz \
-          "https://gh-proxy.com/https://github.com/coder/code-server/releases/download/v${CS_VER}/code-server-${CS_VER}-linux-amd64.tar.gz" \
-        || curl -fsSL --connect-timeout 15 --max-time 300 --retry 2 -o /tmp/cs.tgz \
-          "https://github.com/coder/code-server/releases/download/v${CS_VER}/code-server-${CS_VER}-linux-amd64.tar.gz"; \
-    fi; \
-    mkdir -p /opt/app/vendor; \
-    tar -xzf /tmp/cs.tgz -C /opt/app/vendor; \
-    mv "/opt/app/vendor/code-server-${CS_VER}-linux-amd64" /opt/app/vendor/code-server; \
-    chmod +x /opt/app/vendor/code-server/bin/code-server; \
-    rm -rf /tmp/cs.tgz /tmp/vendor-assets
+# 想恢复开发台的话，把下面这段加回来（预置包仍在 docker/vendor-assets/，没删）：
+#     ARG CS_VER=4.137.0
+#     COPY docker/vendor-assets/ /tmp/vendor-assets/
+#     RUN set -eux; \
+#         if [ -f /tmp/vendor-assets/code-server-linux-amd64.tar.gz ]; then \
+#             cp /tmp/vendor-assets/code-server-linux-amd64.tar.gz /tmp/cs.tgz; \
+#         else \
+#             curl -fsSL --connect-timeout 15 --max-time 300 --retry 2 -o /tmp/cs.tgz \
+#               "https://gh-proxy.com/https://github.com/coder/code-server/releases/download/v${CS_VER}/code-server-${CS_VER}-linux-amd64.tar.gz"; \
+#         fi; \
+#         mkdir -p /opt/app/vendor && tar -xzf /tmp/cs.tgz -C /opt/app/vendor; \
+#         mv "/opt/app/vendor/code-server-${CS_VER}-linux-amd64" /opt/app/vendor/code-server; \
+#         chmod +x /opt/app/vendor/code-server/bin/code-server; \
+#         rm -rf /tmp/cs.tgz /tmp/vendor-assets
+#
+# ⚠️ 注意当年踩过的坑：构建期**别默认走网络**（这是"离线一键部署包"），
+#    直连 github release 会 302 到 objects.githubusercontent.com，网络一差就卡 40 分钟；
+#    也不要写成 `COPY docker/code-server-*.tar.gz`（文件不在会让整个构建失败）。
 
 # 运行数据与模型挂载点
 RUN mkdir -p /data /opt/app/sd_model /opt/app/esrgan
 
-EXPOSE 8000 8810
-# 容器里 code-server 必须绑 0.0.0.0 才能被宿主的端口映射碰到；
-# 安全性靠 `docker run -p 127.0.0.1:8810:8810` 只映射到宿主回环来保证。
-ENV MM_CODE_BIND=0.0.0.0
+EXPOSE 8000
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=8 \
     CMD curl -fsS http://127.0.0.1:8000/api/health || exit 1
