@@ -901,6 +901,9 @@
   // ---------- 记忆库 · 文段式 ----------
   // ---------- 记忆库：长期（跨对话共享）+ 短期（按对话独立）----------
   // 切对话时只有"短期记忆"跟着变；长期记忆是同一份，永远不变。
+  // 长期记忆读取失败了几次（用于"自动重试 + 显示原因"）
+  let _memLoadFails = 0;
+
   async function loadMemory() {
     const lng = $("#memLongText"), sht = $("#memShortText");
     if (!lng || !sht) return;
@@ -909,6 +912,7 @@
       if ((d.session_id || "") !== (sessionId || "")) return;   // 用户已切走，别覆盖
       lng.value = d.long || "";
       sht.value = d.short || "";
+      _memLoadFails = 0;
       const lm = $("#memLongMeta");
       if (lm) lm.textContent = `${(d.long || "").length} / ${d.long_cap || 2000} 字`;
       const sm = $("#memShortMeta");
@@ -917,7 +921,17 @@
         : "这个对话还没有短期记忆";
       const nm = $("#memSessName");
       if (nm) nm.textContent = await currentTitle(sessionId);
-    } catch (e) { /* 静默：面板不可用不影响聊天 */ }
+    } catch (e) {
+      // ⚠️ **这里绝不能静默**。原来是一句 `catch (e) { /* 静默 */ }`，后果很坑：
+      // 后端还没起来 / 正在重启时加载失败，输入框就只剩**灰色占位符**，
+      // 用户看到的是"记忆是空的、字体发暗"，以为模型压根没记住 ——
+      // 实测被这么误判过（我重启动应用时抓到的，截图里那个就是）。
+      // 现在：① 在字数行上写明失败原因；② 自动退避重试几次。
+      _memLoadFails += 1;
+      const lm = $("#memLongMeta");
+      if (lm) lm.textContent = `⚠️ 记忆读取失败（第 ${_memLoadFails} 次）：${e.message || e}`;
+      if (_memLoadFails <= 4) setTimeout(loadMemory, 1500 * _memLoadFails);
+    }
   }
 
   // ⚠️ 别在对话一结束就立刻 loadMemory()。
