@@ -31,6 +31,15 @@ from . import (config, ollama_client, memory, kb, file_tools, video, web_tools,
 app = FastAPI(title="本地多模态助手", version="1.0.0")
 client = ollama_client.OllamaClient()
 
+# ⚠️ 这个 **必须**有：本文件多处用 `logger.xxx` 打日志，
+# 但一直只 `import logging` 却没建 logger —— 于是每次走到都是
+# `NameError: name 'logger' is not defined`。
+# 最要命的是它发生在**后台线程**里（模型预热、code-server 残留回收）：
+# 线程挂了不报错、不留痕，功能就这么静默地"从来没生效过" ——
+# 用户看到的现象是"打开开发台还是要干等十几秒"，
+# 而代码里明明写着预热。是启动器把后端 stdout 落到 %TEMP%\mm_backend.log 后才抓到。
+logger = logging.getLogger("uvicorn.error")
+
 # 启动时就把知识库目录建好 —— 用户可以直接往里拷 .txt / .md，
 # 不用先"导入"一次才知道往哪放。
 try:

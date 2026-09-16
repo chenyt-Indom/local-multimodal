@@ -509,7 +509,12 @@ def _get_edit_pipe():
 
     与文生图一样加入失败重试与日志（原因见 _get_pipe 说明）。
     """
-    global _edit_pipe
+    # ⚠️ `_device` **必须一起 global**。下面第 519 行会给它赋值，
+    # 只写 `global _edit_pipe` 的话 `_device` 就成了**局部变量**，
+    # 于是第 515 行的 `return _edit_pipe, _device` 会在赋值前读取它，
+    # 抛 `UnboundLocalError: cannot access local variable '_device'` ——
+    # 也就是说：**图片微改第一次能用、之后每次必崩**（原文漏了 `_device`）。
+    global _edit_pipe, _device
     with _lock:
         if _edit_pipe is not None:
             return _edit_pipe, _device
