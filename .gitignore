@@ -41,3 +41,8 @@ sessions/
 
 # 图片库（用户保存的图片，运行时数据）
 image_library/
+
+# 内置 code-server（真正的 VS Code，200MB+，不入版本库）
+# 需要时从 https://github.com/coder/code-server/releases 下载 windows-amd64 包
+# 解压到 vendor/ 即可（目录名形如 code-server-4.x.x-windows-amd64）
+vendor/

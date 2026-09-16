@@ -2743,6 +2743,26 @@ def ws_run_status():
 
 
 # ---------- 用外部专业 IDE 打开项目 ----------
+# ---------- 内置 VS Code（code-server）----------
+@app.get("/api/ide/status")
+def ide_status():
+    return workspace.code_server_status()
+
+
+@app.post("/api/ide/start")
+def ide_start(body: dict):
+    """给当前项目起一个**内置的真 VS Code**（code-server），返回访问地址。
+
+    只绑 127.0.0.1 + 免密：**只有本机能连**，外网访问不到。
+    """
+    return workspace.start_code_server(str((body or {}).get("project") or ""))
+
+
+@app.post("/api/ide/stop")
+def ide_stop():
+    return workspace.stop_code_server()
+
+
 @app.post("/api/ws/warm")
 def ws_warm(body: dict):
     """**预热模型**：打开开发台时调一次，免得第一次写代码干等十几秒。

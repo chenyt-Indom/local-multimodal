@@ -1030,6 +1030,45 @@
     } catch (e) { showOut("上传失败", String(e.message || e)); }
   }
 
+  /* 内置的**真 VS Code**（code-server）：绿色包，跑在 127.0.0.1，全程离线。
+     断点调试 / 变量监视 / 终端 / Git 面板 / 扩展市场都在里面 ——
+     这些是自研编辑器做不出来的，所以直接把它接进来。 */
+  async function openVsCode() {
+    var st = {};
+    try { st = await jget("/api/ide/status"); } catch (e) { st = {}; }
+    if (!st.installed) {
+      showOut("没有内置 VS Code", "没在 vendor/ 下找到 code-server。\n\n" +
+        "获取方式（一次性）：到 github.com/coder/code-server/releases 下载\n" +
+        "  code-server-<版本>-windows-amd64.tar.gz\n" +
+        "解压到项目的 vendor/ 目录即可（目录名保持 code-server-<版本>-windows-amd64）。");
+      return;
+    }
+    if (st.running) {
+      if (confirm("内置 VS Code 正在运行：\n" + st.url + "\n\n要停掉它吗？")) {
+        await jpost("/api/ide/stop", {});
+        showOut("已停止", "内置 VS Code 已停止。");
+        toast("已停止内置 VS Code");
+        return;
+      }
+      window.open(st.url, "_blank");
+      return;
+    }
+    showOut("正在启动内置 VS Code…", "第一次启动要几秒，请稍候…");
+    try {
+      var d = await jpost("/api/ide/start", {});
+      if (!d.ok) { showOut("启动失败", d.error || "未知错误"); return; }
+      showOut("内置 VS Code 已就绪 · 项目 " + d.project,
+        "地址：" + d.url + "\n\n" +
+        "· 这是**真正的 VS Code**（code-server 4.137 / Code 1.137），全程离线；\n" +
+        "· 打开的就是当前项目目录 —— 和开发台改的是**同一批文件**；\n" +
+        "· 断点调试、变量监视、终端、Git 面板、扩展市场都在里面；\n" +
+        "· 窗口没自动弹出的话，把上面的地址复制到浏览器打开；\n" +
+        "· 再点一次「🧩 VS Code」可以停掉它。");
+      var w = window.open(d.url, "_blank");
+      if (!w) toast("地址已显示在下方，复制到浏览器打开");
+    } catch (e) { showOut("启动失败", String(e.message || e)); }
+  }
+
   // ---------- 事件绑定 ----------
   function bind() {
     var btn = $("openStudioBtn");
@@ -1044,6 +1083,7 @@
     $("stDeploy").onclick = deploy;
     $("stUpload").onclick = uploadProject;
     $("stIde").onclick = openIde;
+    $("stVsCode").onclick = openVsCode;
     $("stFolder").onclick = openFolder;
     $("stRunStop").onclick = stopRun;
     $("stDebug").onclick = debugCur;

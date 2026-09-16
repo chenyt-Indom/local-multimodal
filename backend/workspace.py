@@ -600,6 +600,145 @@ def open_folder(proj: str = "") -> dict:
     return {"ok": True, "path": d, "project": p}
 
 
+# ------------------------------------------------- 内置 code-server（真正的 VS Code）
+# 为什么接它：用户要"更专业的工作台"。断点调试、变量监视、重构、代码导航、
+# 终端、Git 面板、扩展市场 —— 这些 VS Code 打磨了十几年，自研一个半成品不划算。
+# code-server 是 VS Code 的**服务端**（自带 Node，绿色包），跑在 127.0.0.1 上，
+# 用网页打开就是完整的 VS Code，**全程离线**。
+_CODE_SERVER = {"proc": None, "port": 0, "project": ""}
+
+
+def find_code_server() -> str:
+    """找到内置的 code-server 可执行文件（没有就返回空）。"""
+    import glob
+    base = os.path.join(config.res_root(), "vendor")
+    for pat in ("code-server-*/bin/code-server.cmd",
+                "code-server-*/bin/code-server",
+                "code-server/bin/code-server.cmd",
+                "code-server/bin/code-server"):
+        hits = sorted(glob.glob(os.path.join(base, pat.replace("/", os.sep))))
+        for h in hits:
+            if os.path.isfile(h):
+                return h
+    return ""
+
+
+def code_server_status() -> dict:
+    """状态查询。
+
+    ⚠️ 不能只看 `proc.poll()`：code-server 在 Windows 上是通过 `.cmd` 拉起的，
+    句柄活着**不代表端口还在服务**（实测遇到过：状态说 running、端口却没人监听，
+    用户点开就是一个打不开的地址）。所以**再探一次端口**，双重确认。
+    """
+    import socket
+    p = _CODE_SERVER.get("proc")
+    port = _CODE_SERVER.get("port") or 0
+    alive = bool(p is not None and p.poll() is None)
+    if alive and port:
+        reachable = False
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.8)
+                reachable = (s.connect_ex(("127.0.0.1", port)) == 0)
+        except Exception:
+            reachable = False
+        if not reachable:
+            alive = False
+            _CODE_SERVER.update({"proc": None, "port": 0, "project": ""})
+    elif not alive:
+        _CODE_SERVER.update({"proc": None, "port": 0, "project": ""})
+    return {"ok": True, "installed": bool(find_code_server()), "running": alive,
+            "port": port if alive else 0,
+            "project": _CODE_SERVER.get("project") or "",
+            "url": ("http://127.0.0.1:%d/" % port) if alive else ""}
+
+
+def stop_code_server() -> dict:
+    p = _CODE_SERVER.get("proc")
+    if p is not None:
+        try:
+            p.terminate()
+            try:
+                p.wait(timeout=6)
+            except Exception:
+                p.kill()
+        except Exception:
+            pass
+    _CODE_SERVER.update({"proc": None, "port": 0, "project": ""})
+    return {"ok": True}
+
+
+def start_code_server(proj: str = "") -> dict:
+    """给当前项目起一个内置 VS Code（code-server），返回可访问地址。
+
+    ⚠️ 只绑 `127.0.0.1` + `--auth none`：**只有本机能连**，外网碰不到。
+    这在本机单用户桌面应用里是常规做法（等于"你自己电脑上的 VS Code"）。
+    """
+    import glob
+    import socket
+    import subprocess as _sp
+    exe = find_code_server()
+    if not exe:
+        return {"ok": False, "error": "没有内置的 code-server（vendor/ 下没找到）"}
+    p = safe_project(proj) if str(proj or "").strip() else active_project()
+    d = root(p)
+
+    cur = code_server_status()
+    if cur.get("running") and cur.get("project") == p:
+        return {"ok": True, "url": cur["url"], "port": cur["port"], "project": p,
+                "note": "already running"}
+    stop_code_server()
+
+    def _free(port):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", port))
+                return True
+            except OSError:
+                return False
+
+    port = 0
+    for cand in range(8810, 8840):
+        if _free(cand):
+            port = cand
+            break
+    if not port:
+        return {"ok": False, "error": "8810~8839 都被占用了"}
+
+    env = dict(os.environ)
+    env["PORT"] = str(port)
+    env.pop("MM_DATA_DIR", None)
+    args = [exe, "--bind-addr", "127.0.0.1:%d" % port, "--auth", "none",
+            "--disable-telemetry", "--disable-update-check", d]
+    try:
+        if exe.endswith(".cmd"):
+            proc = _sp.Popen(args, cwd=d, env=env, shell=False,
+                             stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        else:
+            proc = _sp.Popen(args, cwd=d, env=env,
+                             stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+    except Exception as e:
+        return {"ok": False, "error": "启动失败：%s" % e}
+
+    # 等它真的监听上（首次启动要几秒）
+    for _ in range(80):
+        time.sleep(0.25)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.4)
+            if s.connect_ex(("127.0.0.1", port)) == 0:
+                _CODE_SERVER.update({"proc": proc, "port": port, "project": p})
+                return {"ok": True, "url": "http://127.0.0.1:%d/" % port,
+                        "port": port, "project": p, "path": d}
+        if proc.poll() is not None:
+            return {"ok": False, "error": "code-server 异常退出（可能被杀软拦了）"}
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    return {"ok": False, "error": "启动超时（20 秒内没监听上）"}
+
+
 # --------------------------------------------------------------- 语法检查（调试）
 def check_py(rel: str, proj: str = "") -> dict:
     """对 .py 做**语法检查**，返回可直接喂给编辑器的诊断。
