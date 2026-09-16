@@ -1,6 +1,7 @@
 # 统一换行符，避免在 Windows 检出后脚本带 CRLF 而在 Linux 容器里执行失败
 *.sh        text eol=lf
 *.bat       text eol=crlf
+*.cmd       text eol=crlf
 Dockerfile* text eol=lf
 *.yml       text eol=lf
 *.yaml      text eol=lf
