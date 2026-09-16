@@ -28,6 +28,11 @@ config.json
 docker/data/
 
 # ---------- 残留 / 临时文件 ----------
+# 改代码前留的备份（如 frontend/app.js.bak-devdesk）绝不能进镜像：
+# 它会被 COPY frontend/ 一起打进去，白白增大体积还容易让人看错文件。
+*.bak
+*.bak-*
+*.orig
 *.incomplete
 *.tmp
 *.log
