@@ -891,3 +891,20 @@ body.dragging .drop-overlay,
 .ws-open { flex: none; }
 
 /* 界面自更新验证：改动这行会让已打开的窗口自动重载（不用手动刷新） */
+
+/* ---------- 开发台的编辑器 = 内置真 VS Code（唯一编辑器，Monaco 已删） ---------- */
+.studio-editor { position: relative; flex: 1; min-height: 0; padding: 0; overflow: hidden;
+  background: #1e1e1e; }
+.studio-vs { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+.studio-vs-cover { position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; background: var(--bg); color: var(--muted); font-size: 13px;
+  text-align: center; padding: 24px; white-space: pre-line; line-height: 1.7; }
+.studio-vs-cover[hidden] { display: none; }
+/* 文件标签条不再需要（VS Code 自己有标签页），但保留「🤖 交给 AI 改」这一个动作 */
+.studio-tabs { min-height: 34px; }
+
+/* AI 正在往文件里逐字写 —— 顶栏上的一条进度 */
+.st-vs-typing { margin-left: 10px; padding: 3px 10px; border-radius: 999px;
+  background: var(--panel2); border: 1px solid var(--accent); color: var(--accent);
+  font-size: 12px; white-space: nowrap; }
+.st-vs-typing[hidden] { display: none; }

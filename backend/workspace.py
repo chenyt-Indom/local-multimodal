@@ -269,6 +269,29 @@ def read_text(rel: str, proj: str = "") -> dict:
     return {"ok": True, "rel": safe_rel(rel), "text": text, "chars": len(text)}
 
 
+def stream_write(rel: str, text: str, proj: str = "") -> dict:
+    """**边生成边落盘**专用：只写文件，**不备份、不记"待审阅"改动**。
+
+    为什么必须单独开一条路，不能复用 write_text：
+    AI 写文件的正文是**逐字流出来的**，我们把已经生成的部分先落盘，
+    编辑器（内置真 VS Code）的文件监视器就能看到代码一点点"长出来"。
+    但 write_text **每写一次就把旧版备份进回收站、并记一条待审阅** ——
+    按 40 字一刷算，写一个 3000 字的文件会塞进去几十上百份垃圾备份，
+    "AI 改动"列表也会被刷爆。
+    所以这里的定位是"给编辑器看的进度流"；**真正的落盘仍然是生成结束时
+    那一次 write_text（带备份与改动记录）**。
+    """
+    try:
+        r = safe_rel(rel)
+        p = abs_path(r, proj)
+        os.makedirs(os.path.dirname(p) or root(proj), exist_ok=True)
+        with open(p, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text or "")
+        return {"ok": True, "rel": r, "chars": len(text or "")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def write_text(rel: str, text: str, proj: str = "", by: str = "user") -> dict:
     """写入文件；覆盖前把旧版备份进回收站，并把这次改动记进"待审阅"。
 

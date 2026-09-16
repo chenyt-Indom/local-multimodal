@@ -249,8 +249,8 @@
         <button class="btn sm ghost" id="stPreview" title="在系统浏览器里预览当前 HTML">🌐 预览</button>
         <button class="btn sm ghost" id="stDeploy" title="给当前项目起本地静态服务（多文件前端用）">🚀 部署</button>
         <button class="btn sm ghost" id="stUpload" title="把当前项目提交并上传到 GitHub / Gitee / 自建 Git（用本机 git 凭据）">⬆ 上传</button>
-        <button class="btn sm" id="stVsCode" title="内置的真 VS Code（code-server）：不用装任何东西，浏览器里就是完整的 VS Code —— 断点调试、变量监视、终端、Git、扩展">🧩 VS Code</button>
-        <button class="btn sm ghost" id="stIde" title="用本机已装的 PyCharm / VS Code 打开这个项目 —— 断点调试、变量监视、重构、代码导航都在那边">🧠 用 IDE 打开</button>
+        <button class="btn sm ghost" id="stVsCode" title="重启内置 VS Code 并重新加载（切了项目、或界面卡住时用）">⟳ VS Code</button>
+        <button class="btn sm ghost" id="stVsTerm" title="在 VS Code 里打开终端跑命令（Ctrl+`）—— 运行、装包、调试都在那儿">⌨ 终端</button>
         <button class="btn sm ghost" id="stFolder" title="在资源管理器里打开项目文件夹">📂</button>
         <button class="btn sm ghost" id="stDebug" title="运行并检查：有报错就把完整 traceback 交给 AI 去修">🔧 调试</button>
         <button class="btn sm ghost" id="stZip" title="把整个项目打包成 zip 下载">📦 打包</button>
@@ -284,7 +284,19 @@
           <button class="btn sm ghost st-askai" id="stAskAi"
             title="把当前文件交给 AI 改（会明确要求它先读磁盘上的最新内容）">🤖 交给 AI 改</button>
         </div>
-        <div class="studio-editor" id="stEditor"></div>
+        <!-- 编辑器 = **内置的真 VS Code**（code-server）本身。
+             以前这里挂的是 Monaco：只有"文本编辑"，没有终端、没有调试器、
+             没有 Git 面板 —— 用户原话是"调试和运行比不上 PyCharm 和 Trae 这类"。
+             所以整个换掉：**全应用只保留这一个编辑器**（Monaco 已删除）。
+             AI 写文件时是**边生成边落盘**的，VS Code 的文件监视器能看到内容
+             一点点长出来 —— 也就是"AI 自己逐字敲进编辑器"。 -->
+        <div class="studio-editor" id="stEditor">
+          <iframe class="studio-vs" id="stVs" title="内置 VS Code"
+                  src="about:blank" allow="clipboard-read; clipboard-write"></iframe>
+          <div class="studio-vs-cover" id="stVsCover">
+            <div class="studio-vs-msg" id="stVsMsg">正在启动内置 VS Code…</div>
+          </div>
+        </div>
         <div class="studio-out" id="stOut" hidden>
           <div class="studio-out-head">
             <span id="stOutTitle">运行结果</span>
@@ -321,20 +333,8 @@
   </div>
   <input type="file" id="stFileInput" multiple hidden />
 
-  <!-- 内置 VS Code：**直接嵌在应用里**（不是丢给浏览器），全程离线 -->
-  <div class="vswrap" id="vsWrap" hidden>
-    <div class="vsbar">
-      <span class="vstitle">🧩 内置 VS Code <span class="vsproj" id="vsProj"></span></span>
-      <span class="head-acts">
-        <button class="btn sm ghost" id="vsReload" title="重新加载编辑器界面">⟳ 重载</button>
-        <button class="btn sm ghost" id="vsExternal" title="用系统浏览器打开（想双屏对照时用）">🌐 浏览器打开</button>
-        <button class="btn sm ghost" id="vsStopIde" title="停掉 VS Code 进程（释放内存）">■ 停掉</button>
-        <button class="btn sm" id="vsClose" title="收起编辑器界面（进程保留，随时再打开）">⇥ 回到开发台</button>
-      </span>
-    </div>
-    <iframe id="vsFrame" class="vsframe" src="about:blank"
-      allow="clipboard-read; clipboard-write"></iframe>
-  </div>
+  <!-- 独立的「🧩 VS Code」覆盖层已删除：VS Code 现在就是开发台**唯一的编辑器**
+       （见 .studio-editor 里的 #stVs），不再需要第二个入口。 -->
 
   <script src="/static/studio.js"></script>
   <script src="/static/app.js"></script>

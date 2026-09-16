@@ -85,25 +85,45 @@
     });
   }
 
-  // ---------- Monaco（离线本地加载） ----------
-  function loadMonaco() {
-    if (loading) return loading;
-    loading = new Promise(function (resolve, reject) {
-      if (window.monaco) return resolve(window.monaco);
-      var s = document.createElement("script");
-      s.src = "/static/vendor/monaco/vs/loader.js";
-      s.onload = function () {
-        try {
-          window.require.config({ paths: { vs: "/static/vendor/monaco/vs" } });
-          window.require(["vs/editor/editor.main"], function () {
-            resolve(window.monaco);
-          }, reject);
-        } catch (e) { reject(e); }
-      };
-      s.onerror = function () { reject(new Error("编辑器资源加载失败")); };
-      document.head.appendChild(s);
-    });
-    return loading;
+  // ---------- 编辑器：内置的真 VS Code（code-server） ----------
+  // **Monaco 已经删掉**。原因：它只有"文本编辑"这一层，没有终端、没有调试器、
+  // 没有 Git 面板 —— 用户的原话是"调试和运行比不上 PyCharm 和 Trae 这类"。
+  // VS Code 本体全都自带，而且同样是**完全离线**跑在本机 127.0.0.1 上。
+  // 所以全应用**只保留这一个编辑器**，不再自己维护一套半成品。
+  var vsReady = false;
+
+  function vsMsg(text) {
+    var m = $("stVsMsg"), c = $("stVsCover");
+    if (m) m.textContent = text;
+    if (c) c.hidden = !text;
+  }
+
+  function vsFrame(url) {
+    var f = $("stVs");
+    if (f && url && f.getAttribute("src") !== url) f.setAttribute("src", url);
+    vsReady = true;
+    vsMsg("");
+  }
+
+  /* 确保内置 VS Code 已就绪、且开的就是当前项目。
+     ⚠️ code-server 是**启动时绑定目录**的，切项目不会自己跟着换 ——
+     不比对项目的话，用户切了项目看到的还是上一个项目的文件，会以为文件丢了。 */
+  async function ensureVs(force) {
+    var st = {};
+    try { st = await jget("/api/ide/status"); } catch (e) { st = {}; }
+    if (!st.installed) {
+      vsMsg("没有找到内置 VS Code。\n\n获取方式见 vendor/ 说明，或使用 Docker 版（已内置）。");
+      return;
+    }
+    if (!force && st.running && st.project === project) { vsFrame(st.url); return; }
+    if (st.running) { vsMsg("正在切换到项目 " + project + " …"); await jpost("/api/ide/stop", {}); }
+    else vsMsg("正在启动内置 VS Code…（第一次要几秒）");
+    $("stVs").setAttribute("src", "about:blank");
+    try {
+      var d = await jpost("/api/ide/start", {});
+      if (!d.ok) { vsMsg("启动失败：" + (d.error || "未知错误")); return; }
+      vsFrame(d.url);
+    } catch (e) { vsMsg("启动失败：" + String(e.message || e)); }
   }
 
   function themeName() {
@@ -424,44 +444,23 @@
     editor.setPosition({ lineNumber: 1, column: 1 });
   }
 
+  /* 选中一个文件。**不再往 Monaco 里塞内容** —— 编辑发生在右侧的 VS Code 里。
+     这里只记住"当前文件"（▶ 运行 / 🤖 交给 AI 改 都要用它）并高亮文件树。 */
   async function openFile(rel) {
-    try { await initEditor(); }
-    catch (e) { toast("编辑器加载失败：" + e.message); return; }
-    if (!models[rel]) {
-      var d = await jget("/api/ws/file?rel=" + encodeURIComponent(rel));
-      if (!d.ok) { toast(d.error || "打开失败"); return; }
-      if (/\.(png|jpe?g|gif|webp|ico|pdf|zip|woff2?|ttf)$/i.test(rel)) {
-        showOut("这是二进制文件", rel + "（" + (d.chars || 0) + " 字符）不适合在编辑器里改。\n" +
-          "可以在文件树里右键删除，或用「📦 打包」整体下载。");
-        return;
-      }
-      models[rel] = monacoRef.editor.createModel(d.text || "", langOf(rel));
-      models[rel].onDidChangeContent(function () {
-        if (!dirty[rel]) { dirty[rel] = true; renderTabs(); renderTree(); }
-      });
+    await initEditor();
+    if (/\.(png|jpe?g|gif|webp|ico|pdf|zip|woff2?|ttf)$/i.test(rel)) {
+      toast("这是二进制文件，已选中；用「📦 打包」可整体下载");
     }
     if (tabs.indexOf(rel) < 0) tabs.push(rel);
     cur = rel;
-    showTab(rel);
     renderTabs(); renderTree();
-    lintCur();
   }
 
   // ---------- 编辑器 ----------
+  /* 保留这个函数名（很多地方在 await initEditor()），但**不再建 Monaco 编辑器** ——
+     现在"编辑器"就是那个 VS Code iframe，这里只负责把它准备好。 */
   async function initEditor() {
-    if (editor) return;
-    monacoRef = await loadMonaco();
-    editor = monacoRef.editor.create($("stEditor"), {
-      value: "", language: "python", theme: themeName(),
-      automaticLayout: true, fontSize: 13, tabSize: 4,
-      minimap: { enabled: false }, scrollBeyondLastLine: false,
-      renderWhitespace: "selection",
-      fontFamily: "Consolas, 'Cascadia Mono', 'Microsoft YaHei Mono', monospace"
-    });
-    editor.addCommand(monacoRef.KeyMod.CtrlCmd | monacoRef.KeyCode.KeyS,
-      function () { saveCur(); });
-    editor.addCommand(monacoRef.KeyMod.CtrlCmd | monacoRef.KeyCode.Enter,
-      function () { runCur(); });
+    await ensureVs();
   }
 
   // ---------- 动作 ----------
@@ -792,27 +791,21 @@
     });
   }
 
+  /* 原来这里用 Monaco 的 diff 编辑器做"AI 改动对比"。
+     Monaco 删掉之后不自己再造一套对比界面 —— **VS Code 自带**：
+     每个项目本身就是个 git 仓库，左侧「源代码管理」面板（分支图标）
+     会列出 AI 动过的文件，点开就是左右对比，右键就能撤销。
+     所以这里只负责把话说清楚 + 帮用户定位到那儿。 */
   async function openDiff(cid) {
-    try { await initEditor(); } catch (e) { toast("编辑器加载失败"); return; }
     var d = await jget("/api/ws/change?id=" + encodeURIComponent(cid));
     if (!d.ok) { toast(d.error || "读取改动失败"); return; }
-    var mask = $("stDiffMask");
-    mask.hidden = false;
-    $("stDiffName").textContent = (d.created ? "新建文件：" : "改动：") + d.rel;
-    $("stDiffRevert").setAttribute("data-id", cid);
-    if (!diffEditor) {
-      diffEditor = monacoRef.editor.createDiffEditor($("stDiffBody"), {
-        readOnly: true, automaticLayout: true, theme: themeName(),
-        renderSideBySide: true, originalEditable: false,
-        fontSize: 13, minimap: { enabled: false }
-      });
-    }
-    if (diffModels) { diffModels.o.dispose(); diffModels.m.dispose(); }
-    diffModels = {
-      o: monacoRef.editor.createModel(d.before || "", langOf(d.rel)),
-      m: monacoRef.editor.createModel(d.after || "", langOf(d.rel))
-    };
-    diffEditor.setModel({ original: diffModels.o, modified: diffModels.m });
+    toast("在右侧 VS Code 的「源代码管理」里看这个文件的改动（点左侧分支图标）");
+    showOut((d.created ? "新建文件：" : "改动：") + d.rel,
+      "这份改动的对比与撤销都在 VS Code 里（它自带 Git）：\n\n" +
+      "  1) 看右侧 VS Code → 左侧栏最上面那个「分支」图标（源代码管理）\n" +
+      "  2) 里面会列出 AI 改过的文件，点开就是左右对比\n" +
+      "  3) 想退回：在文件上右键 → Discard Changes\n\n" +
+      "（另外旧版内容仍会自动备份到 _回收站/，需要时也能捞回来）");
   }
 
   async function revertChange() {
@@ -929,35 +922,38 @@
     }
   }
 
-  /* 让某个文件**出现在编辑器里**：开发台没开就打开，开了就切过去。
-     这是"AI 写完不用我复制"的关键一步 ——
-     原来只有"AI 改的正好是你当前打开的那个文件"才会更新，
-     它新建一个文件时界面上什么都不会发生，用户只能自己去文件树里找。 */
+  /* 把 AI 正在动/刚动完的文件**摆到用户眼前**：开发台没开就打开，然后确保
+     VS Code 正开着当前项目。
+     为什么不用"把内容塞进编辑器"了：编辑器已经是 VS Code 本体，
+     它自己会盯着磁盘（文件监视器），我们**只要保证文件真的在磁盘上**，
+     编辑器里就会自己出现、自己刷新 —— 包括"AI 正在逐字写"的过程。 */
   async function revealFile(rel, opts) {
-    opts = opts || {};
     if (!rel) return;
     if (!opened) await open();
-    await refresh();                       // 先让文件树认到这个新文件
-    // AI 刚刚改过磁盘上的内容 —— 即使模型已存在也要重新读，否则编辑器里还是旧文本
-    if (models[rel] && opts.reload !== false) {
-      try {
-        var f = await jget("/api/ws/file?rel=" + encodeURIComponent(rel));
-        if (f.ok && f.text !== null && f.text !== models[rel].getValue()) {
-          var pos = editor ? editor.getPosition() : null;
-          models[rel].setValue(f.text || "");
-          if (pos && editor) editor.setPosition(pos);
-          delete dirty[rel];
-        }
-      } catch (e) { /* 读不到就维持原样 */ }
-    } else {
-      await openFile(rel);
-      return;
-    }
+    await refresh();                       // 让文件树认到这个（可能是刚建出来的）文件
+    await ensureVs();
     if (tabs.indexOf(rel) < 0) tabs.push(rel);
     cur = rel;
-    showTab(rel);
     renderTabs(); renderTree();
-    lintCur();
+  }
+
+  /* AI 正在往某个文件里逐字写 —— 给一条看得见的进度。
+     真正的"逐字"发生在 VS Code 里（文件在长），这里只是把状态说清楚，
+     免得用户以为"它又在憋大招"。 */
+  function showTyping(ev) {
+    if (!ev || !ev.rel) return;
+    var line = $("stVsTyping");
+    if (!line) {
+      line = document.createElement("div");
+      line.id = "stVsTyping";
+      line.className = "st-vs-typing";
+      var bar = document.querySelector(".studio-bar");
+      if (bar) bar.appendChild(line);
+    }
+    line.textContent = "✍ AI 正在写 " + ev.rel + " · " + (ev.chars || 0) + " 字";
+    line.hidden = false;
+    clearTimeout(showTyping._t);
+    showTyping._t = setTimeout(function () { line.hidden = true; }, 4000);
   }
 
   function close() {
@@ -972,11 +968,13 @@
   function toggle() { if (opened) close(); else open(); }
 
   function notify(ev) {
-    if (!ev || ev.type !== "workspace") return;
+    if (!ev) return;
+    // ① AI 正在往文件里逐字写（生成没结束）—— 只更新进度提示。
+    //    内容在我们这边是**边生成边落盘**的，VS Code 看到文件在变就会自己刷出来。
+    if (ev.type === "typing") { showTyping(ev); return; }
+    if (ev.type !== "workspace") return;
     if (ev.act === "write") {
-      // 开发台开着 → **直接把 AI 刚写的那个文件切到编辑器里**。
-      // 不这么做的话：AI 改的是别的文件（尤其是新建文件）时，界面上一点动静都没有，
-      // 用户会以为"它只是嘴上说了说"，然后自己去聊天里复制粘贴。
+      // 写完了 → 把那个文件切到用户眼前（开发台开着的话），并刷新"AI 改动"列表。
       if (opened) {
         revealFile(ev.rel).then(function () { loadChanges(); });
       }
@@ -1047,64 +1045,10 @@
   }
 
   /* 内置的**真 VS Code**（code-server）：绿色包，跑在 127.0.0.1，全程离线。
-     **直接嵌在应用里**（iframe），不需要浏览器、不需要联网 ——
-     断点调试 / 变量监视 / 终端 / Git 面板 / 扩展都在里面。 */
-  var vsUrl = "";
-
-  function showVs(url, project) {
-    vsUrl = url;
-    $("vsProj").textContent = project ? "· 项目 " + project : "";
-    $("vsFrame").src = url;
-    $("vsWrap").hidden = false;
-  }
-
-  function closeVs() { $("vsWrap").hidden = true; }
-
-  async function openVsCode() {
-    var st = {};
-    try { st = await jget("/api/ide/status"); } catch (e) { st = {}; }
-    if (!st.installed) {
-      showOut("没有内置 VS Code", "没在 vendor/ 下找到 code-server。\n\n" +
-        "获取方式（一次性）：到 github.com/coder/code-server/releases 下载\n" +
-        "  code-server-<版本>-windows-amd64.tar.gz\n" +
-        "解压到项目的 vendor/ 目录即可（目录名保持 code-server-<版本>-windows-amd64）。");
-      return;
-    }
-    if (st.running && st.project && project && st.project !== project) {
-      // ⚠️ 坑：code-server 是**启动时绑定目录**的，换个项目不会自己跟着换。
-      // 不处理的话用户切了项目再点「VS Code」，看到的还是上一个项目的文件，
-      // 会以为"文件丢了"。所以项目对不上就重启一次。
-      showOut("切换中…", "内置 VS Code 还开着项目 " + st.project +
-        "，正在切到 " + project + " …");
-      await jpost("/api/ide/stop", {});
-      $("vsFrame").src = "about:blank";
-    } else if (st.running) {    // 已启动且项目一致 → 直接嵌进来
-      showVs(st.url, st.project);
-      toast("内置 VS Code 已打开");
-      return;
-    }
-    showOut("正在启动内置 VS Code…", "第一次启动要几秒，请稍候…");
-    try {
-      var d = await jpost("/api/ide/start", {});
-      if (!d.ok) { showOut("启动失败", d.error || "未知错误"); return; }
-      showVs(d.url, d.project);
-      showOut("内置 VS Code 已就绪 · 项目 " + d.project,
-        "地址：" + d.url + "\n\n" +
-        "· 这是**真正的 VS Code**（code-server 4.137 / Code 1.137），全程离线；\n" +
-        "· 打开的就是当前项目目录 —— 和开发台改的是**同一批文件**；\n" +
-        "· 断点调试、变量监视、终端、Git 面板、扩展都在里面；\n" +
-        "· 想双屏对照可以点「🌐 浏览器打开」；「⇥ 回到开发台」只是收起界面，进程还在。");
-    } catch (e) { showOut("启动失败", String(e.message || e)); }
-  }
-
-  async function stopVsCode() {
-    if (!confirm("停掉内置 VS Code？\n\n（界面会关掉，编辑器里没保存的内容会丢）")) return;
-    await jpost("/api/ide/stop", {});
-    $("vsFrame").src = "about:blank";
-    closeVs();
-    showOut("已停止", "内置 VS Code 已停止。");
-    toast("已停止内置 VS Code");
-  }
+     它现在是开发台**唯一的编辑器**（见 .studio-editor 里的 #stVs），
+     所以原来那套独立的全屏覆盖层（showVs / closeVs / openVsCode / stopVsCode）
+     已经删掉，只留 ensureVs() 负责"起进程 + 指到当前项目"。
+     停进程用后端「■ 停掉」也可以：POST /api/ide/stop。 */
 
   // ---------- 事件绑定 ----------
   function bind() {
@@ -1119,14 +1063,14 @@
     $("stPreview").onclick = previewCur;
     $("stDeploy").onclick = deploy;
     $("stUpload").onclick = uploadProject;
-    $("stIde").onclick = openIde;
-    $("stVsCode").onclick = openVsCode;
-    $("vsClose").onclick = closeVs;
-    $("vsReload").onclick = function () {
-      if (vsUrl) { $("vsFrame").src = "about:blank"; setTimeout(function () { $("vsFrame").src = vsUrl; }, 120); }
+    // ⟳ VS Code：重启并重新加载内置编辑器（切了项目、或界面卡住时用）
+    $("stVsCode").onclick = function () { ensureVs(true); };
+    // ⌨ 终端：把焦点送进 VS Code，用户按 Ctrl+` 就能开终端跑命令
+    if ($("stVsTerm")) $("stVsTerm").onclick = function () {
+      var f = $("stVs");
+      if (f) { try { f.focus(); } catch (e) {} }
+      toast("按 Ctrl+` 打开终端；运行、装包、调试都在 VS Code 里");
     };
-    $("vsExternal").onclick = function () { if (vsUrl) window.open(vsUrl, "_blank"); };
-    $("vsStopIde").onclick = stopVsCode;
     $("stFolder").onclick = openFolder;
     $("stRunStop").onclick = stopRun;
     $("stDebug").onclick = debugCur;

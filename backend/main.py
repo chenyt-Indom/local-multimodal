@@ -1410,8 +1410,61 @@ def _safe_emit_len(text: str) -> int:
     return max(0, best)
 
 
+_WS_WRITE_NAME_RE = re.compile(r'"name"\s*:\s*"workspace_write"')
+
+
+def _partial_ws_write(buf: str):
+    """从**还没生成完**的正文里，尽量抠出 workspace_write 的 (rel, text)。
+
+    为什么要这么干：代码模型是把工具调用当**文本**吐出来的，
+    也就是说 `{"rel": "app.py", "text": "…代码…"}` 里的代码是**逐字流出来的**。
+    把这半截内容先落盘，编辑器那边的文件监视器就能看到代码一点点长出来 ——
+    用户要的"AI 自动逐字输入到编辑器"就是这么实现的（不需要他复制任何东西）。
+
+    `text` 可能只有一半（甚至停在转义符中间），所以这里全部走容错解析：
+    能解析多少给多少，解析不了就返回 None（这一帧不写盘，等下一帧）。
+
+    返回 (rel, text)；rel 可能为 None（名字还没打完），text 为 None 表示还没有正文。
+    """
+    if not buf or "workspace_write" not in buf:
+        return None, None
+    m = _WS_WRITE_NAME_RE.search(buf)
+    if not m:
+        return None, None
+    seg = buf[m.end():]
+    rel = None
+    mr = re.search(r'"rel"\s*:\s*"((?:[^"\\]|\\.)*)"', seg)
+    if mr:
+        try:
+            rel = json.loads('"%s"' % mr.group(1))
+        except Exception:
+            rel = None
+    mt = re.search(r'"text"\s*:\s*"', seg)
+    if not mt:
+        return rel, None          # 正文还没开始
+    rest = seg[mt.end():]
+    out = []
+    i = 0
+    while i < len(rest):
+        c = rest[i]
+        if c == "\\":
+            if i + 1 >= len(rest):
+                break             # 转义序列还没打完 → 这一帧先不放出来
+            out.append(rest[i:i + 2])
+            i += 2
+            continue
+        if c == '"':
+            break                 # 正文结束
+        out.append(c)
+        i += 1
+    try:
+        return rel, json.loads('"%s"' % "".join(out))
+    except Exception:
+        return rel, None
+
+
 def _route_code_model(cfg: dict, text: str, fallback: str, prev_code: bool = False):
-    """代码类请求换用专用代码模型，返回 (模型名, 给用户看的提示)。"""
+    """代码类请求换用专用代码模型，返回 (模型名，给用户看的提示)。"""
     if not cfg.get("code_auto_route", True):
         return fallback, ""
     want = str(cfg.get("code_model") or "").strip()
@@ -2092,6 +2145,8 @@ async def chat(req: ChatRequest):
 
             round_msg = {"content": "", "thinking": None, "model": model}
             code_emitted = 0        # 代码轮已经推给前端的正文长度（见 _safe_emit_len）
+            # 边生成边落盘的进度（见 _partial_ws_write）：文件 / 已落盘字数 / 上次时刻
+            _ws_rel, _ws_len, _ws_t = "", 0, 0.0
             tool_calls = None
             done_reason = ""
             # 注意：必须用 _stream_lines（子线程读 + 队列），
@@ -2127,6 +2182,29 @@ async def chat(req: ChatRequest):
                             code_emitted = _safe
                             final_text += _piece
                             yield json.dumps({"message": {"content": _piece}}) + "\n"
+                        # ★ "AI 自动逐字输入到编辑器"就靠这一段：
+                        #   模型把 workspace_write 的正文**逐字**吐出来，
+                        #   我们把已经生成的部分先落盘 → 内置 VS Code 的文件监视器
+                        #   看到文件在变，编辑器里就是代码一点点长出来。
+                        #   不落盘的话，用户只能等生成完"啪"地出现一整份文件。
+                        _rel, _partial = _partial_ws_write(round_msg["content"])
+                        if _rel and _partial is not None:
+                            _now = time.time()
+                            _fresh = _rel != _ws_rel
+                            # 节流：换文件立刻写；同文件每 60 字或每 0.3 秒写一次。
+                            # 太密会把磁盘和 VS Code 的文件监视器打爆；太疏就没有"打字"感。
+                            if (_fresh or len(_partial) - _ws_len >= 60
+                                    or _now - _ws_t >= 0.30):
+                                try:
+                                    workspace.stream_write(_rel, _partial)
+                                except Exception:
+                                    pass      # 落盘失败不影响模型继续生成，结束时还会正式写一次
+                                yield json.dumps({"ui": {
+                                    "type": "typing", "rel": _rel,
+                                    "chars": len(_partial), "reset": _fresh,
+                                    "project": workspace.active_project(),
+                                }}) + "\n"
+                                _ws_rel, _ws_len, _ws_t = _rel, len(_partial), _now
                     else:
                         final_text += m["content"]
                         # 仅把用户可见的文本增量透出

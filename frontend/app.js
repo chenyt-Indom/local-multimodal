@@ -5,6 +5,8 @@
   let docs = [];            // 待发送文档：[{name, text, chars}]（拖进来时抽取正文）
   let videoB64 = null;      // 待发送视频帧 base64 列表
   let streaming = false;
+  // 每轮只提示一次「AI 正在写代码」，别刷屏
+  let typingHintShown = false;
   let abortCtl = null;      // 用于「■ 终止」：中断当前的流式请求
   let aborted = false;      // 标记本轮是用户主动终止的（不是出错）
   const history = [];       // 会话消息（用于多轮上下文）
@@ -1787,6 +1789,7 @@
     };
 
     streaming = true;
+    typingHintShown = false;
     aborted = false;
     $("#sendBtn").disabled = true;
     setStopVisible(true);
@@ -1836,6 +1839,18 @@
             else if (obj.ui.type === "code") {
               answerWrap.appendChild(makeCodeCard(obj.ui));
               messagesEl.scrollTop = messagesEl.scrollHeight;
+            }
+            else if (obj.ui.type === "typing") {
+              // AI 正在把代码**逐字**写进项目文件（后端是边生成边落盘的）。
+              // 编辑器（内置 VS Code）自己盯着磁盘，会看到内容一点点长出来；
+              // 这里只负责把状态说清楚，免得用户以为"它又在憋大招"。
+              if (window.Studio && window.Studio.notify) window.Studio.notify(obj.ui);
+              if (!window.Studio || !window.Studio.opened) {
+                if (!typingHintShown) {
+                  typingHintShown = true;
+                  showToast("AI 正在写代码到项目文件（可在开发台看到它逐字敲）", "ok");
+                }
+              }
             }
             else if (obj.ui.type === "workspace") {
               // 模型改了工作区文件：
