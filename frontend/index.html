@@ -321,6 +321,21 @@
   </div>
   <input type="file" id="stFileInput" multiple hidden />
 
+  <!-- 内置 VS Code：**直接嵌在应用里**（不是丢给浏览器），全程离线 -->
+  <div class="vswrap" id="vsWrap" hidden>
+    <div class="vsbar">
+      <span class="vstitle">🧩 内置 VS Code <span class="vsproj" id="vsProj"></span></span>
+      <span class="head-acts">
+        <button class="btn sm ghost" id="vsReload" title="重新加载编辑器界面">⟳ 重载</button>
+        <button class="btn sm ghost" id="vsExternal" title="用系统浏览器打开（想双屏对照时用）">🌐 浏览器打开</button>
+        <button class="btn sm ghost" id="vsStopIde" title="停掉 VS Code 进程（释放内存）">■ 停掉</button>
+        <button class="btn sm" id="vsClose" title="收起编辑器界面（进程保留，随时再打开）">⇥ 回到开发台</button>
+      </span>
+    </div>
+    <iframe id="vsFrame" class="vsframe" src="about:blank"
+      allow="clipboard-read; clipboard-write"></iframe>
+  </div>
+
   <script src="/static/studio.js"></script>
   <script src="/static/app.js"></script>
 </body>

@@ -984,35 +984,26 @@
     try { box.setSelectionRange(box.value.length, box.value.length); } catch (e) { /* ignore */ }
   }
 
-  /* 调试：跑一遍 → 有报错就把**完整 traceback** 交给 AI 去修。
-     这是"debug 能力"里最实的一环：报错不用你自己抄给模型。 */
+  /* 调试：跑一遍 → 有报错就把**完整输出**交给 AI 去修。
+     ⚠️ 直接复用 runCur 的**流式**通道 —— 原来自成一套、走同步接口，
+     于是"▶ 运行"已经改成实时输出了，「🔧 调试」还是 25 秒封顶的老路。 */
   async function debugCur() {
     if (!cur) { toast("先打开一个文件"); return; }
-    if (!/\.py$/i.test(cur)) { toast("调试针对 .py；前端项目请点「🚀 部署」看效果"); return; }
+    if (!/\.py$/i.test(cur)) {
+      toast("调试针对 .py；前端项目请在「🧩 VS Code」里用浏览器调试");
+      return;
+    }
     if (dirty[cur]) await saveCur();
     await lintCur();
-    showOut("调试中…", "正在执行 " + cur + " …");
-    var d = await jpost("/api/ws/run", { rel: cur });
-    if (d.needs_confirm) {
-      var risk = (d.risky || []).join("、");
-      if (confirm("这段代码里有需要确认的操作：" + risk + "\n\n确定要运行吗？")) {
-        d = await jpost("/api/ws/confirm_run", { rel: cur });
-      } else { showOut("已取消", "你拒绝了这次执行。"); return; }
-    }
-    if (!d.ok) { showOut("调试失败", d.error || "未知错误"); return; }
-    var out = ["退出码 " + d.rc + "   用时 " + d.seconds + " 秒", "",
-               "── 标准输出 ──", d.out || "（无输出）"];
-    if (d.err) { out.push("", "── 错误 ──", d.err); }
-    showOut("调试 · " + cur, out.join("\n"));
-    if (d.rc !== 0 || (d.err || "").trim()) {
-      handToAi("运行项目里的 " + cur + " 报错了，完整输出如下：\n\n```\n" +
-        (d.err || d.out || "").slice(-3000) + "\n```\n\n" +
-        "请先用 workspace_read 读它的最新内容，定位原因并**直接改好**" +
-        "（用 workspace_write 写回整份文件），再用 workspace_run 跑一次确认通过。");
-      toast("报错已填进聊天框 —— 按回车让 AI 修");
-    } else {
-      toast("调试通过：退出码 0，没有报错");
-    }
+    await runCur();                    // 流式跑完（没有 25 秒上限）
+    var body = ($("stOutBody").textContent || "").trim();
+    var okRun = /^退出码 0\b/m.test(body);
+    if (okRun) { toast("调试通过：退出码 0，没有报错"); return; }
+    handToAi("运行项目里的 " + cur + " 报错了 / 没正常结束，完整输出如下：\n\n```\n" +
+      body.slice(-3000) + "\n```\n\n" +
+      "请先用 workspace_read 读它的最新内容，定位原因并**直接改好**" +
+      "（用 workspace_write 写回整份文件），然后确认能跑通。");
+    toast("输出已填进聊天框 —— 按回车让 AI 修");
   }
 
   // ---------- 上传到代码托管平台 ----------
@@ -1031,8 +1022,19 @@
   }
 
   /* 内置的**真 VS Code**（code-server）：绿色包，跑在 127.0.0.1，全程离线。
-     断点调试 / 变量监视 / 终端 / Git 面板 / 扩展市场都在里面 ——
-     这些是自研编辑器做不出来的，所以直接把它接进来。 */
+     **直接嵌在应用里**（iframe），不需要浏览器、不需要联网 ——
+     断点调试 / 变量监视 / 终端 / Git 面板 / 扩展都在里面。 */
+  var vsUrl = "";
+
+  function showVs(url, project) {
+    vsUrl = url;
+    $("vsProj").textContent = project ? "· 项目 " + project : "";
+    $("vsFrame").src = url;
+    $("vsWrap").hidden = false;
+  }
+
+  function closeVs() { $("vsWrap").hidden = true; }
+
   async function openVsCode() {
     var st = {};
     try { st = await jget("/api/ide/status"); } catch (e) { st = {}; }
@@ -1043,30 +1045,40 @@
         "解压到项目的 vendor/ 目录即可（目录名保持 code-server-<版本>-windows-amd64）。");
       return;
     }
-    if (st.running) {
-      if (confirm("内置 VS Code 正在运行：\n" + st.url + "\n\n要停掉它吗？")) {
-        await jpost("/api/ide/stop", {});
-        showOut("已停止", "内置 VS Code 已停止。");
-        toast("已停止内置 VS Code");
-        return;
-      }
-      window.open(st.url, "_blank");
+    if (st.running && st.project && project && st.project !== project) {
+      // ⚠️ 坑：code-server 是**启动时绑定目录**的，换个项目不会自己跟着换。
+      // 不处理的话用户切了项目再点「VS Code」，看到的还是上一个项目的文件，
+      // 会以为"文件丢了"。所以项目对不上就重启一次。
+      showOut("切换中…", "内置 VS Code 还开着项目 " + st.project +
+        "，正在切到 " + project + " …");
+      await jpost("/api/ide/stop", {});
+      $("vsFrame").src = "about:blank";
+    } else if (st.running) {    // 已启动且项目一致 → 直接嵌进来
+      showVs(st.url, st.project);
+      toast("内置 VS Code 已打开");
       return;
     }
     showOut("正在启动内置 VS Code…", "第一次启动要几秒，请稍候…");
     try {
       var d = await jpost("/api/ide/start", {});
       if (!d.ok) { showOut("启动失败", d.error || "未知错误"); return; }
+      showVs(d.url, d.project);
       showOut("内置 VS Code 已就绪 · 项目 " + d.project,
         "地址：" + d.url + "\n\n" +
         "· 这是**真正的 VS Code**（code-server 4.137 / Code 1.137），全程离线；\n" +
         "· 打开的就是当前项目目录 —— 和开发台改的是**同一批文件**；\n" +
-        "· 断点调试、变量监视、终端、Git 面板、扩展市场都在里面；\n" +
-        "· 窗口没自动弹出的话，把上面的地址复制到浏览器打开；\n" +
-        "· 再点一次「🧩 VS Code」可以停掉它。");
-      var w = window.open(d.url, "_blank");
-      if (!w) toast("地址已显示在下方，复制到浏览器打开");
+        "· 断点调试、变量监视、终端、Git 面板、扩展都在里面；\n" +
+        "· 想双屏对照可以点「🌐 浏览器打开」；「⇥ 回到开发台」只是收起界面，进程还在。");
     } catch (e) { showOut("启动失败", String(e.message || e)); }
+  }
+
+  async function stopVsCode() {
+    if (!confirm("停掉内置 VS Code？\n\n（界面会关掉，编辑器里没保存的内容会丢）")) return;
+    await jpost("/api/ide/stop", {});
+    $("vsFrame").src = "about:blank";
+    closeVs();
+    showOut("已停止", "内置 VS Code 已停止。");
+    toast("已停止内置 VS Code");
   }
 
   // ---------- 事件绑定 ----------
@@ -1084,6 +1096,12 @@
     $("stUpload").onclick = uploadProject;
     $("stIde").onclick = openIde;
     $("stVsCode").onclick = openVsCode;
+    $("vsClose").onclick = closeVs;
+    $("vsReload").onclick = function () {
+      if (vsUrl) { $("vsFrame").src = "about:blank"; setTimeout(function () { $("vsFrame").src = vsUrl; }, 120); }
+    };
+    $("vsExternal").onclick = function () { if (vsUrl) window.open(vsUrl, "_blank"); };
+    $("vsStopIde").onclick = stopVsCode;
     $("stFolder").onclick = openFolder;
     $("stRunStop").onclick = stopRun;
     $("stDebug").onclick = debugCur;

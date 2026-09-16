@@ -61,10 +61,28 @@ RUN pip install --index-url "${PIP_INDEX}" -r requirements-image.txt
 COPY backend/ ./backend/
 COPY frontend/ ./frontend/
 
+# ---------- 内置的真 VS Code（code-server）----------
+# 和本机源码模式保持一致：开发台的「🧩 VS Code」按钮要在容器里也能用。
+# 绿色包自带 Node，解压即用；起在 127.0.0.1 上，容器外通过端口映射访问。
+ARG CS_VER=4.137.0
+RUN set -eux; \
+    (curl -fsSL --retry 3 -o /tmp/cs.tgz \
+      "https://github.com/coder/code-server/releases/download/v${CS_VER}/code-server-${CS_VER}-linux-amd64.tar.gz" \
+     || curl -fsSL --retry 3 -o /tmp/cs.tgz \
+      "https://gh-proxy.com/https://github.com/coder/code-server/releases/download/v${CS_VER}/code-server-${CS_VER}-linux-amd64.tar.gz"); \
+    mkdir -p /opt/app/vendor; \
+    tar -xzf /tmp/cs.tgz -C /opt/app/vendor; \
+    mv "/opt/app/vendor/code-server-${CS_VER}-linux-amd64" /opt/app/vendor/code-server; \
+    chmod +x /opt/app/vendor/code-server/bin/code-server; \
+    rm -f /tmp/cs.tgz
+
 # 运行数据与模型挂载点
 RUN mkdir -p /data /opt/app/sd_model /opt/app/esrgan
 
-EXPOSE 8000
+EXPOSE 8000 8810
+# 容器里 code-server 必须绑 0.0.0.0 才能被宿主的端口映射碰到；
+# 安全性靠 `docker run -p 127.0.0.1:8810:8810` 只映射到宿主回环来保证。
+ENV MM_CODE_BIND=0.0.0.0
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=8 \
     CMD curl -fsS http://127.0.0.1:8000/api/health || exit 1

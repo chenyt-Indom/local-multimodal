@@ -653,17 +653,74 @@ def code_server_status() -> dict:
             "url": ("http://127.0.0.1:%d/" % port) if alive else ""}
 
 
+def _cs_state_file() -> str:
+    return config.data("data", ".code_server.json")
+
+
+def reap_orphan_code_server() -> dict:
+    """清掉**上一次应用运行时留下的** code-server。
+
+    ⚠️ 踩过的坑：code-server 在 Windows 上是通过 `.cmd` 拉起的，
+    `terminate()` 只杀掉外层那个壳，**真正的 node 子进程会活下来**。
+    于是重启应用后：旧进程还占着 8810 → 新进程只能用 8812 → 再重启又漂到 8813，
+    越积越多、白吃内存，端口也一路乱跑。
+    所以把 PID 记到磁盘上，下次启动先按 PID 精确回收。
+    """
+    import json as _json
+    f = _cs_state_file()
+    killed = 0
+    try:
+        if os.path.isfile(f):
+            with open(f, "r", encoding="utf-8") as fh:
+                st = _json.load(fh) or {}
+            pid = int(st.get("pid") or 0)
+            if pid:
+                try:
+                    import subprocess as _sp
+                    _sp.run(["taskkill", "/PID", str(pid), "/F", "/T"],
+                            capture_output=True, timeout=15)
+                    killed = 1
+                except Exception:
+                    pass
+            os.remove(f)
+    except Exception:
+        pass
+    _CODE_SERVER.update({"proc": None, "port": 0, "project": ""})
+    return {"ok": True, "killed": killed}
+
+
+def _remember_cs(pid: int, port: int, project: str) -> None:
+    import json as _json
+    try:
+        with open(_cs_state_file(), "w", encoding="utf-8") as fh:
+            _json.dump({"pid": pid, "port": port, "project": project}, fh)
+    except Exception:
+        pass
+
+
+def _forget_cs() -> None:
+    try:
+        f = _cs_state_file()
+        if os.path.isfile(f):
+            os.remove(f)
+    except Exception:
+        pass
+
+
 def stop_code_server() -> dict:
     p = _CODE_SERVER.get("proc")
     if p is not None:
         try:
-            p.terminate()
-            try:
-                p.wait(timeout=6)
-            except Exception:
-                p.kill()
+            import subprocess as _sp
+            # 连带子进程一起杀（只 terminate 外层壳的话，node 会活下来）
+            _sp.run(["taskkill", "/PID", str(p.pid), "/F", "/T"],
+                    capture_output=True, timeout=15)
         except Exception:
-            pass
+            try:
+                p.kill()
+            except Exception:
+                pass
+    _forget_cs()
     _CODE_SERVER.update({"proc": None, "port": 0, "project": ""})
     return {"ok": True}
 
@@ -709,7 +766,10 @@ def start_code_server(proj: str = "") -> dict:
     env = dict(os.environ)
     env["PORT"] = str(port)
     env.pop("MM_DATA_DIR", None)
-    args = [exe, "--bind-addr", "127.0.0.1:%d" % port, "--auth", "none",
+    # 监听地址：源码模式绑回环就够（只有本机能连）；容器里得绑 0.0.0.0，
+    # 再由 `docker run -p 127.0.0.1:8810:8810` 只映射到宿主回环 —— 两头都不对外。
+    bind = str(env.get("MM_CODE_BIND") or "127.0.0.1").strip() or "127.0.0.1"
+    args = [exe, "--bind-addr", "%s:%d" % (bind, port), "--auth", "none",
             "--disable-telemetry", "--disable-update-check", d]
     try:
         if exe.endswith(".cmd"):
@@ -728,6 +788,7 @@ def start_code_server(proj: str = "") -> dict:
             s.settimeout(0.4)
             if s.connect_ex(("127.0.0.1", port)) == 0:
                 _CODE_SERVER.update({"proc": proc, "port": port, "project": p})
+                _remember_cs(proc.pid, port, p)
                 return {"ok": True, "url": "http://127.0.0.1:%d/" % port,
                         "port": port, "project": p, "path": d}
         if proc.poll() is not None:

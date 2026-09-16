@@ -2749,6 +2749,17 @@ def ide_status():
     return workspace.code_server_status()
 
 
+@app.on_event("startup")
+def _reap_ide_orphans():
+    """启动时先回收上次残留的 code-server（见 workspace.reap_orphan_code_server）。"""
+    try:
+        r = workspace.reap_orphan_code_server()
+        if r.get("killed"):
+            logger.info("已回收上次残留的 code-server 进程")
+    except Exception as e:
+        logger.warning("回收 code-server 残留进程失败：%s", e)
+
+
 @app.post("/api/ide/start")
 def ide_start(body: dict):
     """给当前项目起一个**内置的真 VS Code**（code-server），返回访问地址。
@@ -3711,27 +3722,38 @@ def voice_stop():
 
 
 # ---------- 前端 ----------
+_NO_CACHE = "no-store, no-cache, must-revalidate, max-age=0"
+
+
 @app.middleware("http")
 async def _no_cache_pages(request, call_next):
-    """让前端文件**每次回来校验**，而不是直接用缓存。
+    """让前端文件**彻底不缓存**。
 
-    ⚠️ 踩过这个坑：改了 app.js（比如给拖拽加了"文档"分支），
-    但界面行为一点没变 —— 因为浏览器 / WebView 直接吃了缓存的旧文件，
-    看起来就像"功能根本没做"，白白怀疑代码。
-    加上 no-cache 后，浏览器每次会带 ETag 回来问一次：
-    文件没变仍是 304（几乎不花时间），变了就立刻拿到新的。
+    ⚠️ 这个坑踩过两次：
+      ① 改了 app.js（给拖拽加"文档"分支），界面行为一点没变 —— 浏览器吃了缓存的旧文件；
+         当时加的 `no-cache, must-revalidate`（靠 ETag 回来校验）解决了一部分。
+      ② 但这不够：桌面窗口是 WebView2，**它不一定老老实实回来校验** ——
+         实测"运行结果面板改成了实时输出"，用户截图里还是上一版的格式，
+         白白让用户以为没修好。
+    本地应用的静态资源重新拉一次的开销可以忽略，**正确性远比那几毫秒重要**，
+    所以直接 `no-store`：不存、不问、每次重新拿。
     """
     resp = await call_next(request)
     path = request.url.path
-    if path == "/" or path.startswith("/static/"):
-        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+    if (path == "/" or path.startswith("/static/")
+            or path.endswith((".js", ".css", ".html"))):
+        resp.headers["Cache-Control"] = _NO_CACHE
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
     return resp
 
 
 @app.get("/")
 def index():
     resp = FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
-    resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+    resp.headers["Cache-Control"] = _NO_CACHE
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
     return resp
 
 

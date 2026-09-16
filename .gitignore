@@ -46,3 +46,9 @@ image_library/
 # 需要时从 https://github.com/coder/code-server/releases 下载 windows-amd64 包
 # 解压到 vendor/ 即可（目录名形如 code-server-4.x.x-windows-amd64）
 vendor/
+
+# 模型早期用相对路径误写到源码根目录的产物（已加绝对路径防护，不会再产生）
+# 留着不动，避免误删用户内容；不纳入版本库
+/代码/
+/番茄钟/
+/网页/
