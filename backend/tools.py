@@ -125,7 +125,10 @@ _WS_RUN_SCHEMA = {
                            "args": {"type": "string",
                                     "description": "可选：命令行参数（空格分隔），如 \"add 张三 138\"。"
                                                    "argparse 这类工具**不给参数就什么都不做**，"
-                                                   "要验它们就得传参数。"}},
+                                                   "要验它们就得传参数。"},
+                           "stdin": {"type": "string",
+                                     "description": "可选：预先喂给程序的标准输入，**一行对应一次 input()**。"
+                                                    "程序里用了 input() 就必须给，否则会读到 EOF 而报错。"}},
                        "required": ["rel"]},
     },
 }
@@ -1599,7 +1602,8 @@ def run_code(code: str, allow_risky: bool = False) -> dict:
             "rc": rc, "seconds": round(time.time() - t0, 2)}
 
 
-def run_file(path: str, allow_risky: bool = False, args: str = "") -> dict:
+def run_file(path: str, allow_risky: bool = False, args: str = "",
+             stdin_text: str = "") -> dict:
     """运行**磁盘上真实存在的** .py 文件（工作区里的项目文件）。
 
     和 `run_code` 的区别：这里 **cwd 设成文件所在目录**，并且直接跑原文件 ——
@@ -1629,6 +1633,15 @@ def run_file(path: str, allow_risky: bool = False, args: str = "") -> dict:
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env.pop("MM_DATA_DIR", None)      # 被跑的代码不该摸到应用数据目录
+    # 让子目录里的脚本也能 import 项目根的模块（Python 默认只把**脚本所在目录**
+    # 放进 sys.path，而 AI 生成的项目常把工具模块放根目录、脚本放子目录）。
+    try:
+        from . import workspace as _ws2
+        _pp = _ws2.root(_ws2.active_project())
+        _old_pp = env.get("PYTHONPATH") or ""
+        env["PYTHONPATH"] = _pp + (os.pathsep + _old_pp if _old_pp else "")
+    except Exception:
+        pass
     try:
         # 用 Popen + communicate（而不是 subprocess.run）：超时分支里还能
         # **拿到已经打印出来的内容**。run 的 TimeoutExpired 会把缓冲一起丢掉，
@@ -1644,6 +1657,10 @@ def run_file(path: str, allow_risky: bool = False, args: str = "") -> dict:
                 _extra = []
         pr = _sp.Popen([sys.executable, "-X", "utf8", "-u", os.path.basename(p)] + _extra,
                        cwd=os.path.dirname(p) or ".", env=env,
+                       # stdin 也接管道：模型可以**预先喂输入**来测 input() 程序
+                       # （communicate 结束时会把管道关掉，所以没喂输入的程序
+                       #   会照旧拿到 EOF，不会挂住智能体）。
+                       stdin=_sp.PIPE,
                        stdout=_sp.PIPE, stderr=_sp.PIPE,
                        text=True, encoding="utf-8", errors="replace")
     except Exception as exc:
@@ -1651,7 +1668,11 @@ def run_file(path: str, allow_risky: bool = False, args: str = "") -> dict:
                 "seconds": round(time.time() - t0, 2),
                 "err": "无法启动：%s: %s" % (type(exc).__name__, exc)}
     try:
-        out, err = pr.communicate(timeout=RUN_TIMEOUT)
+        _stdin = str(stdin_text or "").replace("\r\n", "\n")
+        # 结尾补一个换行：程序里最后一次 input() 才不会一直等
+        if _stdin and not _stdin.endswith("\n"):
+            _stdin += "\n"
+        out, err = pr.communicate(input=_stdin, timeout=RUN_TIMEOUT)
         rc = pr.returncode
     except _sp.TimeoutExpired:
         pr.kill()
@@ -1733,7 +1754,8 @@ def _do_workspace_run(arguments, ui_events=None) -> str:
     if not rel.lower().endswith(".py"):
         return ("当前只能直接运行 .py 文件。如果你想验证网页，"
                 "写好后让用户点开发台上的「🌐 预览」。")
-    r = run_file(p, allow_risky=False, args=str((arguments or {}).get("args") or ""))
+    r = run_file(p, allow_risky=False, args=str((arguments or {}).get("args") or ""),
+                 stdin_text=str((arguments or {}).get("stdin") or ""))
     if r.get("needs_confirm"):
         ask = (arguments or {}).get("__confirm__")
         risk = "、".join(r.get("risky") or [])

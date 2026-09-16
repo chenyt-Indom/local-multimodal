@@ -1260,7 +1260,9 @@ _TEXT_TOOL_DOCS = {
     "workspace_write": '把内容写进工作区文件（存在则覆盖，旧版自动进回收站）。'
                        '**要给整份内容**。参数 {"rel": "相对路径", "text": "完整内容"}',
     "workspace_run": '运行工作区里的一个 .py，拿到真实输出与报错（工作目录=文件所在目录）。'
-                     '参数 {"rel": "相对路径，如 app.py"}',
+                     '参数 {"rel": "相对路径，如 app.py", '
+                     '"args": "可选，命令行参数，如 add 张三 138", '
+                     '"stdin": "可选，预先喂给程序的标准输入，一行对应一次 input()"}',
     # ---- 「完全自动开发项目」必需：从零建项目、铺结构、改名、清理 ----
     # 只有 write/read/run 的话，模型只能改**已有**文件，没法把项目搭起来。
     "workspace_new_project": '新建一个开发项目并立刻切进去，之后都用相对路径。'
@@ -3077,8 +3079,11 @@ async def ws_run_stream(body: dict):
     # `args`：命令行参数（界面上有个「参数」框可以填）。
     # argparse 这类工具**不给参数就什么都不做**，界面只会显示"跑完了但没有输出"，
     # 用户会以为程序坏了 —— 实测就是这么被问到的。
+    # `stdin`：要预先喂给程序的标准输入（一行对应一次 input()）。
+    # 不喂也没关系：运行中用户还能继续在界面上输入（见 /api/ws/run_input）。
     r = workspace.start_run(str(b.get("rel") or ""), run_id=rid,
-                            args=str(b.get("args") or ""))
+                            args=str(b.get("args") or ""),
+                            stdin_text=str(b.get("stdin") or ""))
     if not r.get("ok"):
         async def _bad():
             yield json.dumps({"t": "end", "ok": False,
@@ -3138,6 +3143,16 @@ async def ws_run_stream(body: dict):
 def ws_run_stop(body: dict):
     """停掉正在跑的用户脚本。"""
     return workspace.stop_run(str((body or {}).get("id") or ""))
+
+
+@app.post("/api/ws/run_input")
+def ws_run_input(body: dict):
+    """往正在运行的脚本送一行标准输入（程序里用 input() 时）。
+
+    界面上：运行结果面板底部有个输入框，回车就调这里。
+    """
+    b = body or {}
+    return workspace.send_run_input(str(b.get("id") or ""), str(b.get("data") or ""))
 
 
 @app.get("/api/ws/run_status")

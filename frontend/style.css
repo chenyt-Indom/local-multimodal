@@ -951,3 +951,16 @@ body.dragging .drop-overlay,
   border: 1px solid var(--line, #3a3f47); border-radius: 6px; padding: 0 6px; }
 .studio-runargs::placeholder { color: #8a8a8a; }
 .studio-runargs:focus { outline: none; border-color: var(--accent, #4a9eff); }
+
+/* 「标准输入」行：程序里 input() 读的就是这里。
+   为什么需要：后端是 GUI 启动的、**没有终端**，运行的进程不接管道时
+   一句 input() 直接 EOFError，用户点运行只看到报错、程序根本跑不起来。 */
+.studio-stdin { display: flex; align-items: center; gap: 6px;
+  padding: 6px 8px; border-top: 1px solid var(--line, #3a3f47);
+  background: var(--panel2, #23262d); }
+.studio-stdin-ico { font-size: 13px; opacity: .65; }
+.studio-stdin input { flex: 1; min-width: 0; height: 26px; font-size: 12px;
+  background: var(--bg, #1b1e24); color: var(--text, #e6e6e6);
+  border: 1px solid var(--line, #3a3f47); border-radius: 6px;
+  padding: 0 8px; outline: none; }
+.studio-stdin input:focus { border-color: var(--accent, #4a9eff); }

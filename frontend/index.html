@@ -321,6 +321,17 @@
             </span>
           </div>
           <pre id="stOutBody"></pre>
+          <!-- 程序里用 input() 时，从这里喂输入（回车发送）。
+               为什么必须有：后端是 GUI 启动的、**没有终端**，运行的进程不接管道时
+               一句 input() 直接 EOFError，用户点运行只看到一个报错，程序根本跑不起来
+               —— 实测过。现在进程的 stdin 接成了管道，这里输入什么就喂什么。
+               运行前先填好也可以，点运行时会把它们依次喂进去。 -->
+          <div class="studio-stdin">
+            <span class="studio-stdin-ico" title="标准输入（程序里 input() 读的就是这里）">⌨</span>
+            <input id="stRunIn" autocomplete="off" spellcheck="false"
+                   placeholder="程序里用 input() 时在这里输入后回车；也可以运行前先填好">
+            <button class="btn sm ghost" id="stRunInSend" title="把这一行送给正在运行的程序">发送</button>
+          </div>
         </div>
       </div>
     </div>

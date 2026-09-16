@@ -613,12 +613,49 @@
     if (s) s.hidden = !on;
     var b = $("stRun");
     if (b) { b.disabled = !!on; b.textContent = on ? "▶ 运行中…" : "▶ 运行"; }
+    // 运行时把输入框的提示改成"现在就该用它"，否则用户看到程序停着不动
+    // 会以为卡死了 —— input() 会一直等，界面上不会有任何输出。
+    var inp = $("stRunIn");
+    if (inp) {
+      inp.placeholder = on
+        ? "程序若在用 input()，就在这里输入后回车（会以 » 回显）"
+        : "程序里用 input() 时在这里输入后回车；也可以运行前先填好";
+    }
   }
 
   /* 运行 = **流式**（像终端一样边跑边出字），不是跑完才给结果。
      原来用 /api/ws/run 是同步的：计时器/服务器这类长任务就是"一直正在执行"，
      而且超时被强杀时那段时间打印的内容全丢（实测番茄钟跑满 25 秒 →
      界面显示"（没有输出）"）。见后端 ws_run_stream 的注释。 */
+
+  /* 标准输入：程序里 `input()` 读的就是这里。
+     后端是 GUI 启动的、**没有终端** —— 运行的进程不接管道时，一句 input() 直接
+     `EOFError: EOF when reading a line`（实测），用户点运行只看到一个报错，
+     程序根本跑不起来。现在进程的 stdin 接成了管道，这里输入什么就喂什么。 */
+  async function sendRunInput() {
+    var box = $("stRunIn");
+    if (!box) return;
+    var v = box.value;
+    if (!v) return;
+    try {
+      var r = await fetch("/api/ws/run_input", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: runId, data: v })
+      });
+      var d = {};
+      try { d = await r.json(); } catch (e) {}
+      if (!r.ok || d.ok === false) {
+        toast("送不进去：" + ((d && d.error) || ("HTTP " + r.status)));
+        return;
+      }
+      // 程序自己不会把输入回显出来（不像终端），这里补一行，
+      // 用户才看得到"我送出去的是什么"。加 `» ` 前缀区分"这是我们回显的"。
+      var out = $("stOutBody");
+      if (out) { out.textContent += "» " + v + "\n"; out.scrollTop = out.scrollHeight; }
+      box.value = "";
+    } catch (e) { toast("送不进去：" + e.message); }
+  }
+
   async function runCur() {
     if (runId) { toast("已经有一个在跑了，先点「■ 停止」"); return; }
     if (!cur) { toast("先打开一个文件"); return; }
@@ -639,9 +676,13 @@
         method: "POST", headers: { "Content-Type": "application/json" },
         // 带上命令行参数：argparse 这类工具不给参数就什么都不做，
         // 界面会显示"跑完了但没有输出"，用户会以为程序坏了。
+        // stdin：运行前在「输入」框里填的内容作为**预置输入**先喂进去，
+        // 一行对应一次 input()。发送后清空输入框 —— 那批内容已经送出去了。
         body: JSON.stringify({ rel: cur, id: runId,
-                               args: (($("stRunArgs") || {}).value || "") })
+                               args: (($("stRunArgs") || {}).value || ""),
+                               stdin: (($("stRunIn") || {}).value || "") })
       });
+      if (($("stRunIn") || {}).value) $("stRunIn").value = "";
       if (!resp.ok) throw new Error("HTTP " + resp.status);
       var reader = resp.body.getReader();
       var dec = new TextDecoder();
@@ -1224,6 +1265,10 @@
     if ($("stIdeFolder")) $("stIdeFolder").onclick = openFolder;
     $("stFolder").onclick = openFolder;
     $("stRunStop").onclick = stopRun;
+    if ($("stRunInSend")) $("stRunInSend").onclick = sendRunInput;
+    if ($("stRunIn")) $("stRunIn").addEventListener("keydown", function (e) {
+      if (e.key === "Enter") { e.preventDefault(); sendRunInput(); }
+    });
     $("stDebug").onclick = debugCur;
     $("stOutFix").onclick = function () {
       var body = ($("stOutBody").textContent || "").trim();

@@ -478,7 +478,8 @@ def norm_upload_name(filename: str) -> str:
 _RUNS = {}          # run_id -> Popen
 
 
-def start_run(rel: str, proj: str = "", run_id: str = "", args: str = "") -> dict:
+def start_run(rel: str, proj: str = "", run_id: str = "",
+              args: str = "", stdin_text: str = "") -> dict:
     """启动工作区里的 .py，返回 Popen —— 输出由调用方边读边推给前端。
 
     与 `tools.run_file` 的分工：
@@ -508,6 +509,16 @@ def start_run(rel: str, proj: str = "", run_id: str = "", args: str = "") -> dic
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["PYTHONUNBUFFERED"] = "1"          # ⚠️ 关键：不加这个子进程会缓冲，看不到实时输出
     env.pop("MM_DATA_DIR", None)
+    # 让**子目录里的脚本也能 import 项目根的模块**。
+    # Python 默认把 sys.path[0] 设成**脚本所在目录**，所以 `pkg/run.py` 里写
+    # `import utils`（utils.py 在项目根）会 ModuleNotFoundError ——
+    # 而 AI 生成的项目恰好常这么摆（工具放根目录、脚本放子目录）。实测踩过。
+    try:
+        _proj_root = root(str(proj or "").strip() or active_project())
+        _old_pp = env.get("PYTHONPATH") or ""
+        env["PYTHONPATH"] = _proj_root + (os.pathsep + _old_pp if _old_pp else "")
+    except Exception:
+        pass
     try:
         # 命令行参数：像 argparse / 需要位置参数的工具，**不给参数就是什么都不做**
         # （实测用户点运行一个 argparse 脚本，界面显示"跑完了但没有输出"，以为坏了）。
@@ -523,12 +534,49 @@ def start_run(rel: str, proj: str = "", run_id: str = "", args: str = "") -> dic
             # -u 同样是为了**关掉子进程缓冲**，否则 print 会攒成一块再吐
             [sys.executable, "-X", "utf8", "-u", os.path.basename(p)] + extra,
             cwd=os.path.dirname(p) or ".", env=env,
+            # ⚠️ stdin 必须接到管道：后端是 GUI 启动的、**没有终端可读**，
+            # 不接管道的话程序里一句 `input()` 直接
+            # `EOFError: EOF when reading a line`，用户点运行只能看到报错。
+            # 接成管道后，程序会**等**在那里，用户在界面上输入什么就喂什么。
+            stdin=_sp.PIPE,
             stdout=_sp.PIPE, stderr=_sp.STDOUT,
             text=True, encoding="utf-8", errors="replace", bufsize=1)
     except Exception as e:
         return {"ok": False, "error": "启动失败：%s" % e}
+    # 可选：运行前先喂一批输入（多行文本，每行对应一次 input()）
+    if str(stdin_text or ""):
+        try:
+            _t = str(stdin_text).replace("\r\n", "\n")
+            proc.stdin.write(_t if _t.endswith("\n") else _t + "\n")
+            proc.stdin.flush()
+        except Exception:
+            pass      # 喂不进去不影响启动，用户还可以在运行中输入
     _RUNS[run_id] = proc
     return {"ok": True, "proc": proc, "rel": safe_rel(rel), "risky": risky}
+
+
+def send_run_input(run_id: str, data: str) -> dict:
+    """往**正在运行的脚本**的 stdin 送一行 —— 程序里用 `input()` 时靠它。
+
+    为什么必须有：这个后端是 GUI 启动的，**没有终端**。运行的进程不接管道时，
+    一句 `input()` 会直接 `EOFError: EOF when reading a line`（实测），
+    用户点运行只会看到一个报错，程序根本跑不起来。
+    接上管道后程序会**等**在那里，界面里输入什么就喂什么。
+    """
+    proc = _RUNS.get(run_id)
+    if proc is None:
+        return {"ok": False, "error": "没有正在运行的进程（可能已经结束了）"}
+    if getattr(proc, "stdin", None) is None:
+        return {"ok": False, "error": "这个进程没有可写的输入通道"}
+    if proc.poll() is not None:
+        return {"ok": False, "error": "程序已经结束了"}
+    try:
+        s = str(data)
+        proc.stdin.write(s if s.endswith("\n") else s + "\n")
+        proc.stdin.flush()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": "输入送不进去：%s" % e}
 
 
 def stop_run(run_id: str = "") -> dict:
@@ -1043,8 +1091,20 @@ def start_code_server(proj: str = "") -> dict:
     # 监听地址：源码模式绑回环就够（只有本机能连）；容器里得绑 0.0.0.0，
     # 再由 `docker run -p 127.0.0.1:8810:8810` 只映射到宿主回环 —— 两头都不对外。
     bind = str(env.get("MM_CODE_BIND") or "127.0.0.1").strip() or "127.0.0.1"
+    # `--locale zh-cn`：**这是锁定中文的正路**。
+    # code-server 的 CLI 本身就有这个选项（cli.js 里的 `locale`），会把显示语言
+    # 一并传给 workbench；比往 argv.json 里塞 `locale` 可靠 ——
+    # argv.json 的位置跟着 user-data-dir 走，猜错了就静默失效，最难查。
+    # 前提是装了语言包扩展（MS-CEINTL.vscode-language-pack-zh-hans），否则它只能
+    # 影响登录页之类的静态文案，界面仍是英文。
+    # 用环境变量 MM_CODE_LOCALE 可以覆盖（默认 zh-cn，给了空串就用英文）。
+    _loc = env.get("MM_CODE_LOCALE")
+    _loc = "zh-cn" if _loc is None else str(_loc).strip()
     args = [exe, "--bind-addr", "%s:%d" % (bind, port), "--auth", "none",
-            "--disable-telemetry", "--disable-update-check", d]
+            "--disable-telemetry", "--disable-update-check"]
+    if _loc:
+        args += ["--locale", _loc]
+    args += [d]
     try:
         if exe.endswith(".cmd"):
             proc = _sp.Popen(args, cwd=d, env=env, shell=False,
