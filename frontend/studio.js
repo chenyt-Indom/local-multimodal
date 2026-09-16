@@ -198,6 +198,17 @@
       await refresh();
       await loadChanges();
       toast("已切到项目：" + project);
+      // ⚠️ **PyCharm 不会跟着换项目**（它是独立桌面程序，我们只能"为某个目录打开它"，
+      // 换不了它当前开着的项目）。这里的当前项目一换，AI 的读写就都在新项目里，
+      // 而用户眼前的 PyCharm 还停在上一个 —— 会以为"AI 把文件弄丢了 / 怎么报文件不存在"。
+      // 实测就踩过：模型读到"文件不存在"，于是干脆不改了。
+      // 所以换完项目必须提醒一句，把"两边对不上"这件事说破。
+      toast("别忘了点「🧠 " + (ideInfo.name || "PyCharm") + "」让 " +
+            (ideInfo.name || "PyCharm") + " 也切到这个项目", "warn");
+      setTimeout(function () {
+        toast("提示：AI 读写的是本项目（" + project + "），" +
+              (ideInfo.name || "PyCharm") + " 需要你点一下按钮才会跟着切", "warn");
+      }, 1600);
     } catch (e) { toast("切换失败：" + e.message); }
   }
 
