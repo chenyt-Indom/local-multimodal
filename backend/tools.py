@@ -646,6 +646,21 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
         return _do_workspace_write(arguments, ui_events)
     if name == "workspace_run":
         return _do_workspace_run(arguments, ui_events)
+    # ---- 下面这组是"完全自动开发项目"必需的：建项目 / 建目录 / 删 / 移动 / 切项目 ----
+    # 这些能力 workspace 模块**早就有了**（create_project / mkdir / remove / rename），
+    # 只是以前没交给模型 —— 所以它只能改已有文件，没法从零把项目搭起来。
+    if name == "workspace_new_project":
+        return _do_workspace_new_project(arguments, ui_events)
+    if name == "workspace_projects":
+        return _do_workspace_projects()
+    if name == "workspace_use_project":
+        return _do_workspace_use_project(arguments, ui_events)
+    if name == "workspace_mkdir":
+        return _do_workspace_mkdir(arguments, ui_events)
+    if name == "workspace_delete":
+        return _do_workspace_delete(arguments, ui_events)
+    if name == "workspace_move":
+        return _do_workspace_move(arguments, ui_events)
     if name == "web_read":
         return _do_web_read(arguments)
     if name == "github_push":
@@ -1587,6 +1602,100 @@ def _do_workspace_run(arguments, ui_events=None) -> str:
                           "risky": r.get("risky") or []})
     head = "【运行 %s】\n" % rel
     return head + _format_py_result(r)
+
+
+# ---------------------------------------------------------------- 项目管理
+# 「完全自动开发项目」必需的一组工具：建项目 / 列项目 / 切项目 / 建目录 / 删 / 移动。
+# 底层能力 workspace 模块早就有（create_project / mkdir / remove / rename），
+# 以前只是没交给模型 —— 结果它只能改已有文件，**没法从零把项目搭起来**。
+# 有了这组，用户一句话就能让它自建项目、铺目录、写文件、跑、报错自己修。
+
+def _do_workspace_projects() -> str:
+    from . import workspace as _ws
+    ps = _ws.projects()
+    if not ps:
+        return "现在一个项目都没有。可以直接用 workspace_new_project 建一个。"
+    cur = _ws.active_project()
+    lines = ["【开发工作区里的项目】（· 标记的是当前项目）"]
+    for p in ps:
+        mark = "· " if p.get("name") == cur else "  "
+        lines.append("%s%s（%d 个文件）" % (mark, p.get("name"), p.get("files", 0)))
+    return "\n".join(lines)
+
+
+def _do_workspace_new_project(arguments, ui_events=None) -> str:
+    from . import workspace as _ws
+    name = str((arguments or {}).get("name") or "").strip()
+    if not name:
+        return "建项目失败：要给一个项目名（如 todo-app）。"
+    r = _ws.create_project(name)
+    if not r.get("ok"):
+        return "建项目失败：%s" % r.get("error")
+    real = r.get("name") or name
+    _ws.set_active_project(real)          # 建完就切过去，后续文件都写进新项目
+    if isinstance(ui_events, list):
+        ui_events.append({"type": "workspace", "act": "project",
+                          "project": real})
+    return ("已新建项目「%s」并切入。接下来用 workspace_write 往里写文件"
+            "（路径是**相对项目根**的，例如 main.py、src/util.py；"
+            "父目录会自动创建，不用单独建目录）。" % real)
+
+
+def _do_workspace_use_project(arguments, ui_events=None) -> str:
+    from . import workspace as _ws
+    name = str((arguments or {}).get("name") or "").strip()
+    try:
+        real = _ws.set_active_project(name)
+    except Exception as e:
+        return "切项目失败：%s" % e
+    if isinstance(ui_events, list):
+        ui_events.append({"type": "workspace", "act": "project", "project": real})
+    return "已切到项目「%s」。之后的相对路径都相对于它。" % real
+
+
+def _do_workspace_mkdir(arguments, ui_events=None) -> str:
+    from . import workspace as _ws
+    rel = str((arguments or {}).get("rel") or "").strip()
+    try:
+        r = _ws.mkdir(rel)
+    except ValueError as e:
+        return "建目录失败：%s" % e
+    if not r.get("ok"):
+        return "建目录失败：%s" % r.get("error")
+    if isinstance(ui_events, list):
+        ui_events.append({"type": "workspace", "act": "mkdir", "rel": r.get("rel")})
+    return "已新建目录：%s" % r.get("rel")
+
+
+def _do_workspace_delete(arguments, ui_events=None) -> str:
+    from . import workspace as _ws
+    rel = str((arguments or {}).get("rel") or "").strip()
+    try:
+        r = _ws.remove(rel)
+    except ValueError as e:
+        return "删除失败：%s" % e
+    if not r.get("ok"):
+        return "删除失败：%s" % r.get("error")
+    if isinstance(ui_events, list):
+        ui_events.append({"type": "workspace", "act": "delete", "rel": rel})
+    return "已删除 %s（进了 _回收站，需要时能捞回来）" % rel
+
+
+def _do_workspace_move(arguments, ui_events=None) -> str:
+    from . import workspace as _ws
+    a = arguments or {}
+    rel = str(a.get("rel") or "").strip()
+    to = str(a.get("to") or a.get("new") or "").strip()
+    try:
+        r = _ws.rename(rel, to)
+    except ValueError as e:
+        return "移动失败：%s" % e
+    if not r.get("ok"):
+        return "移动失败：%s" % r.get("error")
+    if isinstance(ui_events, list):
+        ui_events.append({"type": "workspace", "act": "move",
+                          "rel": rel, "to": r.get("rel")})
+    return "已把 %s 移到 %s" % (rel, r.get("rel"))
 
 
 def _do_web_read(arguments) -> str:

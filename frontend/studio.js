@@ -985,6 +985,14 @@
     //    内容在我们这边是**边生成边落盘**的，VS Code 看到文件在变就会自己刷出来。
     if (ev.type === "typing") { showTyping(ev); return; }
     if (ev.type !== "workspace") return;
+    // AI 自己建了项目 / 换了项目 → 项目下拉框和文件树都得跟着换，
+    // 否则它明明在写另一个项目，界面上还停在上一个（看起来就像"没生效"）。
+    if (ev.act === "project") {
+      project = ev.project || project;
+      loadProjects().then(function () { refresh(); loadChanges(); });
+      toast("AI 切到了项目：" + (ev.project || ""));
+      return;
+    }
     if (ev.act === "write") {
       // 写完了 → 把那个文件切到用户眼前（开发台开着的话），并刷新"AI 改动"列表。
       if (opened) {

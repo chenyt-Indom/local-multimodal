@@ -129,6 +129,12 @@ WEB_MAX_TOKENS = 8192
 # 而且这一轮已经把用不到的工具 schema 砍掉了，腾出的空间正好给它。
 WRITING_MAX_TOKENS = 12288
 
+# 「写代码 / 做项目」这一轮的输出上限。
+# 实测踩过：用默认额度（2048）让模型写一个完整文件时，输出**中途被截断** ——
+# 生成出来的 todo.py 停在 `print(f'{index}. {task[`，一跑就 SyntaxError。
+# 写整份代码文件 + 工具调用 JSON 的开销，比普通问答大得多，必须单独给足。
+CODE_MAX_TOKENS = 8192
+
 # 输出长度天花板：空回答重试时加倍，但不能无限涨
 # （上下文窗口还要留给提示词与历史，超出只会让 Ollama 截断提示词）
 MAX_TOKENS_CEILING = 16384
@@ -1255,6 +1261,18 @@ _TEXT_TOOL_DOCS = {
                        '**要给整份内容**。参数 {"rel": "相对路径", "text": "完整内容"}',
     "workspace_run": '运行工作区里的一个 .py，拿到真实输出与报错（工作目录=文件所在目录）。'
                      '参数 {"rel": "相对路径，如 app.py"}',
+    # ---- 「完全自动开发项目」必需：从零建项目、铺结构、改名、清理 ----
+    # 只有 write/read/run 的话，模型只能改**已有**文件，没法把项目搭起来。
+    "workspace_new_project": '新建一个开发项目并立刻切进去，之后都用相对路径。'
+                             '**从零开始做东西时第一步就调它。**'
+                             '参数 {"name": "项目名，如 todo-app"}',
+    "workspace_projects": '列出所有项目（· 是当前项目）。不确定现在在哪个项目里就先调它。参数 {}',
+    "workspace_use_project": '切换到另一个已有项目。参数 {"name": "项目名"}',
+    "workspace_mkdir": '新建一个空目录（注意：写文件时父目录会自动建，'
+                       '只有**要空目录**时才需要它）。参数 {"rel": "相对路径，如 assets"}',
+    "workspace_delete": '删除项目里的文件或目录（进 _回收站，可捞回）。'
+                        '参数 {"rel": "相对路径"}',
+    "workspace_move": '重命名或移动文件/目录。参数 {"rel": "原路径", "to": "新路径"}',
     # 编程时同样用得上：查新用法 / 查资料 / 生图当素材 / 拿当前时间
     "web_search": '联网搜索最新资料（库的新用法、报错原因、版本差异…）。'
                   '参数 {"query": "搜索词"}',
@@ -2000,6 +2018,10 @@ async def chat(req: ChatRequest):
                                       cfg.get("code_exec_enabled", False),
                                       writing=writing_mode)
     if code_model_on:
+        # 代码轮给足输出额度：要写整份文件 + 工具调用 JSON，
+        # 用普通问答的 2048 会让文件**写一半被截断**（见 CODE_MAX_TOKENS 的说明）。
+        cfg["max_tokens"] = max(int(cfg.get("max_tokens") or 2048), CODE_MAX_TOKENS)
+    if code_model_on:
         # ⚠️ 专用代码模型（qwen2.5-coder）**不支持 Ollama 的原生工具调用通道**。
         # 实测（2026-09-15，同一句「写个合并有序列表的函数并运行验证」）：
         #   · 带 tools：31.5 秒，**没有 tool_calls**，把调用当 JSON 文本写进正文 ——
@@ -2073,6 +2095,21 @@ async def chat(req: ChatRequest):
                     "用户可以在界面上切换项目，切过来就是另一套完全独立的文件）。\n\n"
                     "本轮可用工具：\n" % workspace.active_project()
                     + _tt_docs + "\n\n"
+                    # 「完全自动开发项目」的作业流程。不写这一段的话，模型就算
+                    # 手里有 workspace_new_project 也想不到要先建项目、
+                    # 更不会自己"跑→看报错→改→再跑"地把项目做完整。
+                    "【做一整个项目时，按这个顺序自动推进，**不要中途问用户**】\n"
+                    "0. 不确定现在在哪个项目里 → 先调 workspace_projects 看一眼。\n"
+                    "1. 从零做一个新东西 → **第一步调 workspace_new_project** 建项目并切进去。\n"
+                    "2. 铺结构：直接用 workspace_write 写文件即可，**父目录会自动创建**"
+                    "（要建**空目录**才用 workspace_mkdir）。一次一个文件，写整份内容。\n"
+                    "3. **写完就跑**：.py 用 workspace_run 真跑一遍看真实输出，不要靠猜。\n"
+                    "4. **报错就自己修**：照真实 traceback 改，改完**再跑**，"
+                    "直到跑通为止（最多来回 4 次）。缺依赖/缺数据也不要甩给用户 —— "
+                    "优先只改代码绕过去，或用标准库把样例数据造出来。\n"
+                    "5. 全部跑通后，再用一两句话总结：建了哪些文件、怎么运行、结果是什么。\n"
+                    "整个过程用户只需要说一次需求，**不要反复确认、不要问他细节** —— "
+                    "拿不准的地方就按最合理的做法做下去，并在总结里说明你的选择。\n\n"
                     "【硬性规则】\n"
                     "1. 想验证代码对不对，就**真的调用 run_python 跑一遍**看真实输出，"
                     "**绝对不要**凭空猜输出。\n"
@@ -2157,6 +2194,10 @@ async def chat(req: ChatRequest):
             code_emitted = 0        # 代码轮已经推给前端的正文长度（见 _safe_emit_len）
             # 边生成边落盘的进度（见 _partial_ws_write）：文件 / 已落盘字数 / 上次时刻
             _ws_rel, _ws_len, _ws_t = "", 0, 0.0
+            # 【完整性兜底】流式落盘只是"给编辑器看的预览"，**不是正式写入**。
+            # 这里记下每个被预览过的文件"原本长什么样"（None = 本来不存在），
+            # 好在一轮结束时把"没被正式写入"的残file撤掉 —— 见下面那段。
+            _streamed = {}
             tool_calls = None
             done_reason = ""
             # 注意：必须用 _stream_lines（子线程读 + 队列），
@@ -2214,6 +2255,19 @@ async def chat(req: ChatRequest):
                             # 太密会把磁盘和 VS Code 的文件监视器打爆；太疏就没有"打字"感。
                             if (_fresh or len(_partial) - _ws_len >= 60
                                     or _now - _ws_t >= 0.30):
+                                if _fresh and _rel not in _streamed:
+                                    # 第一次预览这个文件 → 先记下它原来的内容，
+                                    # 万一这轮没能正式写完，好把它还原回去
+                                    try:
+                                        _p = workspace.abs_path(_rel)
+                                        if os.path.exists(_p):
+                                            with open(_p, "r", encoding="utf-8",
+                                                      errors="replace") as _fh:
+                                                _streamed[_rel] = _fh.read()
+                                        else:
+                                            _streamed[_rel] = None
+                                    except Exception:
+                                        _streamed[_rel] = None
                                 try:
                                     workspace.stream_write(_rel, _partial)
                                 except Exception:
@@ -2379,6 +2433,43 @@ async def chat(req: ChatRequest):
             if text_protocol and text_results:
                 working.append({"role": "user",
                                 "content": "工具结果：\n" + "\n\n".join(text_results)})
+            # 2.5) 【完整性兜底】把"只被预览过、没被正式写入"的残file撤掉。
+            #
+            # 为什么必须有这一步：流式落盘是**边生成边写**的预览，模型输出一旦
+            # 被截断（或它压根没走 workspace_write 这个工具），磁盘上就只剩**半截文件**。
+            # 而界面上看起来"AI 正在写"，用户会以为成功了 ——
+            # 实测就踩到：生成出来的 todo.py 停在 `print(f'{index}. {task[`，
+            # 一跑就 SyntaxError。**半成品冒充成品，比"什么都没写"更糟。**
+            # 所以：新文件 → 删掉；老文件 → 还原成本轮之前的内容。
+            if _streamed:
+                try:
+                    _written = set()
+                    for _u in ui_events:
+                        if isinstance(_u, dict) and _u.get("act") == "write":
+                            _written.add(_u.get("rel"))
+                    # ⚠️ **只有"这一轮一次正式写入都没有"时才动手**。
+                    # 第一版是按"每个文件有没有被正式写"逐个判的，结果误伤：
+                    # 模型明明在这一轮正式写过文件，但下一轮又预览了别的文件，
+                    # 于是把上一轮写好的东西也一起撤了 —— 实测把一个刚建好的
+                    # 项目目录清空了。**宁可漏判，也不能删用户的文件。**
+                    _left = [] if _written else list(_streamed)
+                    for _r in _left:
+                        _p = workspace.abs_path(_r)
+                        _before = _streamed[_r]
+                        if _before is None:
+                            if os.path.exists(_p):
+                                os.remove(_p)
+                        else:
+                            with open(_p, "w", encoding="utf-8", newline="") as _fh:
+                                _fh.write(_before)
+                    if _left:
+                        yield json.dumps({
+                            "note": "模型这次没能把文件写完（输出被截断，或没走写文件工具），"
+                                    "已撤掉不完整的文件 %s —— 让它重试一次即可。"
+                                    % "、".join(_left)}) + "\n"
+                except Exception:
+                    logger.warning("撤掉残缺文件失败", exc_info=True)
+
             # 3) 把前端副作用事件透出
             for ui in ui_events:
                 yield json.dumps({"ui": ui}) + "\n"
