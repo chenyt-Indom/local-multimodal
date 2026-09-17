@@ -172,6 +172,21 @@
   // 一个站内下载链接 = **两个动作**：下载到电脑 + 在「生成文库」里定位它。
   // 为什么要有第二个：文件其实**已经**在库里了（模型写完就落盘），可用户从聊天里
   // 只看到"下载"，感受上就是"没存进文件库"。给一个直接跳到它的入口才说得通。
+  // 把模型写的站内链接归一化成**已经编码好**的 path+query。
+  // ⚠️ 模型经常把文件名原样写成中文（`rel=我的照片展示.pptx`），
+  //    直接拿去请求会失败（后端 http.client 发请求行时要按 ascii 编码，
+  //    报 `'ascii' codec can't encode characters in position 29-34` —— 实测踩到）。
+  //    交给浏览器解析一遍，它一定会给出编码正确的绝对地址。
+  function fixApiUrl(url) {
+    try {
+      const u = new URL(url, location.href);
+      if (u.origin !== location.origin) return url;   // 外链不动
+      return u.pathname + u.search;
+    } catch (e) {
+      return url;
+    }
+  }
+
   function dlGroup(label, url) {
     let rel = "";
     if (url.indexOf("/api/doclib/download") === 0) {
@@ -188,9 +203,9 @@
   function renderAnswerLinks(bubble, text) {
     const esc = escapeHtml(text);
     let html = esc.replace(/\[([^\]]{1,40})\]\((\/api\/[^\s)]+)\)/g,
-      (_, label, url) => dlGroup(label, url));
+      (_, label, url) => dlGroup(label, fixApiUrl(url)));
     html = html.replace(/(^|[\s（(])(\/api\/(?:doclib\/download|ws\/zip)[^\s<)）]*)/g,
-      (_, pre, url) => `${pre}${dlGroup("点击下载", url)}`);
+      (_, pre, url) => `${pre}${dlGroup("点击下载", fixApiUrl(url))}`);
     bubble.innerHTML = html.replace(/\n/g, "<br>");
   }
 
@@ -253,7 +268,7 @@
     // ② 下载按钮：桌面壳里走原生「另存为」（否则会被 WebView2 静默吞掉）
     const a = t.closest("a.dl-link");
     if (!a) return;
-    const url = a.getAttribute("href") || "";
+    const url = fixApiUrl(a.getAttribute("href") || a.href || "");
     if (url.indexOf("/api/") !== 0) return;
     const api = bridgeApi();
     if (!api || typeof api.save_file !== "function") return;   // 浏览器：默认下载
