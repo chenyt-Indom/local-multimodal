@@ -198,6 +198,9 @@ _MAP_PLAN_SCHEMA = {
             "· 用户说「离线也能看 / 下载地图」时给 offline:true —— 会把沿途瓦片下载到本地缓存。\n"
             "· 返回里有真实距离与用时，**照实念给用户，不要自己算**。"
             "⚠️ 这个工具**没有任何实时路况数据**，不要凭空说「避开拥堵」「当前畅通」这类话。"
+            "⚠️ 它**也没有公交/地铁线路数据** —— 不许编「坐 X 路公交、票价 Y 元、"
+            "每 Z 分钟一班」这种具体线路（实测模型真的会编）。"
+            "要提公共交通就只说一句「这段距离也可以考虑公共交通」，不给线路。"
             "地图卡片会自己显示，你只要用一两句话把结论说清楚。"
         ),
         "parameters": {
@@ -215,6 +218,48 @@ _MAP_PLAN_SCHEMA = {
                             "description": "true＝同时查出发地此刻与预计抵达时段的天气"},
             },
             "required": [],
+        },
+    },
+}
+
+
+_NEARBY_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "nearby_places",
+        "description": (
+            "【地图】查某个地点**周围**有哪些场所（按半径+类别），并在图上标出来。\n"
+            "用户说「附近有什么吃的 / 这周围有没有便利店 / 附近哪能买药 / "
+            "找一下附近的银行」这类**周边搜索**时用它。\n"
+            "· 和 map_plan 的分工：map_plan 是「我要去某地，怎么走」；"
+            "nearby_places 是「这一带有什么」。\n"
+            "· 参数 {\"place\": \"汕头大学\", \"category\": \"餐厅\", \"radius\": 1500}；"
+            "place 也接受 \"23.35,116.68\" 这种坐标。\n"
+            "· category 用中文日常说法即可：餐厅 / 咖啡馆 / 便利店 / 超市 / 药店 / "
+            "医院 / 银行 / 加油站 / 停车场 / 酒店 / 学校 / 公交站 / 公园 / 厕所…\n"
+            "· radius 单位米，默认 1500，最大 20000。\n"
+            "⚠️⚠️ 结果里的 score 是**资料完整度**，**不是用户评分** —— "
+            "OpenStreetMap 根本没有评分/星级/评论数据。"
+            "**绝不能把它说成「评分」或「口碑」，也绝不能自己编星级和评价**。"
+            "要如实解释：分高＝这条记录信息全（有地址/电话/营业时间），"
+            "分低＝资料很少，可能是小摊也可能已歇业，去之前建议先确认。\n"
+            "⚠️ 中国的小微店铺在 OSM 上覆盖很稀疏，**查不到不等于没有**；"
+            "如实说明，并建议换类别词或扩大半径再试。\n"
+            "⚠️ **只准转述返回里确实有的字段**（名字/距离/地址/电话/营业时间/完整度），"
+            "**不要补数据里没有的东西** —— 实测模型会顺口加「校内主干道旁」"
+            "「校门对面」这类位置描述和「学生常去」这类评价，那全是编的。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "place": {"type": "string",
+                          "description": "中心地点名（中文即可），或 \"纬度,经度\""},
+                "category": {"type": "string",
+                             "description": "要找什么：餐厅/便利店/药店/银行…"},
+                "radius": {"type": "integer", "description": "半径（米），默认 1500"},
+                "limit": {"type": "integer", "description": "最多返回几个，默认 20"},
+            },
+            "required": ["place", "category"],
         },
     },
 }
@@ -855,6 +900,7 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
     schemas.append(_MAKE_DOCX_SCHEMA)
     schemas.append(_MAKE_XLSX_SCHEMA)
     schemas.append(_MAP_PLAN_SCHEMA)
+    schemas.append(_NEARBY_SCHEMA)
     schemas.append(_EDIT_OFFICE_SCHEMA)
     # ⚠️ `write_code`（让专用代码模型代写代码）**暂时不启用** ——
     # 用户 2026-09-16 试过之后要求换回"按轮切换代码模型"的架构。
@@ -1194,6 +1240,8 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
         return _do_make_xlsx(arguments, ui_events)
     if name == "map_plan":
         return _do_map_plan(arguments, ui_events)
+    if name == "nearby_places":
+        return _do_nearby_places(arguments, ui_events)
     if name == "edit_office":
         return _do_edit_office(arguments, ui_events)
     if name == "web_read":
@@ -2674,7 +2722,7 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
                      % (one["name"], one.get("addr") or "—", one["lat"], one["lon"],
                         ("  〔%s〕" % src.strip()) if src.strip() else ""))
 
-    rinfo, approx = None, None
+    rinfo, approx, mode_cmp = None, None, None
     if route and route.get("from") and route.get("to"):
         r = _mt.plan_route(str(route.get("from")), str(route.get("to")),
                            str(route.get("mode") or "driving"), allow_net=net,
@@ -2712,6 +2760,29 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
                                 _mt.fmt_duration(r["duration_s"]), mode_cn, tail))
             if r.get("estimated") and r.get("note"):
                 lines.append("    ⚠️ %s" % r["note"])
+
+            # 出行方式对比：用户选的不一定最合适（800 米也要开车、20 公里想走路）。
+            # 复用同一套路网数据，三种都算一遍再比 —— 只有真数据才敢给建议。
+            try:
+                mode_cmp = _mt.compare_modes(str(route.get("from")),
+                                             str(route.get("to")), allow_net=net)
+            except Exception:
+                mode_cmp = None
+            if mode_cmp and mode_cmp.get("ok"):
+                for k, v in (mode_cmp.get("modes") or {}).items():
+                    lines.append("    · %s：%s，约 %s"
+                                 % (_mt._MODE_CN.get(k, k),
+                                    _mt.fmt_distance(v["distance_m"]),
+                                    _mt.fmt_duration(v["duration_s"])))
+                if mode_cmp.get("suggest") != r.get("mode"):
+                    lines.append("    **出行方式建议**：这段路其实 %s 更合适 —— %s"
+                                 % (mode_cmp["suggest_cn"], mode_cmp["suggest_reason"]))
+                elif mode_cmp.get("suggest_reason"):
+                    lines.append("    **你选的这个方式就是合适的**：%s"
+                                 % mode_cmp["suggest_reason"])
+                if mode_cmp.get("note"):
+                    lines.append("    （%s）" % mode_cmp["note"])
+
             w = r.get("weather") or {}
             fw = (w.get("from") or {}).get("now") or {}
             aw = (w.get("to") or {}).get("arrival") or {}
@@ -2798,6 +2869,14 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
                                     "to_name": ((rinfo.get("weather") or {}).get("to") or {}).get("name") or "",
                                     "to_arrival": ((rinfo.get("weather") or {}).get("to") or {}).get("arrival") or {}}
                                    if rinfo.get("weather") else None),
+                       "modes": [{"mode": _mt._MODE_CN.get(k, k),
+                                  "distance": _mt.fmt_distance(v["distance_m"]),
+                                  "duration": _mt.fmt_duration(v["duration_s"]),
+                                  "estimated": bool(v.get("estimated")),
+                                  "suggest": (k == (mode_cmp or {}).get("suggest"))}
+                                 for k, v in ((mode_cmp or {}).get("modes") or {}).items()]
+                                if (mode_cmp and mode_cmp.get("ok")) else [],
+                       "suggest_reason": (mode_cmp or {}).get("suggest_reason") or "",
                        "straight": False} if rinfo else
                       ({"points": [], "straight": True,
                         "distance": _mt.fmt_distance(approx["distance_m"]),
@@ -2806,9 +2885,119 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
                         "mode": mode_cn} if approx else None)),
         })
 
-    head = ("地图结果（%s；卡片会自动显示给用户，你只要把结论说清楚）："
+    head = ("地图结果（%s；卡片会自动显示给用户，你只要把结论说清楚）：\n"
+            "⚠️ 只能基于上面的数据说话。三种出行方式的对比数据都有，"
+            "但**我们没有任何公交/地铁线路数据** —— "
+            "不许编「坐 X 路公交 / 票价 Y 元 / 每 Z 分钟一班」这种具体线路信息，"
+            "最多说一句「这段距离也可以考虑公共交通」。"
             % _mt.mode_text())
     return head + "\n" + "\n".join(lines) + offline_note
+
+
+def _do_nearby_places(arguments=None, ui_events=None) -> str:
+    """查某个地点**周围**的场所，推给前端画成「场所清单 + 地图」。
+
+    ⚠️ 结果里的 score 是**资料完整度**，不是用户评分 ——
+       OSM 根本没有评分/评论数据。输出里必须坚持叫「资料完整度」，
+       免得模型顺手说成「评分 85 分」，那就是在编。
+    """
+    from . import map_tools as _mt
+
+    a = arguments or {}
+    place = str(a.get("place") or a.get("地点") or a.get("center") or "").strip()
+    category = str(a.get("category") or a.get("类别") or a.get("what") or "").strip()
+    if not place:
+        return '错误：缺少 place（中心地点），比如 "汕头大学" 或 "23.35,116.68"。'
+    if not category:
+        return '错误：缺少 category（要找什么），比如 "餐厅" "便利店" "药店"。'
+    try:
+        radius = int(a.get("radius") or a.get("半径") or 1500)
+    except (TypeError, ValueError):
+        radius = 1500
+    try:
+        limit = int(a.get("limit") or 20)
+    except (TypeError, ValueError):
+        limit = 20
+
+    net = _mt.online()
+    c = _mt.geocode_one(place, allow_net=net)
+    if not c:
+        hint = ("现在是离线模式，本地没有这个地点的记录；打开「联网」开关就能查。"
+                if not net else "换个更完整的名字试试（比如加上城市名）")
+        return "没找到中心地点「%s」—— %s" % (place, hint)
+
+    r = _mt.nearby(c["lat"], c["lon"], category, radius=radius, limit=limit,
+                   allow_net=net)
+    if not r.get("ok"):
+        return "周边查询失败：%s" % (r.get("error"))
+
+    items = r.get("items") or []
+    rad = r.get("radius")
+    head = ("周边搜索（要找：%s；中心：%s；半径 %d 米）"
+            % (r.get("category"), c["name"], rad))
+    if not items:
+        return (head + "\n· 这一类在 %d 米内**一个都没查到**。\n"
+                "  ⚠️ OpenStreetMap 是志愿者测绘，中国的小微店铺覆盖很稀疏，"
+                "「查不到」不等于「没有」。可以换个说法、或把 radius 调大再试。" % rad)
+
+    lines = []
+    for it in items[:limit]:
+        nm = it["name"] or "（这个点没有名字）"
+        lines.append("· **%s** —— 距离 %s" % (nm, _mt.fmt_distance(it["dist_m"])))
+        extra = []
+        if it.get("addr"):
+            extra.append("地址：" + it["addr"])
+        if it.get("phone"):
+            extra.append("电话：" + it["phone"])
+        if it.get("hours"):
+            extra.append("营业时间：" + it["hours"])
+        if it.get("website"):
+            extra.append("官网：" + it["website"])
+        if extra:
+            lines.append("  " + "；".join(extra))
+        lines.append("  资料完整度 %d/100（%s）—— %s"
+                     % (it["score"], it["score_why"], it["score_note"]))
+
+    tail = ("\n⚠️ 上面那个数字是**资料完整度**（这条记录有多少可用信息），"
+            "**不是用户评分、不是口碑、不是星级** —— OpenStreetMap 没有评分和评论数据。"
+            "不许把它说成「评分 85 分」这种话，也不许自己编评价。\n"
+            "⚠️ **只准转述返回里确实有的信息**（名字、距离、地址、电话、营业时间、完整度）。"
+            "不要补数据里没有的东西 —— 实测模型会顺口加上「校内主干道旁」「校门对面」"
+            "这类位置描述和「学生常去」这类评价，那都是编的。\n"
+            "· 数据来自 OpenStreetMap（志愿者测绘），中国的小微店铺覆盖稀疏，"
+            "「没查到」不等于「没有」。\n"
+            "· 用户问「靠不靠谱」时：就说资料完整度高低代表什么，"
+            "以及低分的先去确认，**不要编造卫生、口味、服务之类的评价**。")
+
+    if isinstance(ui_events, list):
+        ui_events.append({
+            "type": "map",
+            "online": net,
+            "center": [c["lat"], c["lon"]],
+            "zoom": 15 if rad <= 1200 else 14 if rad <= 3000 else 13 if rad <= 8000 else 12,
+            "markers": [{"name": c["name"], "lat": c["lat"], "lon": c["lon"],
+                         "addr": "", "role": "center"}] +
+                       [{"name": m["name"] or "（无名）", "lat": m["lat"], "lon": m["lon"],
+                         "addr": m.get("addr") or "",
+                         "dist": _mt.fmt_distance(m["dist_m"]),
+                         "score": m["score"]} for m in items[:limit]],
+            "route": None,
+            "nearby": {
+                "category": r.get("category"),
+                "center_name": c["name"],
+                "radius": rad,
+                "total": r.get("total"),
+                "items": [{"name": m["name"] or "（无名）", "lat": m["lat"], "lon": m["lon"],
+                           "dist": _mt.fmt_distance(m["dist_m"]),
+                           "addr": m.get("addr") or "",
+                           "phone": m.get("phone") or "",
+                           "hours": m.get("hours") or "",
+                           "score": m["score"], "why": m["score_why"],
+                           "note": m["score_note"]} for m in items[:limit]],
+            },
+        })
+
+    return head + "\n" + "\n".join(lines) + tail
 
 
 def _do_edit_office(arguments=None, ui_events=None) -> str:

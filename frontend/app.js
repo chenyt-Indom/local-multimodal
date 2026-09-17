@@ -276,6 +276,11 @@
       if (rt.estimated) {
         html += `<span class="map-warn">时间为估算</span>`;
       }
+    } else if (ui.nearby && (ui.nearby.items || []).length) {
+      // 周边搜索：信息栏要说清"找的是什么、几家"，别只说"N 个地点"
+      html += ` <b>${escapeHtml(ui.nearby.center_name || "")}</b> 周边 ` +
+        `${ui.nearby.radius} 米内的${escapeHtml(ui.nearby.category || "")}` +
+        `（${ui.nearby.total} 家）`;
     } else if ((ui.markers || []).length) {
       html += ` <b>${escapeHtml(ui.markers[0].name || "")}</b>` +
         ((ui.markers || []).length > 1 ? ` 等 ${ui.markers.length} 个地点` : "");
@@ -298,6 +303,39 @@
     }
     if (rt && rt.note) {
       html += `<div class="map-note">${escapeHtml(rt.note)}</div>`;
+    }
+    // 出行方式对比（后端用同一套路网算出来的真实数据）
+    if (rt && (rt.modes || []).length) {
+      const chips = rt.modes.map(function (m) {
+        return `<span class="mode-chip${m.suggest ? " on" : ""}">` +
+          `${escapeHtml(m.mode)} ${escapeHtml(m.distance)} · ${escapeHtml(m.duration)}` +
+          (m.estimated ? "（估算）" : "") + `</span>`;
+      }).join("");
+      html += `<div class="map-modes">${chips}` +
+        (rt.suggest_reason
+          ? `<div class="map-note">建议：${escapeHtml(rt.suggest_reason)}</div>` : "") +
+        `</div>`;
+    }
+    // 周边场所清单
+    const nb = ui.nearby || null;
+    if (nb && (nb.items || []).length) {
+      const rows = nb.items.map(function (it) {
+        const extra = [];
+        if (it.addr) extra.push(escapeHtml(it.addr));
+        if (it.phone) extra.push("电话 " + escapeHtml(it.phone));
+        if (it.hours) extra.push("营业 " + escapeHtml(it.hours));
+        const lv = it.score >= 60 ? "hi" : (it.score >= 40 ? "mid" : "lo");
+        return `<li><b>${escapeHtml(it.name)}</b>` +
+          `<span class="nb-dist">${escapeHtml(it.dist)}</span>` +
+          `<span class="nb-score ${lv}">资料完整度 ${it.score}</span>` +
+          (extra.length ? `<div class="nb-extra">${extra.join("　·　")}</div>` : "") +
+          (it.note ? `<div class="nb-note">${escapeHtml(it.note)}</div>` : "") +
+          `</li>`;
+      }).join("");
+      html += `<div class="map-nearby">` +
+        `<div class="nb-head">${escapeHtml(nb.center_name || "")} 周边 ${nb.radius} 米内的` +
+        `${escapeHtml(nb.category || "")}（${nb.total} 家）` +
+        `<span class="nb-warn">完整度≠评分</span></div><ul>${rows}</ul></div>`;
     }
     info.innerHTML = html || "地图";
 

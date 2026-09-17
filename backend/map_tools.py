@@ -845,3 +845,249 @@ def static_map_hint(lat: float, lon: float, zoom: int = 13) -> str:
     """给一个不用 JS 也能看的入口（OSM 网页版）。"""
     return ("https://www.openstreetmap.org/?mlat=%.5f&mlon=%.5f#map=%d/%.5f/%.5f"
             % (lat, lon, zoom, lat, lon))
+
+
+# ---------------------------------------------------------------- 附近场所（Overpass）
+# ⚠️ 为什么不能用 Photon 做"附近"：Photon 是**按名字搜**的 ——
+#    搜「餐厅」它只会找**名字里带"餐厅"两个字**的店（实测返回的是几十上百公里外的
+#    "餐厅""XX餐厅"），根本给不出"这一带所有餐厅"。按类别+半径查 POI 得用 Overpass。
+# ⚠️ Overpass 会限流（实测连续几个请求就 HTTP 429），所以这里**必须缓存 + 节流**。
+OVERPASS = "https://overpass-api.de/api/interpreter"
+_NB_FILE = "nearby.json"
+_TTL_NEARBY = 7 * 86400
+
+# 类别关键词 → Overpass 标签。用户说什么词都能对上（中英文都收）
+_CAT_TAGS = [
+    (("餐厅", "吃饭", "吃的", "吃点", "下馆子", "饭店", "餐馆", "美食", "快餐",
+      "restaurant", "food"),
+     '["amenity"~"restaurant|fast_food|food_court"]'),
+    (("咖啡", "咖啡馆", "cafe", "coffee"), '["amenity"="cafe"]'),
+    (("便利", "小卖", "杂货", "便利店", "convenience"),
+     '["shop"~"convenience|grocery|general"]'),
+    (("超市", "supermarket", "商场", "mall"), '["shop"~"supermarket|mall|department_store"]'),
+    (("药店", "药房", "pharmacy"), '["amenity"="pharmacy"]'),
+    (("医院", "诊所", "卫生院", "hospital", "clinic"), '["amenity"~"hospital|clinic|doctors"]'),
+    (("银行", "bank"), '["amenity"="bank"]'),
+    (("取款", "atm", "取钱"), '["amenity"~"atm|bank"]'),
+    (("加油", "加油站", "fuel"), '["amenity"="fuel"]'),
+    (("充电", "充电桩", "charging"), '["amenity"="charging_station"]'),
+    (("停车", "停车场", "parking"), '["amenity"="parking"]'),
+    (("酒店", "宾馆", "旅馆", "住宿", "hotel"), '["tourism"~"hotel|hostel|guest_house|motel"]'),
+    (("学校", "大学", "学院", "school", "university"), '["amenity"~"school|university|college"]'),
+    (("公交", "巴士", "bus"), '["highway"="bus_stop"]'),
+    (("地铁", "subway", "metro"), '["railway"="station"]["station"~"subway"]'),
+    (("火车", "高铁", "车站", "railway"), '["railway"~"station|halt"]'),
+    (("厕所", "洗手间", "卫生间", "toilet"), '["amenity"="toilets"]'),
+    (("公园", "绿地", "park"), '["leisure"~"park|garden"]'),
+    (("菜市场", "市场", "market"), '["amenity"="marketplace"]'),
+    (("快递", "驿站", "邮局", "post"), '["amenity"~"post_office|post_depot"]'),
+    (("理发", "美发", "hair"), '["shop"~"hairdresser|beauty"]'),
+    (("五金", "建材", "hardware"), '["shop"~"hardware|doityourself"]'),
+    (("服装", "衣", "clothes"), '["shop"~"clothes|shoes"]'),
+    (("景点", "旅游", "attraction", "sight"), '["tourism"~"attraction|viewpoint|museum"]'),
+    (("医院", "clinic"), '["amenity"~"hospital|clinic"]'),
+]
+
+
+def _cat_tag(category: str) -> tuple:
+    """把用户说的类别翻译成 Overpass 标签。返回 (标签, 标准类别名) 或 (None, "")。"""
+    c = str(category or "").strip().lower()
+    if not c:
+        return None, ""
+    for keys, tag in _CAT_TAGS:
+        for k in keys:
+            if k in c:
+                return tag, keys[0]
+    return None, ""
+
+
+def _poi_score(t: dict) -> tuple:
+    """按"资料有多全"打分（0~100）+ 说清凭什么这么算。
+
+    ⚠️⚠️ 这**不是用户评分** —— OSM 里根本没有评分/星级/评论数据，谁都编不出来。
+    它衡量的是"这条记录有多少可用信息"：有电话、有网站、有营业时间的，
+    基本能确认是个在营的正规场所；只有名字和坐标的，可能是小摊小店、也可能早没了。
+    所以这个分数要给用户讲明白是**信息完整度**，不能让他误以为是口碑分。
+    """
+    s, hits = 0, []
+    if t.get("name"):
+        s += 20; hits.append("有店名")
+    if any(t.get(k) for k in ("addr:street", "addr:full", "addr:housenumber",
+                              "addr:city", "addr:district", "addr:province")):
+        s += 25; hits.append("有地址")
+    if t.get("phone") or t.get("contact:phone"):
+        s += 20; hits.append("有电话")
+    if t.get("website") or t.get("contact:website"):
+        s += 15; hits.append("有官网")
+    if t.get("opening_hours"):
+        s += 20; hits.append("有营业时间")
+    return min(s, 100), "、".join(hits) if hits else "只有坐标"
+
+
+def score_note(score: int) -> str:
+    """分数低要说清是什么原因，而不是丢个数字。"""
+    if score >= 60:
+        return "资料较全，通常是在营的正规场所"
+    if score >= 40:
+        return "资料一般，出发前建议先打个电话确认"
+    return "资料很少（基本只有名字和坐标），可能是小摊小店、也可能已经关了，去之前最好先确认"
+
+
+def _overpass(q: str):
+    """问 Overpass。
+
+    ⚠️ 两个必踩的坑：
+    1. **必须重试**。官方实例 `overpass-api.de` 负载很高，实测 504 Gateway Timeout
+       和 429 Too Many Requests 都很常见 —— 一次失败不代表"没有结果"。
+    2. headers 的值**必须是字符串**。上次传了个 dict，urllib 在 putheader 里抛
+       `TypeError: expected string or bytes-like object, got 'dict'`，
+       看着像网络故障，其实是自己写错，白白浪费一轮排查。
+
+    备选实例实测情况（别再试一遍了）：
+      · `overpass-api.de`            —— 唯一能出中国数据的，但经常 504/429
+      · `overpass.osm.ch`            —— 通，但是**瑞士区域实例**，只有瑞士数据
+      · `kumi.systems` / `mail.ru` / `private.coffee` —— 一律超时
+    所以这里只打官方实例，靠重试 + 缓存扛住。
+    """
+    body = urllib.parse.urlencode({"data": q}).encode()
+    last = None
+    for i in range(3):
+        try:
+            req = urllib.request.Request(OVERPASS, data=body, headers={
+                "User-Agent": _UA,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            })
+            with urllib.request.urlopen(req, timeout=45) as r:
+                return json.loads(r.read().decode("utf-8", "replace"))
+        except Exception as e:
+            last = e
+            time.sleep(1.5 * (i + 1))       # 504/429 大多歇一下就好
+    raise last
+
+
+def nearby(lat: float, lon: float, category: str, radius: int = 1500,
+           limit: int = 20, allow_net=None) -> dict:
+    """查某个坐标周围指定类别的场所（按距离排序）。
+
+    返回 {"ok","items":[{name,lat,lon,dist_m,kind,addr,phone,website,hours,
+                        score,score_why,score_note}],"category","radius","note"}
+    """
+    tag, cat = _cat_tag(category)
+    if not tag:
+        return {"ok": False, "error": "不认识这个类别：「%s」。可以试：餐厅 / 便利店 / "
+                                     "超市 / 药店 / 医院 / 银行 / 加油站 / 停车场 / "
+                                     "酒店 / 学校 / 公交站 / 公园 / 厕所…" % category}
+    net = online() if allow_net is None else bool(allow_net)
+    radius = max(100, min(20000, int(radius or 1500)))
+    limit = max(1, min(60, int(limit or 20)))
+    key = "%s|%.3f,%.3f|%d" % (cat, lat, lon, radius)
+
+    # 先看缓存（Overpass 会 429，缓存是必须的，不是优化）
+    hit = _load_cache(_NB_FILE).get(key)
+    if hit and hit.get("items") and _fresh(hit.get("ts"), _TTL_NEARBY):
+        res = dict(hit["items"])
+        res["from_cache"] = True
+        res["cache_ts"] = hit.get("ts")
+        return res
+    if not net:
+        if hit and hit.get("items"):
+            res = dict(hit["items"])
+            res.update(from_cache=True, cache_ts=hit.get("ts"), stale=True)
+            return res
+        return {"ok": False, "offline": True,
+                "error": "离线模式下没查过这一带的「%s」，查不到。"
+                         "联网问一次之后就会存到本地，下次离线也能看。" % category}
+
+    q = ('[out:json][timeout:30];('
+         'node(around:%d,%.6f,%.6f)%s;'
+         'way(around:%d,%.6f,%.6f)%s;'
+         'relation(around:%d,%.6f,%.6f)%s;'
+         ');out center %d;'
+         % (radius, lat, lon, tag, radius, lat, lon, tag,
+            radius, lat, lon, tag, limit * 2))
+    try:
+        d = _overpass(q)
+    except Exception as e:
+        # 429 很常见，把话说清楚，别让用户以为是"没有结果"
+        msg = str(e)
+        if "429" in msg:
+            msg = "查询太频繁被限流了，歇十几秒再试"
+        if hit and hit.get("items"):
+            res = dict(hit["items"])
+            res.update(from_cache=True, cache_ts=hit.get("ts"), stale=True)
+            return res
+        return {"ok": False, "error": "附近查询失败：%s" % msg}
+
+    items = []
+    for el in (d.get("elements") or []):
+        t = el.get("tags") or {}
+        la = el.get("lat") or (el.get("center") or {}).get("lat")
+        lo = el.get("lon") or (el.get("center") or {}).get("lon")
+        if la is None or lo is None:
+            continue
+        dd = haversine(lat, lon, float(la), float(lo))
+        if dd > radius:
+            continue
+        sc, why = _poi_score(t)
+        addr = "".join(str(t.get(k) or "") for k in
+                       ("addr:province", "addr:city", "addr:district",
+                        "addr:street", "addr:housenumber"))
+        items.append({
+            "name": t.get("name") or "",
+            "lat": round(float(la), 6), "lon": round(float(lo), 6),
+            "dist_m": int(dd), "kind": cat,
+            "addr": addr, "phone": t.get("phone") or t.get("contact:phone") or "",
+            "website": t.get("website") or t.get("contact:website") or "",
+            "hours": t.get("opening_hours") or "",
+            "brand": t.get("brand") or "",
+            "score": sc, "score_why": why, "score_note": score_note(sc),
+        })
+    # 距离近的排前面；同样近的，资料全的排前面（更可能是真在营的）
+    items.sort(key=lambda x: (x["dist_m"], -x["score"]))
+    res = {"ok": True, "category": cat, "radius": radius, "center": [lat, lon],
+           "total": len(items), "items": items[:limit],
+           "note": "数据来自 OpenStreetMap（志愿者测绘）。中国的小微店铺覆盖很稀疏，"
+                   "「查不到」不等于「没有」。评分是**资料完整度**、不是用户口碑分。"}
+    cache_put(_NB_FILE, key, {"ts": _now(), "items": res})
+    return res
+
+
+# ---------------------------------------------------------------- 交通方式对比与建议
+_MODE_CN = {"driving": "驾车", "foot": "步行", "bike": "骑行"}
+
+
+def suggest_mode(distance_m: float) -> tuple:
+    """按距离给出更合适的出行方式 + 原因。返回 (mode, 理由)。"""
+    d = float(distance_m or 0) / 1000.0
+    if d <= 1.2:
+        return "foot", ("才 %.1f 公里，走路最快，还不用找车位" % d) if d > 0.05 else "距离很近，走过去就行"
+    if d <= 4.5:
+        return "bike", ("%.1f 公里这个距离骑车最划算：比走路快得多，又比开车灵活"
+                        "（市区找车位、堵车都省了）" % d)
+    if d <= 30:
+        return "driving", "%.1f 公里，开车明显更省时间，骑车要花好几倍功夫" % d
+    return "driving", "%.1f 公里属于长途，只能开车或坐公共交通" % d
+
+
+def compare_modes(origin: str, dest: str, allow_net=None) -> dict:
+    """把三种出行方式都算一遍（用同一套路网数据），供"该选哪种"的对比。
+
+    ⚠️ 三种方式的**路径都来自驾车路网**（免费 OSRM 只跑 car profile），
+       步行/骑行的时间是按速度换算的估算值 —— 结果里带 estimated 标记，
+       提交给用户时必须说明，不能让他以为那是真实步行路径。
+    """
+    out, dist = {}, 0.0
+    for m in ("driving", "foot", "bike"):
+        r = plan_route(origin, dest, m, allow_net=allow_net)
+        if r.get("ok"):
+            out[m] = {"distance_m": r["distance_m"], "duration_s": r["duration_s"],
+                      "estimated": bool(r.get("estimated"))}
+            dist = dist or r["distance_m"]
+    if not out:
+        return {"ok": False, "error": "三种方式都没算出来（可能是地点没找到或网不通）"}
+    best, why = suggest_mode(dist)
+    return {"ok": True, "modes": out, "distance_m": dist,
+            "suggest": best, "suggest_cn": _MODE_CN.get(best, best),
+            "suggest_reason": why,
+            "note": "步行/骑行的路径也取自驾车路网，时间按速度估算，仅供参考。"}
