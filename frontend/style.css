@@ -968,3 +968,36 @@ body.dragging .drop-overlay,
   line-height: 1.5;
 }
 .bubble .dl-link:hover { background: #1f4e79; }
+
+/* 站内下载按钮 + 「在文件库中打开」按钮（并排） */
+.bubble .dl-group {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0;
+}
+.bubble .dl-open {
+  display: inline-block;
+  margin: 5px 3px;
+  padding: 4px 12px;
+  border-radius: 6px;
+  border: 1px solid #2e75b6;
+  background: transparent;
+  color: #2e75b6;
+  font-size: 13px;
+  line-height: 1.5;
+  cursor: pointer;
+  font-family: inherit;
+}
+.bubble .dl-open:hover { background: rgba(46, 117, 182, .12); }
+
+/* 从聊天里跳到文库时，闪一下目标文件（列表长的时候也能一眼看到） */
+.dl-item.dl-flash {
+  animation: dlFlash 0.7s ease-in-out 3;
+  border-radius: 6px;
+}
+@keyframes dlFlash {
+  0%, 100% { background: transparent; }
+  50% { background: rgba(46, 117, 182, .28); }
+}

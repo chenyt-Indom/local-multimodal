@@ -1066,11 +1066,11 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
     if name == "workspace_pack":
         return _do_workspace_pack(arguments)
     if name == "make_pptx":
-        return _do_make_pptx(arguments)
+        return _do_make_pptx(arguments, ui_events)
     if name == "make_docx":
-        return _do_make_docx(arguments)
+        return _do_make_docx(arguments, ui_events)
     if name == "edit_office":
-        return _do_edit_office(arguments)
+        return _do_edit_office(arguments, ui_events)
     if name == "web_read":
         return _do_web_read(arguments)
     if name == "github_push":
@@ -2187,7 +2187,7 @@ def _do_workspace_pack(arguments=None) -> str:
 _BAD_FN = re.compile(r'[\\/:*?"<>|\r\n\t]')
 
 
-def _do_make_pptx(arguments=None) -> str:
+def _do_make_pptx(arguments=None, ui_events=None) -> str:
     """把结构化内容生成 .pptx，存进生成文库，返回可点下载链接。
 
     ⚠️ 生成的是**二进制**文件，所以走 `doclib.save_bytes` + `/api/doclib/download`，
@@ -2250,6 +2250,12 @@ def _do_make_pptx(arguments=None) -> str:
     w = _dl.save_bytes(base, data)
     if not w.get("ok"):
         return "写入生成文库失败：%s" % w.get("error")
+
+    if isinstance(ui_events, list):
+        # 让「生成文库」面板**立刻**刷新并选中这个文件。
+        # ⚠️ 不推这个事件的话，文件明明已经落盘了、界面还停在旧列表，
+        #    用户会以为"没存进文件库"（实测反馈）。
+        ui_events.append({"type": "library", "act": "write", "rel": base})
 
     n_pages = r.get("slides") or len(slides)
     tip = ""
@@ -2328,7 +2334,7 @@ def _pick_slides(a: dict) -> list:
     return []
 
 
-def _do_make_docx(arguments=None) -> str:
+def _do_make_docx(arguments=None, ui_events=None) -> str:
     """把结构化内容生成 .docx，存进生成文库，返回可点下载链接。
 
     ⚠️ 生成的是**二进制**，必须走 `doclib.save_bytes` + `/api/doclib/download`，
@@ -2395,6 +2401,10 @@ def _do_make_docx(arguments=None) -> str:
     if not w.get("ok"):
         return "写入生成文库失败：%s" % w.get("error")
 
+    if isinstance(ui_events, list):
+        # 同 make_pptx：让「生成文库」面板立刻刷新并选中它
+        ui_events.append({"type": "library", "act": "write", "rel": base})
+
     tip = ""
     if r.get("warnings"):
         tip = "\n（提示：%s）" % "；".join(r["warnings"][:3])
@@ -2407,7 +2417,7 @@ def _do_make_docx(arguments=None) -> str:
                urllib.parse.quote(base), base, tip))
 
 
-def _do_edit_office(arguments=None) -> str:
+def _do_edit_office(arguments=None, ui_events=None) -> str:
     """查看 / 修改生成文库里的 .docx 或 .pptx。"""
     from . import doclib as _dl
     from . import office_edit as _oe
@@ -2464,10 +2474,14 @@ def _do_edit_office(arguments=None) -> str:
         pass
 
     ok, msg, warns = _oe.edit(path, ops, img_bases=_img_bases())
+
     name = os.path.basename(rel)
     link = "/api/doclib/download?rel=%s" % urllib.parse.quote(rel)
     if not ok:
         return "修改失败：%s%s" % (msg, ("\n警告：" + "；".join(warns)) if warns else "")
+    if isinstance(ui_events, list):
+        # 改成功了才刷新文库面板（失败就不动，免得闪一下又没变化）
+        ui_events.append({"type": "library", "act": "write", "rel": rel})
     out = ("已修改《%s》：%s。\n下载链接（原样给用户）：%s"
            % (name, msg, link))
     if warns:

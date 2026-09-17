@@ -169,14 +169,51 @@
   // 编个网址就变成能点的（那种才是真危险）。
   // ⚠️ 必须放在顶层（不能塞进里面那个作用域）—— **实时回答**和**恢复历史
   // 记录**是两条不同的渲染路径，两边都要用得到。
+  // 一个站内下载链接 = **两个动作**：下载到电脑 + 在「生成文库」里定位它。
+  // 为什么要有第二个：文件其实**已经**在库里了（模型写完就落盘），可用户从聊天里
+  // 只看到"下载"，感受上就是"没存进文件库"。给一个直接跳到它的入口才说得通。
+  function dlGroup(label, url) {
+    let rel = "";
+    if (url.indexOf("/api/doclib/download") === 0) {
+      const m = url.match(/[?&]rel=([^&]+)/);
+      if (m) { try { rel = decodeURIComponent(m[1]); } catch (e) { rel = m[1]; } }
+    }
+    return '<span class="dl-group">' +
+      `<a class="dl-link" href="${url}" download>${label}</a>` +
+      (rel ? `<button type="button" class="dl-open" data-rel="${escapeHtml(rel)}"` +
+             ` title="在左侧「生成文库」里定位并选中它">📂 在文件库中打开</button>` : "") +
+      "</span>";
+  }
+
   function renderAnswerLinks(bubble, text) {
     const esc = escapeHtml(text);
     let html = esc.replace(/\[([^\]]{1,40})\]\((\/api\/[^\s)]+)\)/g,
-      (_, label, url) => `<a class="dl-link" href="${url}" download>${label}</a>`);
+      (_, label, url) => dlGroup(label, url));
     html = html.replace(/(^|[\s（(])(\/api\/(?:doclib\/download|ws\/zip)[^\s<)）]*)/g,
-      (_, pre, url) => `${pre}<a class="dl-link" href="${url}" download>点击下载</a>`);
+      (_, pre, url) => `${pre}${dlGroup("点击下载", url)}`);
     bubble.innerHTML = html.replace(/\n/g, "<br>");
   }
+
+  // 跳到「生成文库」并把这个文件选中、闪一下（列表长的时候也能一眼找到）
+  async function openInLibrary(rel) {
+    const panel = document.getElementById("doclibPanel");
+    if (!panel) { showToast("界面上找不到「生成文库」面板", "warn"); return false; }
+    panel.scrollIntoView({ behavior: "smooth", block: "start" });
+    await loadDoclib(rel || "");          // 刷新列表 + 选中（内部会打上 active）
+    let hit = null;
+    document.querySelectorAll(".dl-item").forEach((el) => {
+      if (el.dataset.rel === rel) hit = el;
+    });
+    if (hit) {
+      hit.classList.add("dl-flash");
+      setTimeout(() => hit.classList.remove("dl-flash"), 2600);
+      showToast("已在生成文库中定位：" + rel, "ok");
+    } else {
+      showToast("文件库里没找到「" + rel + "」（可能已被删除或改名）", "warn");
+    }
+    return true;
+  }
+  window.__openInLibrary = openInLibrary;
 
   // ---------- 站内下载：桌面壳里改走原生「另存为」 ----------
   // ⚠️ 这是用户实际报过的坑：桌面窗口是 WebView2，而 pywebview 的
@@ -202,9 +239,19 @@
     }
     return true;                       // true = 已经接管，别再走默认行为
   }
-  // 事件委托：回答里的下载按钮是 innerHTML 塞进去的，逐个绑定不现实
+  // 事件委托：回答里的下载/定位按钮是 innerHTML 塞进去的，逐个绑定不现实
   document.addEventListener("click", (e) => {
-    const a = e.target && e.target.closest ? e.target.closest("a.dl-link") : null;
+    const t = e.target;
+    if (!t || !t.closest) return;
+    // ①「在文件库中打开」：跳到生成文库并选中该文件
+    const op = t.closest(".dl-open");
+    if (op) {
+      e.preventDefault();
+      openInLibrary(op.getAttribute("data-rel") || "");
+      return;
+    }
+    // ② 下载按钮：桌面壳里走原生「另存为」（否则会被 WebView2 静默吞掉）
+    const a = t.closest("a.dl-link");
     if (!a) return;
     const url = a.getAttribute("href") || "";
     if (url.indexOf("/api/") !== 0) return;
