@@ -1340,6 +1340,7 @@ _TEXT_TOOL_DOCS = {
                  '参数 {"title": "封面主标题", "subtitle": "副标题（可选）", '
                  '"author": "落款（可选）", "theme": "blue/green/warm/purple/mono/red", '
                  '"slides": [{"title": "页标题", "bullets": ["要点1", "- 二级要点"], '
+                 '"image_query": "配图搜索词（可选，会自动搜图插入）", '
                  '"section": false}]} —— section=true 是章节过渡页。'
                  '生成后把返回的下载链接**原样**告诉用户。',
     "make_docx": '生成一份真正的 Word 文档（.docx），存进生成文库并给出可点下载链接。'
@@ -2141,6 +2142,17 @@ async def chat(req: ChatRequest):
     model_note = ""
     images = list(req.images_b64 or [])
     _remember_image(images)          # 记住本轮图片，供后续「把这张图改成…」直接引用
+    # ⚠️ 本轮附件还必须**落盘**：模型能"看到"图，却拿不到图的字节 ——
+    # 用户说「把这张图放进 PPT / 插到文档里」时，只有磁盘上的文件才能被
+    # python-pptx / python-docx 使用。落盘后把路径写进提示词，模型照抄即可。
+    # （按内容哈希命名，同一张图反复附也不会堆垃圾。）
+    attach_paths = []
+    if images:
+        try:
+            from . import img_fetch
+            attach_paths = img_fetch.save_chat_images(images)
+        except Exception:
+            logging.getLogger("uvicorn.error").warning("附件图片落盘失败", exc_info=True)
     messages = list(req.messages)
     # ⚠️ 这里**不要**再按条数截断历史！
     # 曾经这里有一句 `messages = messages[-MAX_CONTEXT_MESSAGES:]`，
@@ -2205,6 +2217,16 @@ async def chat(req: ChatRequest):
     # session 必须提前取到：记忆是按对话隔离的，注入时必须知道是哪个对话。
     session = req.session_id or ""
     sys_prompt = _SystemPrompt.build(last_user, session, req.docs, no_tools=code_model_on)
+    if attach_paths and not code_model_on:
+        # 把落盘路径交给模型 —— 这是"按用户提供的图片做文档/PPT"能成立的前提
+        sys_prompt += (
+            "\n\n【本轮用户附了图片，已存到本机】\n"
+            + "\n".join("- %s" % p for p in attach_paths)
+            + "\n要把它们放进文档/PPT，就把上面的路径填进："
+              "make_pptx 每页的 image、make_docx 的 image 块 src、"
+              "或 edit_office 里 add_image 的 src。**不要只描述图片内容、"
+              "也不要说「我无法插入图片」** —— 路径已经给你了。\n"
+        )
     # ⚠️ 这两段都在描述工具（run_python / ask_user / library）。代码模型那一轮
     # 工具已被清空，留着它们只会让模型"照着描述编"（实测：声称已保存文件、却没给代码）。
     if cfg.get("code_exec_enabled") and not code_model_on:
@@ -2234,6 +2256,12 @@ async def chat(req: ChatRequest):
         "→ 用 **edit_office**（先 action=inspect 看结构，再 action=edit 改）；\n"
         "    · 要**纯文本 / 代码 / 数据文件**（.md .txt .py .json .csv）→ 才用 library。\n"
         "   生成完只把**下载链接**给用户，**别描述界面按钮或操作步骤**（界面上没有那些）。\n"
+        "- **配图**（用户说「配点图」「图文并茂」「找张图放上去」「加个 logo」时）：\n"
+        "    · 给那一页/那一块写 **image_query**（中文搜索词，如「校园 图书交换 活动」）\n"
+        "      → 系统会**自动联网搜一张合适的图插进去**，你不用自己找链接、也不要说做不到；\n"
+        "    · 已经有图（本机路径 / 图片库 id / 网址）就直接填进 image / src；\n"
+        "    · 想整页铺背景图用 bg_image，想每页加 logo 用顶层 logo 参数；\n"
+        "    · **别编造图片来源**。搜不到时如实说没搜到，不要假装插了图。\n"
         "- 只是让你「写一篇作文 / 拟个方案」→ **直接写在回答里**，不要自作主张建文件。\n"
         "- ⚠️ 用户说「**把这篇 / 刚才那篇**存起来、导出」时，content 必须是**你上一轮写的正文原文**，"
         "**完整复制过去** —— 不许只写摘要、不许留占位符（如「（在此粘贴正文）」）、不许自己另编一版。"

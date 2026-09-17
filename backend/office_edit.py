@@ -387,10 +387,13 @@ def edit_pptx(path, ops, img_bases=None):
 
             elif k in ("add_image", "加图片", "插图片"):
                 sl = prs.slides[_pct(int(idx0)) - 1]
-                src = PP._resolve({"_bases": list(img_bases or [])},
-                                  op.get("src") or "")
+                # 图片来源：src（路径 / 网址 / 图库 id）或 query（联网搜一张）
+                pseudo = {"image": op.get("src") or "",
+                          "image_query": op.get("query") or "",
+                          "_bases": list(img_bases or [])}
+                src = PP._slide_image(pseudo, wide=bool(op.get("wide")))
                 if not src or not os.path.exists(src):
-                    warns.append("图片找不到：%s" % op.get("src"))
+                    warns.append("图片找不到：%s" % (op.get("src") or op.get("query")))
                     continue
                 PP._add_pic_fit(sl, src, Inches(float(op.get("x", 0.8))),
                                 Inches(float(op.get("y", 0.8))),

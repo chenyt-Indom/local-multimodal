@@ -311,14 +311,14 @@ def _put_bullets(slide, bs, x, y, w, h, th, st, base_size=None, font=None,
             p.alignment = PP_ALIGN.CENTER
         sz = float(b.get("size") or (size - (2 if lvl else 0)))
         col = b.get("color") or (st.get("body") or th["body"] if not lvl
-                                 else th["muted"])
+                                 else (st.get("muted") or th["muted"]))
         mark = b.get("mark")
         if mark is None:
             mark = "• " if not lvl else "– "
         if mark:
             r0 = p.add_run()
             r0.text = mark
-            _set_font(r0, sz, th["accent"] if not lvl else th["muted"], font=font)
+            _set_font(r0, sz, th["accent"] if not lvl else (st.get("muted") or th["muted"]), font=font)
         r = p.add_run()
         r.text = b["text"][:200]
         _set_font(r, sz, col, bold=bool(b.get("bold")), font=font,
@@ -354,7 +354,29 @@ def _decorate(slide, decor, th, st, page_no=None):
         p.alignment = PP_ALIGN.RIGHT
         r = p.add_run()
         r.text = "%02d" % page_no
-        _set_font(r, 11, th["muted"], font=st.get("font"))
+        _set_font(r, 11, st.get("muted") or th["muted"], font=st.get("font"))
+
+
+def _page_base(s, th, st, sl, page_no):
+    """内页统一底：背景（可用 bg_image）→ 装饰 → 角落 logo。
+
+    ⚠️ 顺序不能反：装饰和 logo 必须压在背景图**上面**，否则直接看不见。
+    ⚠️ 用了背景图时，标题/正文默认改成白色 —— 深色字压在照片上读不了。
+    """
+    path = _image_value(sl or {}, "bg_image", wide=True)
+    on_img = bool(path) and _add_bg_image(
+        s, path, th, veil=float(st.get("veil") or 0.72),
+        color=st.get("veil_color"))
+    if on_img:
+        # 文字整体提亮，否则深色字压在照片上读不了；二级要点/图注/页码用浅灰
+        st["title_color"] = st.get("title_color") or "FFFFFF"
+        st["body"] = st.get("body") or "FFFFFF"
+        st["muted"] = st.get("muted") or "E4E4E4"
+    else:
+        _fill_bg(s, st.get("bg") or th["bg"])
+    _decorate(s, st.get("decor"), th, st, page_no)
+    _add_logo(s, st.get("_logo_path") or "", st.get("logo_pos") or "tr",
+              float(st.get("logo_size") or 0.5))
 
 
 def _title_bar(slide, title, th, st, y=Inches(0.5), rule=True):
@@ -376,9 +398,13 @@ def _title_bar(slide, title, th, st, y=Inches(0.5), rule=True):
 # --------------------------------------------------------------------------
 # 各版式
 # --------------------------------------------------------------------------
-def _add_cover(prs, th, st, title, subtitle, author):
+def _add_cover(prs, th, st, title, subtitle, author, cover_img=""):
     s = _blank(prs)
-    _grad_bg(s, th["cover_bg"], th["accent"], 45)
+    if cover_img and os.path.exists(cover_img):
+        # 封面用整页图：压一层主题色蒙版，标题才读得清
+        _add_bg_image(s, cover_img, th, veil=float(st.get("veil") or 0.66))
+    else:
+        _grad_bg(s, th["cover_bg"], th["accent"], 45)
     _rect(s, Inches(0.9), Inches(2.05), Inches(1.7), Inches(0.09),
           fill=st.get("accent") or th["cover_fg"])
     tf = _textbox(s, Inches(0.9), Inches(2.4), Inches(11.5), Inches(2.6))
@@ -407,8 +433,8 @@ def _add_cover(prs, th, st, title, subtitle, author):
 
 def _add_section(prs, th, st, text, index, page_no):
     s = _blank(prs)
-    _fill_bg(s, st.get("bg") or th["bg"])
-    _decorate(s, st.get("decor"), th, st, page_no)
+    # 章节页没有独立的页配置（参数是标题文字），传空字典走默认底
+    _page_base(s, th, st, {}, page_no)
     _rect(s, Inches(0), Inches(3.05), Inches(0.28), Inches(1.4),
           fill=st.get("accent") or th["accent"])
     tf = _textbox(s, Inches(0.95), Inches(3.05), Inches(11.4), Inches(1.5))
@@ -426,8 +452,7 @@ def _add_section(prs, th, st, text, index, page_no):
 
 def _add_content(prs, th, st, sl, page_no):
     s = _blank(prs)
-    _fill_bg(s, st.get("bg") or th["bg"])
-    _decorate(s, st.get("decor"), th, st, page_no)
+    _page_base(s, th, st, sl, page_no)
     y = _title_bar(s, sl.get("title"), th, st, rule=bool(st.get("rule", True)))
     bs = _bullets_of(sl.get("bullets"))
     _put_bullets(s, bs, Inches(0.95), y + Inches(0.4), Inches(11.45),
@@ -441,8 +466,7 @@ def _add_content(prs, th, st, sl, page_no):
 
 def _add_two_col(prs, th, st, sl, page_no):
     s = _blank(prs)
-    _fill_bg(s, st.get("bg") or th["bg"])
-    _decorate(s, st.get("decor"), th, st, page_no)
+    _page_base(s, th, st, sl, page_no)
     y = _title_bar(s, sl.get("title"), th, st)
     left = sl.get("left") if sl.get("left") is not None else sl.get("bullets")
     right = sl.get("right") or []
@@ -478,15 +502,13 @@ def _add_two_col(prs, th, st, sl, page_no):
 
 def _add_image_side(prs, th, st, sl, page_no, side="right"):
     s = _blank(prs)
-    _fill_bg(s, st.get("bg") or th["bg"])
-    _decorate(s, st.get("decor"), th, st, page_no)
+    _page_base(s, th, st, sl, page_no)
     y = _title_bar(s, sl.get("title"), th, st)
     img_box = (Inches(6.85), y + Inches(0.35), Inches(5.55), SLIDE_H - y - Inches(1.0))
     txt_box = (Inches(0.9), y + Inches(0.35), Inches(5.6), SLIDE_H - y - Inches(1.0))
     if side == "left":
         img_box, txt_box = txt_box, img_box
-    src = str(sl.get("image") or "").strip()
-    path = _resolve(sl, src)
+    path = _slide_image(sl)
     if path and os.path.exists(path):
         _add_pic_fit(s, path, *img_box)
     else:
@@ -499,7 +521,7 @@ def _add_image_side(prs, th, st, sl, page_no, side="right"):
         pp.alignment = PP_ALIGN.CENTER
         rp = pp.add_run()
         rp.text = "（此处配图）"
-        _set_font(rp, 14, th["muted"], font=st.get("font"))
+        _set_font(rp, 14, st.get("muted") or th["muted"], font=st.get("font"))
     _put_bullets(s, _bullets_of(sl.get("bullets")), txt_box[0], txt_box[1],
                  txt_box[2], txt_box[3], th, st,
                  base_size=(st.get("body_size") or 0) or _fit_size(
@@ -512,7 +534,7 @@ def _add_image_side(prs, th, st, sl, page_no, side="right"):
         pc.alignment = PP_ALIGN.CENTER
         rc = pc.add_run()
         rc.text = cap[:60]
-        _set_font(rc, 11, th["muted"], font=st.get("font"))
+        _set_font(rc, 11, st.get("muted") or th["muted"], font=st.get("font"))
     if sl.get("notes"):
         s.notes_slide.notes_text_frame.text = str(sl["notes"])[:2000]
     return s
@@ -520,9 +542,8 @@ def _add_image_side(prs, th, st, sl, page_no, side="right"):
 
 def _add_image_full(prs, th, st, sl, page_no):
     s = _blank(prs)
-    _fill_bg(s, st.get("bg") or th["bg"])
-    src = str(sl.get("image") or "").strip()
-    path = _resolve(sl, src)
+    # 整页图版式想要横向的图，搜索时按横图筛，免得插进来两边留大黑边
+    path = _slide_image(sl, wide=True)
     if path and os.path.exists(path):
         _add_pic_cover(s, path, Emu(0), Emu(0), SLIDE_W, SLIDE_H)
         _rect(s, Emu(0), Emu(0), SLIDE_W, Inches(1.55),
@@ -531,6 +552,8 @@ def _add_image_full(prs, th, st, sl, page_no):
               fill=_tint(th["cover_fg"], 0.35))
     else:
         _fill_bg(s, _tint(st.get("accent") or th["accent"], 0.88))
+    _add_logo(s, st.get("_logo_path") or "", st.get("logo_pos") or "tr",
+              float(st.get("logo_size") or 0.5))
     tf = _textbox(s, Inches(0.85), Inches(0.42), Inches(11.6), Inches(0.75))
     p = tf.paragraphs[0]
     r = p.add_run()
@@ -543,8 +566,7 @@ def _add_image_full(prs, th, st, sl, page_no):
 
 def _add_table(prs, th, st, sl, page_no):
     s = _blank(prs)
-    _fill_bg(s, st.get("bg") or th["bg"])
-    _decorate(s, st.get("decor"), th, st, page_no)
+    _page_base(s, th, st, sl, page_no)
     y = _title_bar(s, sl.get("title"), th, st)
     spec = sl.get("table") or {}
     header = [str(x) for x in (spec.get("header") or [])]
@@ -599,10 +621,122 @@ def _add_table(prs, th, st, sl, page_no):
     return s
 
 
+_CHART_KINDS = None
+
+
+def _chart_kind(name):
+    """图表类型名（中英文都认）→ pptx 枚举。"""
+    global _CHART_KINDS
+    if _CHART_KINDS is None:
+        from pptx.enum.chart import XL_CHART_TYPE as T
+        _CHART_KINDS = {
+            "bar": T.COLUMN_CLUSTERED, "column": T.COLUMN_CLUSTERED,
+            "柱状": T.COLUMN_CLUSTERED, "柱状图": T.COLUMN_CLUSTERED,
+            "barh": T.BAR_CLUSTERED, "条形": T.BAR_CLUSTERED, "条形图": T.BAR_CLUSTERED,
+            "line": T.LINE_MARKERS, "折线": T.LINE_MARKERS, "折线图": T.LINE_MARKERS,
+            "pie": T.PIE, "饼图": T.PIE, "饼": T.PIE,
+            "doughnut": T.DOUGHNUT, "圆环": T.DOUGHNUT, "环图": T.DOUGHNUT,
+            "area": T.AREA, "面积": T.AREA, "面积图": T.AREA,
+            "stacked": T.COLUMN_STACKED, "堆叠": T.COLUMN_STACKED,
+        }
+    return _CHART_KINDS.get(str(name or "bar").strip().lower(),
+                            _CHART_KINDS["bar"])
+
+
+def _is_pie(spec) -> bool:
+    return str(spec.get("kind") or "bar").strip().lower() in (
+        "pie", "饼图", "饼", "doughnut", "圆环", "环图")
+
+
+def _add_chart(prs, th, st, sl, page_no):
+    """图表页：柱状 / 条形 / 折线 / 饼图 / 圆环 / 面积。
+
+    数据由模型给**结构化数组**（categories + series），不让它画图 ——
+    和"模型只填内容、排版交给代码"的原则一致。
+    """
+    s = _blank(prs)
+    _page_base(s, th, st, sl, page_no)
+    y = _title_bar(s, sl.get("title"), th, st)
+    spec = sl.get("chart") or {}
+    cats = [str(c) for c in (spec.get("categories") or [])]
+    series = [x for x in (spec.get("series") or []) if isinstance(x, dict)]
+    if not cats or not series:
+        return _add_content(prs, th, st, sl, page_no)
+
+    from pptx.chart.data import CategoryChartData
+    data = CategoryChartData()
+    data.categories = cats
+    for sx in series[:4]:
+        vals = []
+        for v in (sx.get("values") or []):
+            try:
+                vals.append(float(v))
+            except Exception:
+                vals.append(0.0)
+        data.add_series(str(sx.get("name") or "系列")[:20], vals)
+
+    left, top = Inches(0.9), y + Inches(0.45)
+    width = Inches(11.5)
+    height = SLIDE_H - top - Inches(0.95)
+    try:
+        gf = s.shapes.add_chart(_chart_kind(spec.get("kind")), left, top,
+                                width, height, data)
+    except Exception as e:
+        return _add_content(prs, th, st, sl, page_no)
+    ch = gf.chart
+    acc = st.get("accent") or th["accent"]
+
+    if spec.get("title"):
+        ch.has_title = True
+        try:
+            ch.chart_title.text_frame.text = str(spec["title"])[:40]
+        except Exception:
+            pass
+    ch.has_legend = bool(spec.get("legend", len(series) > 1))
+    try:
+        ch.font.size = Pt(float(st.get("body_size") or 12))
+        ch.font.name = st.get("font") or _CN_FONT
+    except Exception:
+        pass
+
+    # ⚠️ 配色默认是 pptx 自带的那套蓝橙，和主题完全撞色 —— 必须手动改。
+    # 饼图/圆环按"点"上色，其余按"系列"上色，两条路径不一样。
+    palette = [acc, _tint(acc, 0.45), th["body"], th["muted"],
+               _tint(acc, 0.7), th["card"]]
+    try:
+        for plot in ch.plots:
+            plot.has_data_labels = bool(spec.get("labels"))
+            if plot.has_data_labels:
+                try:
+                    dl = plot.data_labels
+                    dl.font.size = Pt(10)
+                    dl.font.color.rgb = _rgb(th["body"])
+                except Exception:
+                    pass
+            for j, ser in enumerate(plot.series):
+                try:
+                    if _is_pie(spec):
+                        for k, pt in enumerate(ser.points):
+                            pt.format.fill.solid()
+                            pt.format.fill.fore_color.rgb = _rgb(
+                                palette[k % len(palette)])
+                    else:
+                        ser.format.fill.solid()
+                        ser.format.fill.fore_color.rgb = _rgb(
+                            palette[j % len(palette)])
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    if sl.get("notes"):
+        s.notes_slide.notes_text_frame.text = str(sl["notes"])[:2000]
+    return s
+
+
 def _add_cards(prs, th, st, sl, page_no):
     s = _blank(prs)
-    _fill_bg(s, st.get("bg") or th["bg"])
-    _decorate(s, st.get("decor"), th, st, page_no)
+    _page_base(s, th, st, sl, page_no)
     y = _title_bar(s, sl.get("title"), th, st)
     cards = [c for c in (sl.get("cards") or []) if isinstance(c, dict)][:4]
     if not cards:
@@ -639,7 +773,7 @@ def _add_cards(prs, th, st, sl, page_no):
         pb.line_spacing = 1.3
         rb = pb.add_run()
         rb.text = str(c.get("text") or "")[:180]
-        _set_font(rb, 13, th["muted"], font=st.get("font"))
+        _set_font(rb, 13, st.get("muted") or th["muted"], font=st.get("font"))
     if sl.get("notes"):
         s.notes_slide.notes_text_frame.text = str(sl["notes"])[:2000]
     return s
@@ -647,8 +781,7 @@ def _add_cards(prs, th, st, sl, page_no):
 
 def _add_stats(prs, th, st, sl, page_no):
     s = _blank(prs)
-    _fill_bg(s, st.get("bg") or th["bg"])
-    _decorate(s, st.get("decor"), th, st, page_no)
+    _page_base(s, th, st, sl, page_no)
     y = _title_bar(s, sl.get("title"), th, st)
     items = [x for x in (sl.get("stats") or []) if isinstance(x, dict)][:4]
     if not items:
@@ -675,7 +808,7 @@ def _add_stats(prs, th, st, sl, page_no):
         pl.line_spacing = 1.25
         rl = pl.add_run()
         rl.text = str(it.get("label") or "")[:40]
-        _set_font(rl, 14, th["muted"], font=st.get("font"))
+        _set_font(rl, 14, st.get("muted") or th["muted"], font=st.get("font"))
     if sl.get("notes"):
         s.notes_slide.notes_text_frame.text = str(sl["notes"])[:2000]
     return s
@@ -683,8 +816,7 @@ def _add_stats(prs, th, st, sl, page_no):
 
 def _add_steps(prs, th, st, sl, page_no):
     s = _blank(prs)
-    _fill_bg(s, st.get("bg") or th["bg"])
-    _decorate(s, st.get("decor"), th, st, page_no)
+    _page_base(s, th, st, sl, page_no)
     y = _title_bar(s, sl.get("title"), th, st)
     items = [x for x in (sl.get("steps") or []) if isinstance(x, dict)][:5]
     if not items:
@@ -724,7 +856,7 @@ def _add_steps(prs, th, st, sl, page_no):
         pb.line_spacing = 1.3
         rb = pb.add_run()
         rb.text = str(it.get("text") or "")[:160]
-        _set_font(rb, 12.5, th["muted"], font=st.get("font"))
+        _set_font(rb, 12.5, st.get("muted") or th["muted"], font=st.get("font"))
         if i < n - 1:
             _rect(s, cx + cw + Inches(0.03), top + card_h / 2 - Inches(0.1),
                   Inches(0.19), Inches(0.19), fill=_tint(acc, 0.4),
@@ -736,8 +868,7 @@ def _add_steps(prs, th, st, sl, page_no):
 
 def _add_timeline(prs, th, st, sl, page_no):
     s = _blank(prs)
-    _fill_bg(s, st.get("bg") or th["bg"])
-    _decorate(s, st.get("decor"), th, st, page_no)
+    _page_base(s, th, st, sl, page_no)
     y = _title_bar(s, sl.get("title"), th, st)
     items = [x for x in (sl.get("items") or []) if isinstance(x, dict)][:5]
     if not items:
@@ -766,7 +897,7 @@ def _add_timeline(prs, th, st, sl, page_no):
         pb.line_spacing = 1.3
         rb = pb.add_run()
         rb.text = str(it.get("text") or "")[:150]
-        _set_font(rb, 12, th["muted"], font=st.get("font"))
+        _set_font(rb, 12, st.get("muted") or th["muted"], font=st.get("font"))
     if sl.get("notes"):
         s.notes_slide.notes_text_frame.text = str(sl["notes"])[:2000]
     return s
@@ -775,7 +906,13 @@ def _add_timeline(prs, th, st, sl, page_no):
 def _add_quote(prs, th, st, sl, page_no):
     s = _blank(prs)
     acc = st.get("accent") or th["accent"]
-    _grad_bg(s, st.get("bg") or th["cover_bg"], acc, 45)
+    path = _image_value(sl, "bg_image", wide=True) or _slide_image(sl, wide=True)
+    if path and os.path.exists(path):
+        _add_bg_image(s, path, th, veil=float(st.get("veil") or 0.62))
+    else:
+        _grad_bg(s, st.get("bg") or th["cover_bg"], acc, 45)
+    _add_logo(s, st.get("_logo_path") or "", st.get("logo_pos") or "tr",
+              float(st.get("logo_size") or 0.5))
     q = sl.get("quote") or {}
     text = str(q.get("text") or sl.get("title") or "").strip()
     src = str(q.get("from") or "")
@@ -806,8 +943,8 @@ def _add_quote(prs, th, st, sl, page_no):
 
 def _add_toc(prs, th, st, sl, page_no):
     s = _blank(prs)
-    _fill_bg(s, st.get("bg") or th["bg"])
-    _decorate(s, st.get("decor") or ["band"], th, st, page_no)
+    st.setdefault("decor", ["band"])
+    _page_base(s, th, st, sl, page_no)
     y = _title_bar(s, sl.get("title") or "目录", th, st)
     items = sl.get("items") or sl.get("bullets") or []
     bs = _bullets_of(items)
@@ -843,8 +980,7 @@ def _add_toc(prs, th, st, sl, page_no):
 
 def _add_blank(prs, th, st, sl, page_no):
     s = _blank(prs)
-    _fill_bg(s, st.get("bg") or th["bg"])
-    _decorate(s, st.get("decor"), th, st, page_no)
+    _page_base(s, th, st, sl, page_no)
     if sl.get("title"):
         _title_bar(s, sl.get("title"), th, st)
     return s
@@ -853,6 +989,8 @@ def _add_blank(prs, th, st, sl, page_no):
 def _add_end(prs, th, st, text):
     s = _blank(prs)
     _grad_bg(s, th["cover_bg"], st.get("accent") or th["accent"], 45)
+    _add_logo(s, st.get("_logo_path") or "", st.get("logo_pos") or "tr",
+              float(st.get("logo_size") or 0.5))
     tf = _textbox(s, Inches(1.5), Inches(3.15), Inches(10.3), Inches(1.3))
     p = tf.paragraphs[0]
     p.alignment = PP_ALIGN.CENTER
@@ -873,22 +1011,136 @@ _LAYOUTS = {
     "table": _add_table, "cards": _add_cards, "stats": _add_stats,
     "steps": _add_steps, "process": _add_steps,
     "timeline": _add_timeline, "quote": _add_quote, "toc": _add_toc,
+    "chart": _add_chart, "charts": _add_chart, "图表": _add_chart,
     "blank": _add_blank,
 }
 
 
 def _resolve(sl, src):
-    """图片路径：支持绝对路径，或相对「图片搜索目录」（见 build_pptx 的 img_bases）。"""
-    src = str(src or "").strip().strip('"')
-    if not src:
+    """把模型写的图片来源变成本地文件。
+
+    统一交给 `img_fetch`：绝对路径 / 网址 / 图片库 id / 图片库名称 / 相对文件名
+    都认，网图会自动下载并缓存（细节与坑见 img_fetch 模块说明）。
+    """
+    from . import img_fetch
+    return img_fetch.resolve(src, sl.get("_bases"))
+
+
+def _image_value(sl, key, wide=False):
+    """取某个字段的图：路径 / 网址 / 图库 id 都试，**取不到又像搜索词就联网搜一张**。
+
+    ⚠️ 实测模型经常把搜索词直接写进 `image` / `bg_image`，而不是写在
+    `image_query` 里。只按"路径"处理的话它会以为插了图、其实一片空白，还不报错。
+    """
+    v = str((sl or {}).get(key) or "").strip()
+    if not v:
         return ""
-    if os.path.isabs(src):
-        return src
-    for base in (sl.get("_bases") or []):
-        cand = os.path.join(base, src.lstrip("/\\"))
-        if os.path.exists(cand):
-            return cand
+    from . import img_fetch
+    p = img_fetch.resolve(v, sl.get("_bases"))
+    if p:
+        return p
+    # 解析不到：哪怕它长得像路径，也剥出名字当搜索词试一次
+    # （模型会写 "images/植物.jpg" 这种编造路径，直接放弃就一片空白）
+    c = img_fetch.as_query(v)
+    return img_fetch.search_one(c, want_wide=wide) if c else ""
+
+
+def _slide_image(sl, key="image", wide=False):
+    """取本页配图，**三级兜底**，尽量不让模型"以为插了图、其实一片空白"。：
+
+    ① `image` 字段按路径/网址/图库 id 解析；
+    ② 解析不到就当搜索词联网搜（`image_query` 优先，再退到 `image` 本身）；
+    ③ 还没有、但这一页确实表达了配图意图 → **用本页标题搜一张**。
+    每一次兜底都往告警里记一条，工具会把实情回报给模型。
+    """
+    from . import img_fetch
+    bases = (sl or {}).get("_bases")
+    warns = (sl or {}).get("_warn")
+    used = (sl or {}).get("_used")       # 同一份文稿里已经用过的图，避免重复
+    v = str(sl.get(key) or "").strip()
+    q = str(sl.get("image_query") or sl.get("query") or "").strip()
+
+    def _mark(p):
+        if p and used is not None:
+            used.add(p)
+        return p
+
+    if v:
+        p = img_fetch.resolve(v, bases)
+        if p:
+            return _mark(p)
+
+    for cand, why in ((q, "image_query"), (v, key)):
+        c = img_fetch.as_query(cand)
+        if not c:
+            continue
+        p = img_fetch.search_one(c, want_wide=wide, exclude=used)
+        if p:
+            if warns is not None and cand is v:
+                warns.append("「%s」不是有效图片，已按搜索词「%s」联网配图"
+                             % (str(v)[:30], c))
+            return _mark(p)
+
+    title = img_fetch.as_query(sl.get("title"))
+    if title and (v or q):
+        p = img_fetch.search_one(title, want_wide=wide, exclude=used)
+        if p:
+            if warns is not None:
+                warns.append("「%s」没取到图，已用本页标题「%s」搜图代替"
+                             % ((v or q)[:30], title))
+            return _mark(p)
+    if v and warns is not None:
+        warns.append("第「%s」页的图片「%s」没能取到（不是有效路径/网址，"
+                     "也没搜到合适的图）" % (str(sl.get("title") or "?")[:16],
+                                          str(v)[:30]))
     return ""
+
+
+def _fill_alpha(shape, alpha):
+    """给纯色填充加透明度（0=全透明，1=不透明）。
+
+    python-pptx 没直接暴露这个属性，但底层值就是 `a:srgbClr` 里的 `a:alpha`
+    （万分之一为单位）。做"背景图上的蒙版"必须用它，否则文字压在图上读不清。
+    """
+    try:
+        srgb = shape._element.spPr.find(qn("a:solidFill")).find(qn("a:srgbClr"))
+        for old in srgb.findall(qn("a:alpha")):
+            srgb.remove(old)
+        el = srgb.makeelement(qn("a:alpha"),
+                              {"val": str(int(max(0.0, min(1.0, alpha)) * 100000))})
+        srgb.append(el)
+    except Exception:
+        pass
+
+
+def _add_bg_image(slide, path, th, veil=0.72, color=None):
+    """整页背景图 + 半透明蒙版（保证上面压的文字看得清）。"""
+    try:
+        _add_pic_cover(slide, path, Emu(0), Emu(0), SLIDE_W, SLIDE_H)
+    except Exception:
+        return False
+    mask = _rect(slide, Emu(0), Emu(0), SLIDE_W, SLIDE_H,
+                 fill=color or th["cover_bg"])
+    _fill_alpha(mask, veil)
+    return True
+
+
+def _add_logo(slide, path, pos="tr", height_in=0.5, margin_in=0.42):
+    """角落小图标/logo（每页统一位置）。"""
+    if not path or not os.path.exists(path):
+        return
+    from . import img_fetch
+    iw, ih = img_fetch.size_of(path)
+    h = Inches(height_in)
+    w = h if not iw or not ih else Emu(int(h * (iw / float(ih))))
+    m = Inches(margin_in)
+    x = {"tr": SLIDE_W - w - m, "tl": m,
+         "br": SLIDE_W - w - m, "bl": m}.get(pos, SLIDE_W - w - m)
+    y = m if pos in ("tr", "tl") else SLIDE_H - h - m
+    try:
+        slide.shapes.add_picture(path, int(x), int(y), width=int(w), height=int(h))
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -896,7 +1148,8 @@ def _resolve(sl, src):
 # --------------------------------------------------------------------------
 def build_pptx(path, title, slides, subtitle="", author="", theme=DEFAULT_THEME,
                end_text="", font=DEFAULT_FONT, page_number=True,
-               cover=True, end_page=True, img_bases=None):
+               cover=True, end_page=True, img_bases=None,
+               logo="", cover_image="", logo_pos="tr", logo_size=0.5):
     """把结构化内容生成 pptx，返回 {'ok','path','slides','warnings','error'}。
 
     slides 每项：见模块 docstring。`layout` 决定版式，`decor` 加装饰，
@@ -911,33 +1164,90 @@ def build_pptx(path, title, slides, subtitle="", author="", theme=DEFAULT_THEME,
         prs.slide_width, prs.slide_height = SLIDE_W, SLIDE_H
         bases = [b for b in (img_bases or []) if b]
 
+        # 全篇共用的图片：logo（每页角落）与封面背景图。解析一次、复用路径。
+        from . import img_fetch as _if
+        logo_path = _if.resolve(logo, bases) if str(logo or "").strip() else ""
+
+        # ⚠️ 模型常把"封面"单独写成 slides[0]（标题=文档标题、还带个封面配图）。
+        # 必须在**画封面之前**识别出来，把它合并进封面配置并跳过 ——
+        # 否则会多出一页和大封面重复的空标题页；而"先画了再删掉重画"会留下
+        # 重复的 slide XML 部件（实测把 pptx 写坏，解压报 Duplicate name）。
+        _used_imgs = set()            # 这份文稿已经用过的配图（防止整篇重复一张）
+        _skip_idx = -1
+        if cover and slides and isinstance(slides[0], dict):
+            _s0 = slides[0]
+            _lay0 = str(_s0.get("layout") or "").strip().lower()
+            _body0 = any(_s0.get(k) for k in (
+                "bullets", "left", "right", "cards", "stats", "steps",
+                "table", "chart", "items", "quote"))
+            if _lay0 in ("cover", "封面") or (
+                    not _body0 and not _s0.get("section")
+                    and str(_s0.get("title") or "").strip()
+                    == str(title or "").strip()):
+                _skip_idx = 0
+                if not str(cover_image or "").strip():
+                    cover_image = (_s0.get("cover_image") or _s0.get("image_query")
+                                   or _s0.get("image") or _s0.get("bg_image") or "")
+                subtitle = str(_s0.get("subtitle") or subtitle or "")
+                author = str(_s0.get("author") or author or "")
+
+        # 封面背景同样支持"给搜索词"（要横向的图）
+        cover_img = _image_value({"_bases": bases, "cover_image": cover_image},
+                                 "cover_image", wide=True)
+
+        if cover_img:
+            _used_imgs.add(cover_img)
         if cover:
-            _add_cover(prs, th, {"font": fname}, str(title or "演示文稿"),
-                       str(subtitle or ""), str(author or ""))
+            _add_cover(prs, th, {"font": fname, "veil": None},
+                       str(title or "演示文稿"), str(subtitle or ""),
+                       str(author or ""), cover_img=cover_img)
+
+        # 版式本身带图片位的（这几类写了 image 会被真的插进去）
+        IMG_LAYOUTS = {"image_right", "image_left", "image_full", "full_image",
+                       "quote", ""}
+        # 放不下配图的版式：写了 image/image_query 只能忽略 —— 但**必须出声**，
+        # 否则模型会以为插上了、用户看到一片空白（实测踩到，整份 PPT 零张图）。
+        NO_IMG_LAYOUTS = {"two_col", "two-column", "columns", "cards", "stats",
+                          "steps", "process", "timeline", "table", "toc",
+                          "chart", "section"}
 
         sec = 0
         made = 0
-        for sl in (slides or []):
+        for _idx, sl in enumerate(slides or []):
+            if _idx == _skip_idx:
+                continue
             if not isinstance(sl, dict):
                 continue
             s = dict(sl)
             s["_bases"] = bases
+            s["_warn"] = warnings     # 图片取不到时往这里记（_slide_image 读的是页字典）
+            s["_used"] = _used_imgs   # 同一份文稿内已用过的图片路径
             st = dict(s.get("style") or {})
             # ⚠️ 微调字段放在**页级**还是 `style` 里都认 —— 模型很自然会写成
             # {"title":"...", "accent":"C53030"}，只在 style 里找就会静默失效
             # （装饰一个都没出现，还不报错）。两处都收，style 优先。
             for k in ("accent", "bg", "card_bg", "title_color", "title_size",
                       "title_align", "body_size", "body_align", "font",
-                      "decor", "rule"):
+                      "decor", "rule", "veil", "veil_color", "logo_pos",
+                      "logo_size"):
                 if s.get(k) is not None and st.get(k) is None:
                     st[k] = s[k]
             st["font"] = st.get("font") or fname
+            st["_warn"] = warnings          # 图片取不到时往这里记，回报给模型
+            # 页级 logo 优先于全篇 logo（想只给某一页加角标就用它）
+            if str(s.get("logo") or "").strip():
+                st["_logo_path"] = _if.resolve(s.get("logo"), bases)
+            else:
+                st["_logo_path"] = logo_path
             st.setdefault("decor", (["page_number"] if page_number else []))
             if not page_number and "page_number" in (st.get("decor") or []):
                 st["decor"] = [d for d in st["decor"] if d != "page_number"]
             lay = str(s.get("layout") or "").strip().lower()
             if s.get("section"):
                 lay = "section"
+            # 兜底：封面配图写在别的地方时，也别让它变成一张普通内容页
+            if lay in ("cover", "封面"):
+                continue
             if not lay:
                 # 没写 layout 时按内容猜：有 table/cards/stats/steps/image 就用对应版式
                 for key, name in (("table", "table"), ("cards", "cards"),
@@ -958,6 +1268,17 @@ def build_pptx(path, title, slides, subtitle="", author="", theme=DEFAULT_THEME,
                 made += 1
                 _add_section(prs, th, st, str(s.get("title") or "章节"), sec, made + 1)
                 continue
+            has_img_intent = bool(str(s.get("image") or "").strip()
+                                  or str(s.get("image_query") or "").strip())
+            if has_img_intent and lay in NO_IMG_LAYOUTS:
+                warnings.append(
+                    "「%s」这一页写了配图，但版式 %s 放不下图 —— 已忽略。"
+                    "要配图请把这页改成 content / image_right / image_full"
+                    % (str(s.get("title") or "?")[:14], lay))
+            elif has_img_intent and lay in ("content", "") and made >= 0:
+                # content 页要配图 → 自动升级成"左文右图"，这是我们最常用的配图版式。
+                # 不升级的话，模型写在这儿的 image_query 会被无声丢掉。
+                lay = "image_right"
             fn = _LAYOUTS.get(lay)
             if fn is None:
                 warnings.append("不认识的版式「%s」，已按普通内容页处理" % lay)

@@ -427,11 +427,30 @@ def _render_table(doc, b, ctx):
 
 def _render_image(doc, b, ctx):
     src = str(b.get("src") or b.get("path") or "").strip()
-    if not src:
+    query = str(b.get("query") or b.get("image_query") or "").strip()
+    if not src and not query:
         return
-    path = _resolve(src, ctx["bases"])
+    # 没给图、只给了搜索词 → 联网找一张（结果按关键词缓存，不会重复搜）
+    # ⚠️ src 里也可能直接写的是搜索词，所以统一走 resolve_or_search。
+    from . import img_fetch
+    used = ctx.setdefault("used_imgs", set())
+    path = img_fetch.resolve(src, ctx["bases"]) if src else ""
+    if path and path in used:                  # 这份文稿里已经用过这张了
+        path = ""
+    if not path and (src or query):
+        for cand in (query, src):
+            c = img_fetch.as_query(cand)
+            if not c:
+                continue
+            path = img_fetch.search_one(c, exclude=used)
+            if path:
+                break
+    if path:
+        used.add(path)
+    if path and not src:
+        ctx.setdefault("fetched", []).append(query)
     if not path or not os.path.exists(path):
-        ctx["warnings"].append("图片找不到：%s" % src)
+        ctx["warnings"].append("图片找不到：%s" % (src or query))
         return
     st = b.get("style") or {}
     width = st.get("width")
@@ -503,37 +522,47 @@ def _render_end(doc, b, ctx):
 # 主入口
 # --------------------------------------------------------------------------
 def _resolve(src, bases):
-    src = str(src or "").strip().strip('"')
-    if not src:
-        return ""
-    if os.path.isabs(src) and os.path.exists(src):
-        return src
-    for base in (bases or []):
-        if not base:
-            continue
-        cand = os.path.join(base, src.lstrip("/\\"))
-        if os.path.exists(cand):
-            return cand
-    return src if os.path.isabs(src) else ""
+    """把模型写的图片来源变成本地文件（绝对路径 / 网址 / 图库 id / 文件名都认）。
+
+    统一走 `img_fetch`：网图会自动下载并缓存到本地，webp 会转成 png
+    （python-docx 不认 webp）。细节见 img_fetch 模块说明。
+    """
+    from . import img_fetch
+    return img_fetch.resolve(src, bases)
 
 
-def _apply_header_footer(doc, ctx, text, skip_first=False):
-    """页眉 + 页脚页码。域不会自动算，交给 Word/WPS 打开时更新。
+def _apply_header_footer(doc, ctx, text, skip_first=False, logo=""):
+    """页眉（可带 logo）+ 页脚页码。域不会自动算，交给 Word/WPS 打开时更新。
 
     skip_first=True 时首页（封面）不显示页眉页码 —— 规范做法。
     """
+    logo_path = _resolve(logo, ctx.get("bases")) if str(logo or "").strip() else ""
     for sec in doc.sections:
         if skip_first:
             try:
                 sec.different_first_page_header_footer = True
             except Exception:
                 pass
+        # logo 放页眉最右，正文页眉居中另起一段 —— 同一段里两种对齐做不到
+        last = None
+        if logo_path and os.path.exists(logo_path):
+            lp = sec.header.paragraphs[0]
+            lp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            _spacing(lp, before=0, after=0, line=1.0)
+            try:
+                lp.add_run().add_picture(logo_path, height=Pt(16))
+                last = lp
+            except Exception:
+                pass
         if text:
-            hp = sec.header.paragraphs[0]
+            hp = (sec.header.add_paragraph()
+                  if (last is not None) else sec.header.paragraphs[0])
             hp.alignment = WD_ALIGN_PARAGRAPH.CENTER
             _spacing(hp, before=0, after=0, line=1.0)
             _add_runs(hp, text, 9, ctx["th"]["muted"], ctx["body_font"])
-            _para_border(hp, "bottom", ctx["th"]["line"], size=6, space=4)
+            last = hp
+        if last is not None:
+            _para_border(last, "bottom", ctx["th"]["line"], size=6, space=4)
         fp = sec.footer.paragraphs[0]
         fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
         _spacing(fp, before=0, after=0, line=1.0)
@@ -724,7 +753,7 @@ def build_docx_text(path, title, text, **kw):
 
 def build_docx(path, title, blocks, subtitle="", author="", date_text="",
                theme=DEFAULT_THEME, font=DEFAULT_FONT, cover=False,
-               header="", toc=False, margins=2.5, bases=None):
+               header="", toc=False, margins=2.5, bases=None, logo=""):
     """把结构化内容生成 docx，返回 {'ok','path','blocks','pages','warnings','error'}。
 
     blocks 每项：{'type': ..., 其余字段见模块 docstring}
@@ -766,8 +795,9 @@ def build_docx(path, title, blocks, subtitle="", author="", date_text="",
             if add_block(doc, b, ctx):
                 n += 1
 
-        if cover or header:
-            _apply_header_footer(doc, ctx, str(header or ""), skip_first=bool(cover))
+        if cover or header or logo:
+            _apply_header_footer(doc, ctx, str(header or ""), skip_first=bool(cover),
+                                 logo=str(logo or ""))
         if toc or ctx.get("want_toc"):
             _mark_update_fields(doc)
 

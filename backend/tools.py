@@ -67,11 +67,19 @@ _MAKE_PPTX_SCHEMA = {
             "· 每页用 layout 选版式（不写就按内容自动判断）：\n"
             "  content 标题+要点(默认) / two_col 左右两栏(用 left/right，可配 left_title/right_title)\n"
             "  / image_right|image_left 图文并排 / image_full 整页大图\n"
-            "  / table 表格(给 table:{header,rows}) / cards 卡片组(给 cards:[{title,text}])\n"
+            "  / table 表格(给 table:{header,rows}) / **chart 图表**\n"
+            "    (给 chart:{kind:\"bar|barh|line|pie|doughnut|area\", categories:[...],\n"
+            "     series:[{name,values}], labels:true 显示数值, title 图表标题} —— 柱状/条形/折线/饼图/圆环/面积)\n"
+            "  / cards 卡片组(给 cards:[{title,text}])\n"
             "  / stats 大数字(给 stats:[{value,label}]) / steps 流程步骤(给 steps:[{title,text}])\n"
             "  / timeline 时间线(给 items:[{title,text}]) / quote 整页引言(给 quote:{text,from})\n"
             "  / toc 目录(给 items 字符串数组) / section 章节过渡页(只要 title)\n"
-            "· 装饰：每页可加 decor，可选 page_number / band 侧边色带 / corner 角标圆 / dots 圆点。\n"
+            "· 配图：每页写 image（本地路径 / 图片库 id / 网图网址），"
+            "**或者只写 image_query 让它自动联网搜一张合适的图插进去** ——\n"
+            "  用户说「配点图 / 图文并茂 / 找张图放上去」时，就给相关页写 image_query。\n"
+            "· 装饰：每页可加 decor，可选 page_number / band 侧边色带 / corner 角标圆 / dots 圆点；\n"
+            "  还可写 bg_image（整页背景图，会自动压一层半透明蒙版保证文字可读）、"
+            "logo（本页角落小图标）。全篇统一加 logo 用顶层 logo 参数。\n"
             "· 微调：每页可直接写 accent 强调色 / bg 底色 / title_color / title_size / "
             "body_size / card_bg / title_align（也可放进 style 对象里）。\n"
             "· 单条要点微调：bullets 里可以写 {\"text\":\"...\",\"bold\":true,\"color\":\"C53030\","
@@ -89,6 +97,12 @@ _MAKE_PPTX_SCHEMA = {
                 "filename": {"type": "string",
                              "description": "保存的文件名，不用带 .pptx 后缀；不给就用标题"},
                 "end_text": {"type": "string", "description": "结尾页文字，默认「谢谢观看」"},
+                "cover_image": {"type": "string",
+                                "description": "封面整页背景图（路径 / 图片库 id / 网址 / 搜索词）"},
+                "logo": {"type": "string",
+                         "description": "每页角落的 logo 小图（路径 / 图片库 id / 网址）"},
+                "logo_pos": {"type": "string",
+                             "description": "logo 位置：tr 右上(默认) / tl 左上 / br 右下 / bl 左下"},
                 "slides": {
                     "type": "array",
                     "description": "每一页，按顺序排。建议 5~15 页，每页要点 3~6 条。",
@@ -110,10 +124,22 @@ _MAKE_PPTX_SCHEMA = {
                             "left_title": {"type": "string", "description": "two_col 左栏小标题"},
                             "right_title": {"type": "string", "description": "two_col 右栏小标题"},
                             "image": {"type": "string",
-                                      "description": "图片路径（本地绝对路径，或文库里的文件名）"},
+                                      "description": "图片：本地路径 / 图片库 id / 网图网址 / "
+                                                     "文库里的文件名"},
+                            "image_query": {"type": "string",
+                                            "description": "**没图但想要图**时的联网搜索词，"
+                                                           "如「校园 图书交换 活动」。"
+                                                           "系统会自动搜一张插进来"},
+                            "bg_image": {"type": "string",
+                                         "description": "整页背景图（同上来源）；"
+                                                        "会自动加蒙版，文字转白色"},
+                            "logo": {"type": "string", "description": "本页角落 logo，可选"},
                             "image_caption": {"type": "string", "description": "图片说明，可选"},
                             "table": {"type": "object",
                                       "description": "layout=table 时用：{header:[...],rows:[[...]]}"},
+                            "chart": {"type": "object",
+                                      "description": "layout=chart 时用：{kind,categories,"
+                                                     "series:[{name,values}],labels,title}"},
                             "cards": {"type": "array", "description":
                                       "layout=cards 时用：[{title,text}]，2~4 张"},
                             "stats": {"type": "array", "description":
@@ -158,7 +184,9 @@ _MAKE_DOCX_SCHEMA = {
             "  bullet 无序列表（items 数组）/ number 有序列表（items）\n"
             "  quote 引用（text + 可选 from）/ callout 提示框（tag + text，带底色和色条）\n"
             "  table 表格（header 数组 + rows 二维数组 + 可选 caption）\n"
-            "  image 图片（src）/ code 代码块（text）/ divider 分隔线\n"
+            "  image 图片（src 给路径/图片库 id/网图网址；**没有图就改给 query 搜索词**，\n"
+            "        系统会联网搜一张插进来，可配 caption 图注、style.width 控宽度 cm）\n"
+            "  / code 代码块（text）/ divider 分隔线\n"
             "  pagebreak 分页 / toc 目录 / end 结束语\n"
             "· 正文里可用 **加粗**、*斜体*、`等宽` 做局部强调。\n"
             "· 列表里以「- 」或两个空格开头＝二级条目。\n"
@@ -179,6 +207,8 @@ _MAKE_DOCX_SCHEMA = {
                 "filename": {"type": "string", "description": "文件名，不用带 .docx 后缀"},
                 "cover": {"type": "boolean", "description": "是否生成封面页（标题居中）"},
                 "header": {"type": "string", "description": "页眉文字，可选"},
+                "logo": {"type": "string",
+                         "description": "页眉右侧的 logo 小图（路径 / 图片库 id / 网址），可选"},
                 "toc": {"type": "boolean",
                         "description": "是否插入目录页（打开文档时自动生成）"},
                 "blocks": {
@@ -210,7 +240,8 @@ _EDIT_OFFICE_SCHEMA = {
             "  {\"op\":\"set_text\",\"slide\":3,\"shape\":1,\"text\":\"新文字\"}  改某个元素的文字\n"
             "  {\"op\":\"set_text_style\",\"slide\":3,\"shape\":1,\"size\":34,\"color\":\"C53030\",\"bold\":true}\n"
             "  {\"op\":\"add_text\",\"slide\":3,\"text\":\"...\",\"x\":0.9,\"y\":6.3,\"w\":6,\"h\":0.5,\"size\":16,\"color\":\"...\",\"align\":\"center\"}\n"
-            "  {\"op\":\"add_image\",\"slide\":3,\"src\":\"图片路径\",\"x\":1,\"y\":1.5,\"w\":5,\"h\":4}\n"
+            "  {\"op\":\"add_image\",\"slide\":3,\"src\":\"图片路径|图片库id|网图网址\",\"x\":1,\"y\":1.5,\"w\":5,\"h\":4}\n"
+            "    也可以不给 src 而给 {\"query\":\"搜索词\"} → 自动联网搜一张插进去\n"
             "  {\"op\":\"add_shape\",\"slide\":3,\"kind\":\"rect|round|oval\",\"x\":1,\"y\":1,\"w\":2,\"h\":1,\"fill\":\"2E75B6\"}\n"
             "  {\"op\":\"delete_shape\",\"slide\":3,\"shape\":2} / {\"op\":\"set_bg\",\"slide\":3,\"color\":\"FFF7E6\"}\n"
             "  {\"op\":\"set_notes\",\"slide\":3,\"text\":\"备注\"} / {\"op\":\"set_theme\",\"theme\":\"green\"} 整份换配色\n"
@@ -2187,6 +2218,10 @@ def _do_make_pptx(arguments=None) -> str:
         end_text=str(a.get("end_text") or "谢谢观看"),
         font=str(a.get("font") or "yahei"),
         img_bases=_img_bases(),
+        logo=str(a.get("logo") or ""),
+        cover_image=str(a.get("cover_image") or ""),
+        logo_pos=str(a.get("logo_pos") or "tr"),
+        logo_size=float(a.get("logo_size") or 0.5),
     )
     if not r.get("ok"):
         return "生成 PPT 失败：%s" % r.get("error")
@@ -2222,21 +2257,11 @@ def _do_make_pptx(arguments=None) -> str:
 def _img_bases() -> list:
     """图片搜索目录：模型给的图片常常只说个文件名。
 
-    素材可能来自生成文库、当前工作区项目、图片库，三处都找一遍。
+    素材可能来自生成文库、当前工作区项目、图片库、用户存图、下载缓存 ——
+    统一由 img_fetch 给出（顺序即优先级）。
     """
-    from . import doclib as _dl
-    bases = [_dl.LIB_DIR]
-    try:
-        from . import workspace as _ws
-        bases.append(_ws.root())          # 当前工作区项目目录
-    except Exception:
-        pass
-    try:
-        from . import image_library as _il
-        bases.append(_il.DIR)
-    except Exception:
-        pass
-    return [b for b in bases if b]
+    from . import img_fetch
+    return img_fetch.default_bases()
 
 
 def _pick_blocks(a: dict) -> list:
@@ -2340,6 +2365,7 @@ def _do_make_docx(arguments=None) -> str:
         header=str(a.get("header") or ""),
         toc=bool(a.get("toc")),
         bases=_img_bases(),
+        logo=str(a.get("logo") or ""),
     )
     if not r.get("ok"):
         return "生成文档失败：%s" % r.get("error")
