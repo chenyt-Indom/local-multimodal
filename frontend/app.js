@@ -518,7 +518,11 @@
     }
   }
 
-  document.querySelectorAll(".pill").forEach((p) => {
+  // ⚠️ 只给**真正的开关**（带 data-cfg 的）绑开关逻辑。
+  // 原来选的是 ".pill"，结果顶栏那个「地图缓存」按钮（借用了 .pill 的外观）
+  // 也被一起抓进来，`p.onclick = ...` 会**覆盖掉它自己的点击处理**，
+  // 表现就是"按钮点了完全没反应"。加 [data-cfg] 限定就好。
+  document.querySelectorAll(".pill[data-cfg]").forEach((p) => {
     p.onclick = async () => {
       const key = p.dataset.cfg;
       const turningOn = !p.classList.contains("on");
