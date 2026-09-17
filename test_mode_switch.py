@@ -99,6 +99,14 @@ def tile_probe(path):
 def main():
     print("=" * 62)
     print("联网 / 离线 来回切换验证  ->  %s" % BASE)
+    # ⚠️ 期望的底图要**按环境算**，不能写死成 amap：
+    #    配了高德 key 才是 amap；Docker 分发包默认不带 key，联网时也是 osm。
+    #    写死的话拿去验分发包会得到一堆假失败。
+    cfg = (get("/api/config").get("config") or {})
+    has_key = bool(cfg.get("amap_key"))
+    want_online_src = "amap" if has_key else "osm"
+    print("环境：高德 key %s → 联网时期望底图 = %s"
+          % ("已配置" if has_key else "未配置", want_online_src))
     print("=" * 62)
 
     for rd in (1, 2, 3):
@@ -109,7 +117,8 @@ def main():
         st = set_mode(True)
         print("【联网】")
         check("开关切到联网", st.get("online") is True)
-        check("底图=高德", st.get("tile_source") == "amap", st.get("tile_source_name"))
+        check("底图=%s" % want_online_src, st.get("tile_source") == want_online_src,
+              st.get("tile_source_name"))
 
         # 高德瓦片：取一张**这个城市 z=14 的瓦片**（每轮换城市＝大概率没缓存过）
         cname, clat, clon = CITIES[(rd - 1) % len(CITIES)]
