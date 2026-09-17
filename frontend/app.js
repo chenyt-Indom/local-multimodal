@@ -161,11 +161,31 @@
     messagesEl.scrollTop = messagesEl.scrollHeight;
     return el;
   }
+  // 回答里的**站内下载链接**渲染成可点按钮。
+  // ⚠️ 为什么需要：气泡一直用 textContent（纯文本，防 XSS），而模型很爱写
+  // Markdown 的 [点击下载](/api/doclib/download?rel=xxx)，用户看到的是一坨带
+  // 方括号的原文，**点不动** —— 生成 PPT 这类功能等于废了一半。
+  // 只认**站内路径**（以 /api/ 开头）：外链一律不自动变可点，免得模型随口
+  // 编个网址就变成能点的（那种才是真危险）。
+  // ⚠️ 必须放在顶层（不能塞进里面那个作用域）—— **实时回答**和**恢复历史
+  // 记录**是两条不同的渲染路径，两边都要用得到。
+  function renderAnswerLinks(bubble, text) {
+    const esc = escapeHtml(text);
+    let html = esc.replace(/\[([^\]]{1,40})\]\((\/api\/[^\s)]+)\)/g,
+      (_, label, url) => `<a class="dl-link" href="${url}" download>${label}</a>`);
+    html = html.replace(/(^|[\s（(])(\/api\/(?:doclib\/download|ws\/zip)[^\s<)）]*)/g,
+      (_, pre, url) => `${pre}<a class="dl-link" href="${url}" download>点击下载</a>`);
+    bubble.innerHTML = html.replace(/\n/g, "<br>");
+  }
+
   function addMsg(role, text) {
     const el = document.createElement("div");
     el.className = "msg " + role;
     el.innerHTML = `<div class="bubble"></div>`;
-    el.querySelector(".bubble").textContent = text;
+    // 助手的历史回答也走一遍链接渲染 —— 否则程序重启后恢复出来的对话里，
+    // 之前给过的下载链接又变回不能点的纯文本了（实测踩到）。
+    if (role === "assistant") renderAnswerLinks(el.querySelector(".bubble"), text);
+    else el.querySelector(".bubble").textContent = text;
     messagesEl.appendChild(el);
     messagesEl.scrollTop = messagesEl.scrollHeight;
     return el;
@@ -1634,7 +1654,8 @@
       return card;
     };
 
-    // 模型回答里的 ```代码块```：渲染成同样的可编辑卡片（不然只能干看着文本）
+    // 回答里的**站内下载链接**渲染成可点按钮（实现在文件上方 addMsg 附近，
+    // 那里是顶层函数声明，历史恢复和实时回答两条路径都能用）。
     const renderAnswerWithCode = (bubble, text, userText) => {
       const parts = [];
       const re = /```([a-zA-Z0-9_+#.-]*)[ \t]*\n([\s\S]*?)```/g;
@@ -1904,7 +1925,7 @@
       finishThinking();
       // 回答里带代码块的话渲染成可编辑卡片；否则维持原来的纯文本（不改变原有观感）
       if (answer && answer.indexOf("```") >= 0) renderAnswerWithCode(answerBubble, answer, promptText);
-      else answerBubble.textContent = answer;
+      else renderAnswerLinks(answerBubble, answer);
       if (!answer) {
         // 别把空白气泡藏起来让用户一脸茫然——明确说明发生了什么
         answerBubble.textContent = notes.length

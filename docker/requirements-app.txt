@@ -11,3 +11,6 @@ opencv-python-headless>=4.9
 # 不装的话容器里 PDF 会读不出文字，而知识库面板只会显示"读不了"。
 # docx/xlsx/pptx/xls 走标准库解析，不需要额外依赖。
 pypdf>=4.0
+
+# 生成 PPT（make_pptx 工具）。纯 Python（lxml + XlsxWriter），无编译依赖。
+python-pptx>=1.0.0

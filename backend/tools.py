@@ -47,6 +47,59 @@ _WS_PACK_SCHEMA = {
     },
 }
 
+# ---------- PPT 生成 ----------
+# 用户 2026-09-17 提的需求：「模型能生成 PPT 吗？面向各领域的都要能排。」
+# 设计要点：**模型只填内容，不写代码** —— 8B 模型即兴写 python-pptx 代码
+# 又慢又容易错，每次效果还不一样。这里让它输出「标题 + 要点」，排版交给
+# backend/pptx_maker.py，稳定性高一个量级。
+_MAKE_PPTX_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "make_pptx",
+        "description": (
+            "【做PPT】把内容排成一份真正的 .pptx 演示文稿，返回可直接点击的下载链接。"
+            "用户说「做个PPT / 写个演示稿 / 汇报材料 / 答辩PPT / 方案演示 / 讲解稿」时用它。"
+            "**你只管想内容**（封面标题 + 每页要点），排版由工具完成，不用写代码。"
+            "用法：先想清楚大纲（每页一个 title + 若干条 bullets），再一次性传进来。"
+            "要点里如果以「- 」或两个空格开头，会被排成二级条目（用于细分说明）。"
+            "slides 里把 section 设为 true 就是一张章节过渡页（只显示大标题，不带要点）。"
+            "配色按主题选：blue 通用/学术、green 环保/健康、warm 生活/文创、"
+            "purple 科技/创意、mono 极简/正式、red 警示/总结。"
+            "生成后把返回的下载链接**原样**给用户。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "封面主标题"},
+                "subtitle": {"type": "string", "description": "封面副标题，可选，一句话点题"},
+                "author": {"type": "string", "description": "封面落款，如「姓名 · 单位 · 日期」，可选"},
+                "theme": {"type": "string",
+                          "description": "配色：blue(默认) / green / warm / purple / mono / red"},
+                "filename": {"type": "string",
+                             "description": "保存的文件名，不用带 .pptx 后缀；不给就用标题"},
+                "end_text": {"type": "string", "description": "结尾页文字，默认「谢谢观看」"},
+                "slides": {
+                    "type": "array",
+                    "description": "每一页，按顺序排。建议 5~15 页，每页要点 3~6 条。",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string", "description": "这一页的标题"},
+                            "bullets": {"type": "array", "items": {"type": "string"},
+                                        "description": "要点列表；「- 」或两空格开头＝二级条目"},
+                            "notes": {"type": "string", "description": "演讲者备注，可选"},
+                            "section": {"type": "boolean",
+                                        "description": "true＝章节过渡页（只有大标题）"},
+                        },
+                        "required": ["title"],
+                    },
+                },
+            },
+            "required": ["title", "slides"],
+        },
+    },
+}
+
 _WS_LIST_SCHEMA = {
     "type": "function",
     "function": {
@@ -495,6 +548,9 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
     # ⚠️ 这几个以前**只给了代码模型的文本协议**，默认模型看不到，用户会觉得"它没这个能力"。
     schemas.extend(_WS_PROJECT_SCHEMAS)
     schemas.append(_WS_PACK_SCHEMA)
+    # 生成 PPT：纯本机操作（不联网、不执行用户代码），所以**不挂任何开关**，
+    # 始终可用 —— 和「记忆」「文库」一样的待遇。
+    schemas.append(_MAKE_PPTX_SCHEMA)
     # ⚠️ `write_code`（让专用代码模型代写代码）**暂时不启用** ——
     # 用户 2026-09-16 试过之后要求换回"按轮切换代码模型"的架构。
     # 原因：这台机器 12GB 显存装不下两个模型，每调一次 write_code 就要重新加载大脑，
@@ -813,6 +869,8 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
         return _do_workspace_move(arguments, ui_events)
     if name == "workspace_pack":
         return _do_workspace_pack(arguments)
+    if name == "make_pptx":
+        return _do_make_pptx(arguments)
     if name == "web_read":
         return _do_web_read(arguments)
     if name == "github_push":
@@ -1923,6 +1981,71 @@ def _do_workspace_pack(arguments=None) -> str:
     if saved:
         lines.append("文件也在：%s" % saved)
     return "\n".join(lines)
+
+
+# Windows 文件名里不允许的字符 —— 标题里常带「？」「：」这类，必须洗掉
+_BAD_FN = re.compile(r'[\\/:*?"<>|\r\n\t]')
+
+
+def _do_make_pptx(arguments=None) -> str:
+    """把结构化内容生成 .pptx，存进生成文库，返回可点下载链接。
+
+    ⚠️ 生成的是**二进制**文件，所以走 `doclib.save_bytes` + `/api/doclib/download`，
+    不能用 `doclib.write_file`（那个是给文本用的，二进制会被当文字写坏）。
+    """
+    import tempfile
+
+    from . import doclib as _dl
+    from . import pptx_maker as _pp
+
+    a = arguments or {}
+    title = str(a.get("title") or "").strip()
+    slides = a.get("slides") or []
+    if not title:
+        return "错误：缺少 title（封面主标题）。"
+    if not slides:
+        return ("错误：缺少 slides（至少要有一页内容）。"
+                "请先想好大纲：每页给一个 title 和几条 bullets。")
+
+    base = str(a.get("filename") or title).strip()
+    base = _BAD_FN.sub("", base).strip(" .")[:60] or "演示文稿"
+    if not base.lower().endswith(".pptx"):
+        base += ".pptx"
+
+    tmp = os.path.join(tempfile.gettempdir(),
+                       "mm_pptx_%d.pptx" % int(time.time() * 1000))
+    r = _pp.build_pptx(
+        tmp, title, slides,
+        subtitle=str(a.get("subtitle") or ""),
+        author=str(a.get("author") or ""),
+        theme=str(a.get("theme") or "blue"),
+        end_text=str(a.get("end_text") or "谢谢观看"),
+    )
+    if not r.get("ok"):
+        return "生成 PPT 失败：%s" % r.get("error")
+
+    try:
+        with open(tmp, "rb") as f:
+            data = f.read()
+    except Exception as e:
+        return "读取生成的临时文件失败：%s" % e
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+    w = _dl.save_bytes(base, data)
+    if not w.get("ok"):
+        return "写入生成文库失败：%s" % w.get("error")
+
+    n_pages = r.get("slides") or len(slides)
+    return ("已生成 PPT《%s》——共 %d 页，%.0f KB。\n"
+            "下载链接（**直接点就能存下来，原样给用户**）：\n"
+            "/api/doclib/download?rel=%s\n"
+            "（源文件也放在「生成文库」里，文件名 %s，可以随时再下。）"
+            % (title, n_pages, len(data) / 1024.0,
+               urllib.parse.quote(base), base))
 
 
 def _strip_code_fence(text: str) -> str:

@@ -952,3 +952,19 @@ body.dragging .drop-overlay,
 .studio-runargs::placeholder { color: #8a8a8a; }
 .studio-runargs:focus { outline: none; border-color: var(--accent, #4a9eff); }
 
+
+
+/* 回答里的站内下载链接（生成的 PPT / 打包的 zip）—— 渲染成可点按钮。
+   以前气泡是纯文本，模型写的 Markdown 链接点不动。 */
+.bubble .dl-link {
+  display: inline-block;
+  margin: 5px 3px;
+  padding: 4px 13px;
+  border-radius: 6px;
+  background: #2e75b6;
+  color: #fff !important;
+  text-decoration: none;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.bubble .dl-link:hover { background: #1f4e79; }

@@ -26,3 +26,6 @@ spandrel>=0.4
 
 # 打包应用
 pyinstaller>=6.0
+# 生成 PPT（make_pptx 工具）。纯 Python 库，约 10MB，带 lxml + XlsxWriter。
+# 用它而不是让模型即兴写 pptx 代码 —— 稳定性高一个量级。
+python-pptx>=1.0.0

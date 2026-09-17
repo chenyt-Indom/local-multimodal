@@ -1335,6 +1335,13 @@ _TEXT_TOOL_DOCS = {
     "search_knowledge": '在用户的知识库里检索资料。参数 {"query": "检索词"}',
     "generate_image": '生成一张图片并展示（可以直接当网页 / 应用的素材）。'
                       '参数 {"prompt": "画面描述", "size": 512}',
+    "make_pptx": '生成一份真正的 PPT（.pptx），存进生成文库并给出可点下载链接。'
+                 '**你只管想内容，排版由工具做，不用写代码。**'
+                 '参数 {"title": "封面主标题", "subtitle": "副标题（可选）", '
+                 '"author": "落款（可选）", "theme": "blue/green/warm/purple/mono/red", '
+                 '"slides": [{"title": "页标题", "bullets": ["要点1", "- 二级要点"], '
+                 '"section": false}]} —— section=true 是章节过渡页。'
+                 '生成后把返回的下载链接**原样**告诉用户。',
     "get_time": '获取当前日期与时间。参数 {}',
 }
 _TEXT_TOOL_NAMES = set(_TEXT_TOOL_DOCS)
