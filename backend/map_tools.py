@@ -192,6 +192,46 @@ def _source_tag(net: bool) -> str:
         return "osm"
 
 
+# 会用到的数据源（缓存键前缀）
+_SOURCES = ("amap", "osm")
+
+
+def _src_cache_keys(net: bool, parts) -> list:
+    """给出**候选缓存键**（按优先级排序），每条都带数据源前缀。
+
+    ⚠️⚠️ 离线时必须把所有数据源都试一遍，否则离线模式的立身之本就没了。
+    原因：`_source_tag(net)` 在**离线时返回 `"off"`**，而联网写入用的前缀是
+    `"amap"` / `"osm"` —— 离线只查 `"off|…"` 就**永远读不到**，
+    于是"联网查过一次、断网还能用"直接失效（实测踩到：地名和路线都重放不出来，
+    回归测试里 5 项断言挂掉）。这里统一成：**写只用当前源，读要把所有源都找一遍**。
+
+    参数 parts 是键的各段（不含数据源），例如：
+      · 地名  ["广州", "天河城"]  → amap|广州|天河城
+      · 路线  ["driving", "汕头大学", "汕头站"]
+      · 周边  ["餐厅", "23.416,116.629", 1500]
+    """
+    body = "|".join(str(p) for p in parts)
+    tags = [_source_tag(True)] if net else list(_SOURCES)
+    keys = [_ckey("%s|%s" % (t, body)) for t in tags]
+    if not net:
+        # 兼容更早的两种老写法：
+        #   · **完全不带前缀**（`driving|汕头大学|汕头站`）—— 加数据源前缀之前的格式，
+        #     用户本地攒下来的老缓存全是这种，读不到的话"断网重放"就白搭；
+        #   · 带 `off|` 前缀（中途版本用过）。
+        keys.append(_ckey(body))
+        keys.append(_ckey("off|%s" % body))
+    return keys
+
+
+def _cache_pick(cache: dict, keys: list):
+    """按优先级在缓存里挑第一条命中的记录，没有就 None。"""
+    for k in keys:
+        v = cache.get(k)
+        if v:
+            return v
+    return None
+
+
 # ---------------------------------------------------------------- 结果缓存
 # 为什么要它：离线模式能干什么，全看这里攒了多少东西。
 # 联网查过的地名、算过的路线都留在本地，之后断网还能重放。
@@ -511,8 +551,10 @@ def search_place(query: str, limit: int = 5, allow_net=None, city: str = "") -> 
     net = online() if allow_net is None else bool(allow_net)
 
     # ① 本地缓存：没过期就直接用；**过期了在联网时会重查一遍**（这就是"自动更新"）
-    ck = _source_tag(net) + "|" + (str(city or "").strip() + "|" if city else "") + q
-    hit = _load_cache(_GEO_FILE).get(_ckey(ck))
+    #    ⚠️ keys[0] 是"写入用"的键（带当前数据源前缀）；离线时 keys 里
+    #    会把所有源都列上 —— 详见 _src_cache_keys 的注释（不这么做就重放不出来）。
+    keys = _src_cache_keys(net, ([city] if str(city or "").strip() else []) + [q])
+    hit = _cache_pick(_load_cache(_GEO_FILE), keys)
     if hit and hit.get("results") and _fresh(hit.get("ts"), _TTL_GEO):
         return [dict(r, from_cache=True, cache_ts=hit.get("ts"))
                 for r in hit["results"][:limit]]
@@ -550,7 +592,7 @@ def search_place(query: str, limit: int = 5, allow_net=None, city: str = "") -> 
                     if hits and not re.search(r"[路街巷号市区县镇村]", q):
                         hits = [dict(h, loose=True) for h in hits]
                 if hits:
-                    cache_put(_GEO_FILE, _ckey(ck), {"ts": _now(), "results": hits})
+                    cache_put(_GEO_FILE, keys[0], {"ts": _now(), "results": hits})
                     return hits[:limit]
         except Exception:
             pass
@@ -577,7 +619,7 @@ def search_place(query: str, limit: int = 5, allow_net=None, city: str = "") -> 
                 except Exception:
                     continue
             if out:
-                cache_put(_GEO_FILE, _ckey(ck), {"ts": _now(), "results": out})
+                cache_put(_GEO_FILE, keys[0], {"ts": _now(), "results": out})
                 return out[:limit]
         except Exception:
             pass      # 网断了 / Photon 挂了 → 继续往下走兜底
@@ -752,10 +794,10 @@ def plan_route(origin: str, dest: str, mode: str = "driving", allow_net=None,
          "骑行": "bike", "自行车": "bike", "cycling": "bike", "bike": "bike"}.get(
         str(mode or "").strip().lower(), "driving")
     net = online() if allow_net is None else bool(allow_net)
-    key = "%s|%s|%s|%s" % (_source_tag(net), m, _ckey(origin), _ckey(dest))
+    keys = _src_cache_keys(net, [m, _ckey(origin), _ckey(dest)])
 
     # ① 本地缓存：没过期直接用；过期了联网时重算
-    hit = _load_cache(_ROUTE_FILE).get(key)
+    hit = _cache_pick(_load_cache(_ROUTE_FILE), keys)
     if hit and hit.get("routes") and _fresh(hit.get("ts"), _TTL_ROUTE):
         return _serve_cached(hit, m, net, want_weather)
 
@@ -779,7 +821,8 @@ def plan_route(origin: str, dest: str, mode: str = "driving", allow_net=None,
                 rt.setdefault("traffic_lights", 0)
                 rt["recommended"] = (rt["idx"] == best)
                 rt["reason"] = reason if rt["idx"] == best else ""
-            cache_put(_ROUTE_FILE, key, {"ts": _now(), "routes": routes, "best": best,
+            cache_put(_ROUTE_FILE, keys[0], {"ts": _now(), "routes": routes,
+                                             "best": best,
                                          "source": "amap",
                                          # 起终点也要存：从缓存出结果时不能丢名字
                                          "from_name": a["name"], "from_lat": a["lat"],
@@ -804,7 +847,7 @@ def plan_route(origin: str, dest: str, mode: str = "driving", allow_net=None,
                 for r in routes:
                     r["recommended"] = (r["idx"] == best)
                     r["reason"] = reason if r["idx"] == best else ""
-                cache_put(_ROUTE_FILE, key, {"ts": _now(), "routes": routes,
+                cache_put(_ROUTE_FILE, keys[0], {"ts": _now(), "routes": routes,
                                              "best": best,
                                              # 起终点也要存：从缓存出结果时不能丢名字
                                              "from_name": a["name"], "from_lat": a["lat"],
@@ -971,7 +1014,38 @@ def get_tile(z: int, x: int, y: int, allow_net=None, src: str = ""):
                 pass
             return data, False
     # 一张都没下到：过期的旧瓦片也比没有强
-    return (old, True) if old else (None, False)
+    if old:
+        return old, True
+    # ⚠️ 高德**只管中国大陆**：境外的瓦片是**空白**的（实测 179 字节纯色 PNG，
+    #    不报错）。落在境外就直接拿**同号**的 OSM 瓦片顶上 ——
+    #    境外 GCJ-02 与 WGS-84 是重合的（偏移算法只在国境内生效），
+    #    所以同号即同一块地，位置不会错。
+    #    境内**不出这招**：真出问题（参数写错、服务挂了）必须让它 404 看得见，
+    #    否则又会变成"地图一片空白、还查不出原因"（这个坑刚踩过）。
+    if src == "amap":
+        la, lo = _tile_center(z, x, y)
+        if not _in_china(la, lo):
+            return get_tile(z, x, y, allow_net=allow_net, src="osm")
+    return None, False
+
+
+def _tile_center(z: int, x: int, y: int):
+    """瓦片中心点的经纬度（用来判断这块瓦片在不在国内）。"""
+    n = 1 << z
+    lon = (x + 0.5) / n * 360.0 - 180.0
+    lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2.0 * (y + 0.5) / n))))
+    return lat, lon
+
+
+def _in_china(lat: float, lon: float) -> bool:
+    """是否落在国内（范围和 GCJ-02 偏移判定用的那套一致）。
+
+    ⚠️ 这是个**矩形近似**，不是国境线。蒙古、中南半岛北部（河内/曼谷一线以北）、
+    中亚部分落在矩形内会被判成"境内"。后果：那些地方高德同样没数据，
+    但我们不会回退 OSM，于是那块地会空白（不是错位，只是没有底图）。
+    港澳台高德有数据，不受影响。要更准得上国境线多边形，目前不值得。
+    """
+    return 73.66 < lon < 135.05 and 3.86 < lat < 53.55
 
 
 def _lonlat_to_tile(lat: float, lon: float, z: int):
@@ -1288,10 +1362,11 @@ def nearby(lat: float, lon: float, category: str, radius: int = 1500,
     limit = max(1, min(60, int(limit or 20)))
     # ⚠️ 缓存键必须带**数据源** —— 高德和 OSM 的结果质量差很多，
     # 共用一个键会出这种事（实测踩过）：刚配好高德 key，看到的却还是旧的 OSM 数据。
-    key = "%s|%s|%.3f,%.3f|%d" % (_source_tag(net), cat, lat, lon, radius)
+    # ⚠️ 同样是**候选键列表**：离线时要把所有源都找一遍（见 _src_cache_keys）
+    keys = _src_cache_keys(net, [cat, "%.3f,%.3f" % (lat, lon), radius])
 
     # 先看缓存（Overpass 会 429，缓存是必须的，不是优化）
-    hit = _load_cache(_NB_FILE).get(key)
+    hit = _cache_pick(_load_cache(_NB_FILE), keys)
     if hit and hit.get("items") and _fresh(hit.get("ts"), _TTL_NEARBY):
         res = dict(hit["items"])
         res["from_cache"] = True
@@ -1312,7 +1387,7 @@ def nearby(lat: float, lon: float, category: str, radius: int = 1500,
     # 而且带**真实评分**和人均消费 —— 这正是用户要的东西。
     _am = _nearby_amap(lat, lon, cat, radius, limit)
     if _am:
-        cache_put(_NB_FILE, key, {"ts": _now(), "items": _am})
+        cache_put(_NB_FILE, keys[0], {"ts": _now(), "items": _am})
         return _am
 
     # ---- 回退 Overpass（没配 key / 高德失败）----
@@ -1367,7 +1442,7 @@ def nearby(lat: float, lon: float, category: str, radius: int = 1500,
            "note": "数据来自 OpenStreetMap（志愿者测绘）。中国的小微店铺覆盖很稀疏，"
                    "「查不到」不等于「没有」。这里**没有评分数据**（OSM 不提供评分），"
                    "只给距离和「这条记录全不全」。"}
-    cache_put(_NB_FILE, key, {"ts": _now(), "items": res})
+    cache_put(_NB_FILE, keys[0], {"ts": _now(), "items": res})
     return res
 
 
