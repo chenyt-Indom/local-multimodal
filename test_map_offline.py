@@ -124,11 +124,18 @@ CALLS.clear()
 r6 = mt.search_place("汕头大学")
 check("联网搜到「汕头大学」", bool(r6),
       r6[0]["name"] + " (%.4f, %.4f)" % (r6[0]["lat"], r6[0]["lon"]) if r6 else "")
+# ⚠️ 「汕头大学」在内置表里，会**直接走表**（那 231 条人工核过，比 Photon 稳），
+#    压根不发请求 —— 这是设计如此，不是 bug。
+#    想验证"联网真的发出去了 + 写进缓存"，得拿一个**表外**、且 Photon 确实有数据的名字。
+#    （踩过：用「汕头濠江滨海街道」这种，Photon 返回 0 条，结果又掉回内置表兜底，
+#      看着像"缓存没写"，其实是那个词 Photon 压根不认识。）
+r6b = mt.search_place("广州猎德大桥")
+check("表外的地名能联网查到", bool(r6b), r6b[0]["name"] if r6b else "")
 check("确实联网了（Photon）", any("photon" in u for u in CALLS), "请求数 %d" % len(CALLS))
 CALLS.clear()
 
-r7 = mt.search_place("桂林漓江")
-check("联网搜到「桂林漓江」", bool(r7), r7[0]["name"] if r7 else "")
+r7 = mt.search_place("广州天河城")
+check("联网搜到「广州天河城」", bool(r7), r7[0]["name"] if r7 else "")
 CALLS.clear()
 
 rt2 = mt.plan_route("汕头大学", "汕头站", "driving")
@@ -152,11 +159,17 @@ print("【3】切回离线：刚才查过的必须还能用（这是离线模式
 offline(True)
 CALLS.clear()
 
-r8 = mt.search_place("汕头大学")
-check("离线仍查到「汕头大学」", bool(r8), r8[0]["name"] if r8 else "")
+# 用表外那条（联网时走了 Photon 并写了缓存）验证"断网还能重放"
+r8 = mt.search_place("广州猎德大桥")
+check("离线重放联网时查过的地名", bool(r8), r8[0]["name"] if r8 else "")
 check("标记来源＝本地缓存", bool(r8) and r8[0].get("from_cache") is True)
 check("带缓存时间", bool(r8) and r8[0].get("cache_ts"))
 no_net("离线重放地名")
+
+# 内置表里的地名离线当然也能查（走表，同样零请求）
+r8b = mt.search_place("汕头大学")
+check("内置表地名离线也能查", bool(r8b), r8b[0]["name"] if r8b else "")
+no_net("离线查内置表地名")
 
 rt3 = mt.plan_route("汕头大学", "汕头站", "driving")
 check("离线重放出真路线", rt3.get("ok") is True,
@@ -181,7 +194,8 @@ s = mt.cache_stats()
 print("    瓦片 %d 张 / %.2f MB ｜ 地名 %d 个 ｜ 路线 %d 条 ｜ 内置表 %d 条 ｜ 当前 %s"
       % (s["tiles"], s["bytes"] / 1048576.0, s["places"], s["routes"],
          s["builtin"], mt.mode_text()))
-check("地名缓存已写入", s["places"] >= 2, "%d 个" % s["places"])
+# ⚠️ 只要求 >=1：内置表命中的地名**不会**写进缓存（压根没走网络），这是正常的
+check("地名缓存已写入", s["places"] >= 1, "%d 个" % s["places"])
 check("路线缓存已写入", s["routes"] >= 1, "%d 条" % s["routes"])
 check("内置地名表已加载", s["builtin"] > 100, "%d 条" % s["builtin"])
 check("离线模式被正确识别", s["online"] is False)

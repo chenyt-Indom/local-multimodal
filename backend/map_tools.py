@@ -901,36 +901,30 @@ def _cat_tag(category: str) -> tuple:
     return None, ""
 
 
-def _poi_score(t: dict) -> tuple:
-    """按"资料有多全"打分（0~100）+ 说清凭什么这么算。
+def _poi_info(t: dict) -> dict:
+    """看这条记录有多少可用信息，回一句**人话说明**。
 
-    ⚠️⚠️ 这**不是用户评分** —— OSM 里根本没有评分/星级/评论数据，谁都编不出来。
-    它衡量的是"这条记录有多少可用信息"：有电话、有网站、有营业时间的，
-    基本能确认是个在营的正规场所；只有名字和坐标的，可能是小摊小店、也可能早没了。
-    所以这个分数要给用户讲明白是**信息完整度**，不能让他误以为是口碑分。
+    ⚠️ 刻意**不输出分数、不输出星级** —— OSM 根本没有评分数据，
+       给个数字出来一定会被当成口碑分（用户明确要求把评分完全去掉）。
+       只回答"这条记录靠不靠谱、要不要先确认"。
     """
-    s, hits = 0, []
+    n = 0
     if t.get("name"):
-        s += 20; hits.append("有店名")
+        n += 1
     if any(t.get(k) for k in ("addr:street", "addr:full", "addr:housenumber",
                               "addr:city", "addr:district", "addr:province")):
-        s += 25; hits.append("有地址")
+        n += 1
     if t.get("phone") or t.get("contact:phone"):
-        s += 20; hits.append("有电话")
+        n += 1
     if t.get("website") or t.get("contact:website"):
-        s += 15; hits.append("有官网")
+        n += 1
     if t.get("opening_hours"):
-        s += 20; hits.append("有营业时间")
-    return min(s, 100), "、".join(hits) if hits else "只有坐标"
-
-
-def score_note(score: int) -> str:
-    """分数低要说清是什么原因，而不是丢个数字。"""
-    if score >= 60:
-        return "资料较全，通常是在营的正规场所"
-    if score >= 40:
-        return "资料一般，出发前建议先打个电话确认"
-    return "资料很少（基本只有名字和坐标），可能是小摊小店、也可能已经关了，去之前最好先确认"
+        n += 1
+    if n >= 3:
+        return {"info_note": "记录里地址、联系方式这类信息比较全，看着是正常营业的场所"}
+    if n >= 2:
+        return {"info_note": "记录信息不太全，出发前建议先确认一下"}
+    return {"info_note": "记录里基本只有名字和坐标，可能是小摊小店、也可能已经关了，去之前最好先确认"}
 
 
 def _overpass(q: str):
@@ -971,7 +965,8 @@ def nearby(lat: float, lon: float, category: str, radius: int = 1500,
     """查某个坐标周围指定类别的场所（按距离排序）。
 
     返回 {"ok","items":[{name,lat,lon,dist_m,kind,addr,phone,website,hours,
-                        score,score_why,score_note}],"category","radius","note"}
+                        info_note}],"category","radius","note"}
+    ⚠️ **没有 score 字段** —— OSM 不提供评分，也不该拿别的数字冒充评分。
     """
     tag, cat = _cat_tag(category)
     if not tag:
@@ -1029,7 +1024,7 @@ def nearby(lat: float, lon: float, category: str, radius: int = 1500,
         dd = haversine(lat, lon, float(la), float(lo))
         if dd > radius:
             continue
-        sc, why = _poi_score(t)
+        info = _poi_info(t)
         addr = "".join(str(t.get(k) or "") for k in
                        ("addr:province", "addr:city", "addr:district",
                         "addr:street", "addr:housenumber"))
@@ -1041,14 +1036,15 @@ def nearby(lat: float, lon: float, category: str, radius: int = 1500,
             "website": t.get("website") or t.get("contact:website") or "",
             "hours": t.get("opening_hours") or "",
             "brand": t.get("brand") or "",
-            "score": sc, "score_why": why, "score_note": score_note(sc),
+            "info_note": info["info_note"],
         })
-    # 距离近的排前面；同样近的，资料全的排前面（更可能是真在营的）
-    items.sort(key=lambda x: (x["dist_m"], -x["score"]))
+    # 只按距离排（没有评分可用，也不该拿记录完整度冒充评分去排序）
+    items.sort(key=lambda x: x["dist_m"])
     res = {"ok": True, "category": cat, "radius": radius, "center": [lat, lon],
            "total": len(items), "items": items[:limit],
            "note": "数据来自 OpenStreetMap（志愿者测绘）。中国的小微店铺覆盖很稀疏，"
-                   "「查不到」不等于「没有」。评分是**资料完整度**、不是用户口碑分。"}
+                   "「查不到」不等于「没有」。这里**没有评分数据**（OSM 不提供评分），"
+                   "只给距离和「这条记录全不全」。"}
     cache_put(_NB_FILE, key, {"ts": _now(), "items": res})
     return res
 

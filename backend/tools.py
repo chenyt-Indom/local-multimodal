@@ -238,14 +238,13 @@ _NEARBY_SCHEMA = {
             "· category 用中文日常说法即可：餐厅 / 咖啡馆 / 便利店 / 超市 / 药店 / "
             "医院 / 银行 / 加油站 / 停车场 / 酒店 / 学校 / 公交站 / 公园 / 厕所…\n"
             "· radius 单位米，默认 1500，最大 20000。\n"
-            "⚠️⚠️ 结果里的 score 是**资料完整度**，**不是用户评分** —— "
-            "OpenStreetMap 根本没有评分/星级/评论数据。"
-            "**绝不能把它说成「评分」或「口碑」，也绝不能自己编星级和评价**。"
-            "要如实解释：分高＝这条记录信息全（有地址/电话/营业时间），"
-            "分低＝资料很少，可能是小摊也可能已歇业，去之前建议先确认。\n"
+            "⚠️⚠️ **本工具没有任何评分数据** —— OpenStreetMap 不提供评分/星级/评论，"
+            "所以返回里也没有分数。**绝不许自己编一个评分、星级或评价**"
+            "（「评分 4.5」「口碑很好」「味道不错」这类全是编的）。\n"
+            "每条只带一句「这条记录全不全」的说明，照实转述即可。\n"
             "⚠️ 中国的小微店铺在 OSM 上覆盖很稀疏，**查不到不等于没有**；"
             "如实说明，并建议换类别词或扩大半径再试。\n"
-            "⚠️ **只准转述返回里确实有的字段**（名字/距离/地址/电话/营业时间/完整度），"
+            "⚠️ **只准转述返回里确实有的字段**（名字/距离/地址/电话/营业时间/说明），"
             "**不要补数据里没有的东西** —— 实测模型会顺口加「校内主干道旁」"
             "「校门对面」这类位置描述和「学生常去」这类评价，那全是编的。"
         ),
@@ -2897,9 +2896,9 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
 def _do_nearby_places(arguments=None, ui_events=None) -> str:
     """查某个地点**周围**的场所，推给前端画成「场所清单 + 地图」。
 
-    ⚠️ 结果里的 score 是**资料完整度**，不是用户评分 ——
-       OSM 根本没有评分/评论数据。输出里必须坚持叫「资料完整度」，
-       免得模型顺手说成「评分 85 分」，那就是在编。
+    ⚠️ **刻意不输出任何评分** —— OSM 没有评分/评论数据。
+       每条只带一句「这条记录全不全」的人话说明（info_note），
+       前端也不显示分数，免得被当成口碑分。
     """
     from . import map_tools as _mt
 
@@ -2955,19 +2954,18 @@ def _do_nearby_places(arguments=None, ui_events=None) -> str:
             extra.append("官网：" + it["website"])
         if extra:
             lines.append("  " + "；".join(extra))
-        lines.append("  资料完整度 %d/100（%s）—— %s"
-                     % (it["score"], it["score_why"], it["score_note"]))
+        lines.append("  %s" % it["info_note"])
 
-    tail = ("\n⚠️ 上面那个数字是**资料完整度**（这条记录有多少可用信息），"
-            "**不是用户评分、不是口碑、不是星级** —— OpenStreetMap 没有评分和评论数据。"
-            "不许把它说成「评分 85 分」这种话，也不许自己编评价。\n"
-            "⚠️ **只准转述返回里确实有的信息**（名字、距离、地址、电话、营业时间、完整度）。"
+    tail = ("\n⚠️ **不要给这些场所打分，也不要编评价** —— "
+            "OpenStreetMap 没有评分/星级/评论数据，我们这里也没有。"
+            "返回里只有一句「这条记录全不全」的说明，照实转述就行。\n"
+            "⚠️ **只准转述返回里确实有的信息**（名字、距离、地址、电话、营业时间、说明）。"
             "不要补数据里没有的东西 —— 实测模型会顺口加上「校内主干道旁」「校门对面」"
             "这类位置描述和「学生常去」这类评价，那都是编的。\n"
             "· 数据来自 OpenStreetMap（志愿者测绘），中国的小微店铺覆盖稀疏，"
             "「没查到」不等于「没有」。\n"
-            "· 用户问「靠不靠谱」时：就说资料完整度高低代表什么，"
-            "以及低分的先去确认，**不要编造卫生、口味、服务之类的评价**。")
+            "· 用户问「靠不靠谱」时：照实说这条记录全不全、建议先确认，"
+            "**绝不要给星、给分，也不要编卫生/口味/服务之类的评价**。")
 
     if isinstance(ui_events, list):
         ui_events.append({
@@ -2979,8 +2977,7 @@ def _do_nearby_places(arguments=None, ui_events=None) -> str:
                          "addr": "", "role": "center"}] +
                        [{"name": m["name"] or "（无名）", "lat": m["lat"], "lon": m["lon"],
                          "addr": m.get("addr") or "",
-                         "dist": _mt.fmt_distance(m["dist_m"]),
-                         "score": m["score"]} for m in items[:limit]],
+                         "dist": _mt.fmt_distance(m["dist_m"])} for m in items[:limit]],
             "route": None,
             "nearby": {
                 "category": r.get("category"),
@@ -2992,8 +2989,7 @@ def _do_nearby_places(arguments=None, ui_events=None) -> str:
                            "addr": m.get("addr") or "",
                            "phone": m.get("phone") or "",
                            "hours": m.get("hours") or "",
-                           "score": m["score"], "why": m["score_why"],
-                           "note": m["score_note"]} for m in items[:limit]],
+                           "note": m["info_note"]} for m in items[:limit]],
             },
         })
 

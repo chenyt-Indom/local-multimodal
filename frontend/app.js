@@ -324,18 +324,15 @@
         if (it.addr) extra.push(escapeHtml(it.addr));
         if (it.phone) extra.push("电话 " + escapeHtml(it.phone));
         if (it.hours) extra.push("营业 " + escapeHtml(it.hours));
-        const lv = it.score >= 60 ? "hi" : (it.score >= 40 ? "mid" : "lo");
         return `<li><b>${escapeHtml(it.name)}</b>` +
           `<span class="nb-dist">${escapeHtml(it.dist)}</span>` +
-          `<span class="nb-score ${lv}">资料完整度 ${it.score}</span>` +
           (extra.length ? `<div class="nb-extra">${extra.join("　·　")}</div>` : "") +
           (it.note ? `<div class="nb-note">${escapeHtml(it.note)}</div>` : "") +
           `</li>`;
       }).join("");
-      html += `<div class="map-nearby">` +
-        `<div class="nb-head">${escapeHtml(nb.center_name || "")} 周边 ${nb.radius} 米内的` +
-        `${escapeHtml(nb.category || "")}（${nb.total} 家）` +
-        `<span class="nb-warn">完整度≠评分</span></div><ul>${rows}</ul></div>`;
+      // 信息栏已经写了「汕头大学 周边 2000 米内的餐厅（3 家）」，
+      // 这里别再放一遍标题（实测会连着出现两遍，很啰嗦）
+      html += `<div class="map-nearby"><ul>${rows}</ul></div>`;
     }
     info.innerHTML = html || "地图";
 
