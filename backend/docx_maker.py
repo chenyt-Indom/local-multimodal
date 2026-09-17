@@ -26,7 +26,7 @@ import re
 from docx import Document
 from docx.enum.section import WD_SECTION
 from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
@@ -195,7 +195,7 @@ def _outline(p, level):
     pPr.append(el)
 
 
-_INLINE = re.compile(r"(\*\*[^*]+\*\*|`[^`]+`|\*[^*\n]+\*)")
+_INLINE = re.compile(r"(\*\*[^*]+\*\*|`[^`]+`|==[^=\n]+==|\*[^*\n]+\*)")
 
 
 def _add_runs(p, text, size, color, font, bold=False, italic=False):
@@ -203,7 +203,15 @@ def _add_runs(p, text, size, color, font, bold=False, italic=False):
     for seg in _INLINE.split(str(text or "")):
         if not seg:
             continue
-        if seg.startswith("**") and seg.endswith("**") and len(seg) > 4:
+        if seg.startswith("==") and seg.endswith("==") and len(seg) > 4:
+            # ==高亮== → 荧光笔，用来标注重点；Word/WPS 都认
+            r = p.add_run(seg[2:-2])
+            _set_font(r, size, color, bold=bold, font=font, italic=italic)
+            try:
+                r.font.highlight_color = WD_COLOR_INDEX.YELLOW
+            except Exception:
+                pass
+        elif seg.startswith("**") and seg.endswith("**") and len(seg) > 4:
             r = p.add_run(seg[2:-2])
             _set_font(r, size, color, bold=True, font=font)
         elif seg.startswith("`") and seg.endswith("`") and len(seg) > 2:
@@ -787,7 +795,12 @@ def build_docx(path, title, blocks, subtitle="", author="", date_text="",
         elif title:
             _render_heading(doc, {"text": str(title)}, ctx, 1)
 
-        if toc:
+        # ⚠️ 别把目录画两遍：调用方传了 toc=True、内容块里又写了一个 toc 时，
+        # 以前会生成两页一模一样的目录（实测踩到）。内容块优先。
+        _has_toc_block = any(
+            isinstance(b, dict) and str(b.get("type") or "").strip().lower()
+            in ("toc", "outline") for b in (blocks or []))
+        if toc and not _has_toc_block:
             _render_toc(doc, {}, ctx)
 
         n = 0

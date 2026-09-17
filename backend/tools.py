@@ -84,6 +84,10 @@ _MAKE_PPTX_SCHEMA = {
             "body_size / card_bg / title_align（也可放进 style 对象里）。\n"
             "· 单条要点微调：bullets 里可以写 {\"text\":\"...\",\"bold\":true,\"color\":\"C53030\","
             "\"size\":18} 这样的对象，只影响那一条。\n"
+            "· **标注**（用户说「标出重点 / 加标注 / 突出一下」时用）："
+            "要点对象加 \"hl\": true 会加荧光笔高亮，想指定颜色就写 \"hl\":\"FFD9D9\"；"
+            "每页还能写 badge（右上角小标签，如「重点」「必考」「KPI」）、"
+            "caption（页脚小字题注，如「数据来源：…」「图 1 系统架构」）。\n"
             "· 要点以「- 」或两个空格开头＝二级条目。配色 blue/green/warm/purple/mono/red。"
         ),
         "parameters": {
@@ -135,6 +139,11 @@ _MAKE_PPTX_SCHEMA = {
                                                         "会自动加蒙版，文字转白色"},
                             "logo": {"type": "string", "description": "本页角落 logo，可选"},
                             "image_caption": {"type": "string", "description": "图片说明，可选"},
+                            "badge": {"type": "string",
+                                      "description": "右上角小标签，如「重点」「必考」「KPI」，可选"},
+                            "caption": {"type": "string",
+                                        "description": "页脚小字题注，如「数据来源：…」"
+                                                       "「图 1 系统架构」，可选"},
                             "table": {"type": "object",
                                       "description": "layout=table 时用：{header:[...],rows:[[...]]}"},
                             "chart": {"type": "object",
@@ -188,7 +197,8 @@ _MAKE_DOCX_SCHEMA = {
             "        系统会联网搜一张插进来，可配 caption 图注、style.width 控宽度 cm）\n"
             "  / code 代码块（text）/ divider 分隔线\n"
             "  pagebreak 分页 / toc 目录 / end 结束语\n"
-            "· 正文里可用 **加粗**、*斜体*、`等宽` 做局部强调。\n"
+            "· 正文里可用 **加粗**、*斜体*、`等宽`、==高亮== 做局部强调"
+            "（==高亮== 是荧光笔，用来标出重点句）。\n"
             "· 列表里以「- 」或两个空格开头＝二级条目。\n"
             "· 每一块都能带 style 做微调：size 字号 / color 颜色 / bold / align"
             "(left|center|right|justify) / indent 缩进 / bg 底色 / line 行距。"

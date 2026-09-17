@@ -178,6 +178,43 @@
     bubble.innerHTML = html.replace(/\n/g, "<br>");
   }
 
+  // ---------- 站内下载：桌面壳里改走原生「另存为」 ----------
+  // ⚠️ 这是用户实际报过的坑：桌面窗口是 WebView2，而 pywebview 的
+  //    settings['ALLOW_DOWNLOADS'] **默认是 False** —— 后端在 DownloadStarting
+  //    里直接 `args.Cancel = True`，把页面发起的所有下载**静默取消**。
+  //    表现就是：点「点击下载」毫无反应，不报错、不提示，用户完全不知道成没成。
+  //    （和「WebView2 不支持 window.prompt、静默返回 null」是同一类坑。）
+  // 现在的做法：有 pywebview 桥就用它 —— 弹系统「另存为」、存到用户选的位置、
+  // 再把结果如实说出来。浏览器里没有这个桥，照旧走浏览器的下载。
+  function bridgeApi() {
+    return (window.pywebview && window.pywebview.api) || null;
+  }
+  async function saveViaDesktop(url) {
+    const api = bridgeApi();
+    if (!api || typeof api.save_file !== "function") return false;
+    try {
+      const r = await api.save_file(url, "");
+      if (r && r.ok) showToast("已保存：" + r.path, "ok");
+      else if (r && r.cancelled) showToast("已取消保存", "warn");
+      else showToast("保存失败：" + ((r && r.error) || "未知原因"), "warn");
+    } catch (e) {
+      showToast("保存失败：" + String(e.message || e), "warn");
+    }
+    return true;                       // true = 已经接管，别再走默认行为
+  }
+  // 事件委托：回答里的下载按钮是 innerHTML 塞进去的，逐个绑定不现实
+  document.addEventListener("click", (e) => {
+    const a = e.target && e.target.closest ? e.target.closest("a.dl-link") : null;
+    if (!a) return;
+    const url = a.getAttribute("href") || "";
+    if (url.indexOf("/api/") !== 0) return;
+    const api = bridgeApi();
+    if (!api || typeof api.save_file !== "function") return;   // 浏览器：默认下载
+    e.preventDefault();
+    saveViaDesktop(url);
+  });
+  window.__saveViaDesktop = saveViaDesktop;       // 文库面板等处复用
+
   function addMsg(role, text) {
     const el = document.createElement("div");
     el.className = "msg " + role;
@@ -722,9 +759,13 @@
       finally { docx.disabled = false; }
     };
     const dl = $("#dlDownload");
-    if (dl) dl.onclick = () => {
+    if (dl) dl.onclick = async () => {
       if (!dlCurrent) return;
-      window.open("/api/doclib/download?rel=" + encodeURIComponent(dlCurrent), "_blank");
+      const url = "/api/doclib/download?rel=" + encodeURIComponent(dlCurrent);
+      // 桌面壳里 window.open 会被丢给外部浏览器（OpenExternalLinksInBrowser），
+      // 先试原生另存为；没有桥再退回原来的行为。
+      if (await window.__saveViaDesktop(url)) return;
+      window.open(url, "_blank");
     };
     const cp = $("#dlCopyBtn");
     if (cp) cp.onclick = async () => {

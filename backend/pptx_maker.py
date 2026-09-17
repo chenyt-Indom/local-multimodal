@@ -274,7 +274,9 @@ def _bullets_of(items):
             out.append({"text": txt, "level": min(lvl, 1),
                         "bold": extra.get("bold"), "color": extra.get("color"),
                         "size": extra.get("size"), "italic": extra.get("italic"),
-                        "mark": extra.get("mark")})
+                        "mark": extra.get("mark"),
+                        "hl": extra.get("hl") if extra.get("hl") is not None
+                              else extra.get("highlight")})
     return out
 
 
@@ -323,6 +325,10 @@ def _put_bullets(slide, bs, x, y, w, h, th, st, base_size=None, font=None,
         r.text = b["text"][:200]
         _set_font(r, sz, col, bold=bool(b.get("bold")), font=font,
                   italic=bool(b.get("italic")))
+        hl = b.get("hl") if b.get("hl") is not None else b.get("highlight")
+        if hl:
+            # hl: true 用默认浅黄；想指定颜色就写六位十六进制（如 "FFD9D9"）
+            _set_hl(r, _hex6(hl, HL_DEFAULT))
     return tf
 
 
@@ -357,6 +363,71 @@ def _decorate(slide, decor, th, st, page_no=None):
         _set_font(r, 11, st.get("muted") or th["muted"], font=st.get("font"))
 
 
+HL_DEFAULT = "FFE9A8"          # 荧光笔默认色（浅黄，白底黑字也读得清）
+
+
+def _hex6(v, default=""):
+    v = str(v or "").strip().lstrip("#")
+    return v if re.match(r"^[0-9A-Fa-f]{6}$", v) else default
+
+
+def _set_hl(run, color):
+    """给这段文字加"荧光笔"高亮 —— 用来标注重点。
+
+    ⚠️ DrawingML 里段落**没有**"底纹"这个概念，高亮是**字符级**的，
+    要写进 rPr 的 a:highlight；而且必须按 schema 顺序插在 a:latin 之前，
+    顺序错了 PowerPoint 打开会直接判定文件损坏。
+    """
+    try:
+        rPr = run._r.get_or_add_rPr()
+        old = rPr.find(qn("a:highlight"))
+        if old is not None:
+            rPr.remove(old)
+        hl = rPr.makeelement(qn("a:highlight"), {})
+        hl.append(rPr.makeelement(qn("a:srgbClr"), {"val": color}))
+        latin = rPr.find(qn("a:latin"))
+        if latin is not None:
+            latin.addprevious(hl)
+        else:
+            rPr.append(hl)
+    except Exception:
+        pass
+
+
+def _badge(s, text, th, st):
+    """右上角小标签（「重点」「NEW」「必考」）—— 标注整页的性质，位置固定不抢正文。"""
+    text = str(text or "").strip()
+    if not text:
+        return
+    text = text[:10]
+    w = Inches(0.34 + 0.17 * len(text))
+    x = SLIDE_W - w - Inches(0.55)
+    y = Inches(0.42)
+    if st.get("_logo_path") and str(st.get("logo_pos") or "tr") == "tr":
+        y = y + Inches(float(st.get("logo_size") or 0.5) + 0.2)
+    _rect(s, x, y, w, Inches(0.36), fill=st.get("accent") or th["accent"],
+          shape=MSO_SHAPE.ROUNDED_RECTANGLE, radius=0.4)
+    tf = _textbox(s, x, y + Inches(0.035), w, Inches(0.3))
+    p = tf.paragraphs[0]
+    p.alignment = PP_ALIGN.CENTER
+    r = p.add_run()
+    r.text = text
+    _set_font(r, 11, "FFFFFF", bold=True, font=st.get("font"))
+
+
+def _slide_caption(s, text, th, st):
+    """页脚小字题注（「图 1 系统架构」「数据来源：……」）—— 放左下，不压正文。"""
+    text = str(text or "").strip()
+    if not text:
+        return
+    tf = _textbox(s, Inches(0.85), SLIDE_H - Inches(0.66),
+                  Inches(9.2), Inches(0.32))
+    p = tf.paragraphs[0]
+    r = p.add_run()
+    r.text = text[:110]
+    _set_font(r, 10.5, st.get("muted") or th["muted"], font=st.get("font"))
+
+
 def _page_base(s, th, st, sl, page_no):
     """内页统一底：背景（可用 bg_image）→ 装饰 → 角落 logo。
 
@@ -377,6 +448,9 @@ def _page_base(s, th, st, sl, page_no):
     _decorate(s, st.get("decor"), th, st, page_no)
     _add_logo(s, st.get("_logo_path") or "", st.get("logo_pos") or "tr",
               float(st.get("logo_size") or 0.5))
+    if sl:                       # 空白页（{}）不画角标和题注
+        _badge(s, sl.get("badge"), th, st)
+        _slide_caption(s, sl.get("caption"), th, st)
 
 
 def _title_bar(slide, title, th, st, y=Inches(0.5), rule=True):
@@ -432,9 +506,12 @@ def _add_cover(prs, th, st, title, subtitle, author, cover_img=""):
 
 
 def _add_section(prs, th, st, text, index, page_no):
+    # 兼容两种调用：直接给标题文字，或把整页配置传进来（这样章节页也能用
+    # 角标 / 题注 / 背景图，不用另写一套）
+    sl = text if isinstance(text, dict) else {}
+    text = str(sl.get("title") or text or "章节")
     s = _blank(prs)
-    # 章节页没有独立的页配置（参数是标题文字），传空字典走默认底
-    _page_base(s, th, st, {}, page_no)
+    _page_base(s, th, st, sl, page_no)
     _rect(s, Inches(0), Inches(3.05), Inches(0.28), Inches(1.4),
           fill=st.get("accent") or th["accent"])
     tf = _textbox(s, Inches(0.95), Inches(3.05), Inches(11.4), Inches(1.5))
@@ -447,6 +524,31 @@ def _add_section(prs, th, st, text, index, page_no):
     r2.text = text[:60]
     _set_font(r2, 30, st.get("title_color") or th["body"], bold=True,
               font=st.get("font"))
+    return s
+
+
+def _fallback_content(s, th, st, sl, y=None):
+    """版式数据缺失时的回退 —— **画在当前这页上**。
+
+    ⚠️ 以前是 `return _add_content(prs, ...)`，那会**再新建一页**：
+    刚建好的那页就变成一张空白页留在文稿里，页码也跟着错位
+    （实测 timeline 页因为字段名没对上，直接多出一张重复页）。
+    """
+    if y is None:
+        y = _title_bar(s, sl.get("title"), th, st)
+    bs = _bullets_of(sl.get("bullets") or sl.get("items") or [])
+    if not bs:
+        bs = _bullets_of([
+            "（这一页的版式 %s 没给对应内容，已按普通要点页处理）"
+            % str(sl.get("layout") or "?")])
+    _put_bullets(s, bs, Inches(0.95), y + Inches(0.35), Inches(11.5),
+                 SLIDE_H - y - Inches(1.05), th, st,
+                 base_size=st.get("body_size"), font=st.get("font"))
+    if sl.get("notes"):
+        try:
+            s.notes_slide.notes_text_frame.text = str(sl["notes"])[:2000]
+        except Exception:
+            pass
     return s
 
 
@@ -572,7 +674,7 @@ def _add_table(prs, th, st, sl, page_no):
     header = [str(x) for x in (spec.get("header") or [])]
     rows = [[str(c) for c in r] for r in (spec.get("rows") or [])]
     if not header and not rows:
-        return _add_content(prs, th, st, sl, page_no)
+        return _fallback_content(s, th, st, sl, y)
     ncol = max([len(header)] + [len(r) for r in rows] or [0])
     nrow = (1 if header else 0) + len(rows)
     acc = st.get("accent") or th["accent"]
@@ -661,7 +763,7 @@ def _add_chart(prs, th, st, sl, page_no):
     cats = [str(c) for c in (spec.get("categories") or [])]
     series = [x for x in (spec.get("series") or []) if isinstance(x, dict)]
     if not cats or not series:
-        return _add_content(prs, th, st, sl, page_no)
+        return _fallback_content(s, th, st, sl, y)
 
     from pptx.chart.data import CategoryChartData
     data = CategoryChartData()
@@ -682,7 +784,7 @@ def _add_chart(prs, th, st, sl, page_no):
         gf = s.shapes.add_chart(_chart_kind(spec.get("kind")), left, top,
                                 width, height, data)
     except Exception as e:
-        return _add_content(prs, th, st, sl, page_no)
+        return _fallback_content(s, th, st, sl, y)
     ch = gf.chart
     acc = st.get("accent") or th["accent"]
 
@@ -740,7 +842,7 @@ def _add_cards(prs, th, st, sl, page_no):
     y = _title_bar(s, sl.get("title"), th, st)
     cards = [c for c in (sl.get("cards") or []) if isinstance(c, dict)][:4]
     if not cards:
-        return _add_content(prs, th, st, sl, page_no)
+        return _fallback_content(s, th, st, sl, y)
     acc = st.get("accent") or th["accent"]
     n = len(cards)
     gap = Inches(0.32)
@@ -785,7 +887,7 @@ def _add_stats(prs, th, st, sl, page_no):
     y = _title_bar(s, sl.get("title"), th, st)
     items = [x for x in (sl.get("stats") or []) if isinstance(x, dict)][:4]
     if not items:
-        return _add_content(prs, th, st, sl, page_no)
+        return _fallback_content(s, th, st, sl, y)
     acc = st.get("accent") or th["accent"]
     n = len(items)
     gap = Inches(0.4)
@@ -800,6 +902,11 @@ def _add_stats(prs, th, st, sl, page_no):
         rv.text = str(it.get("value") or "")[:12]
         _set_font(rv, 46 if len(str(it.get("value") or "")) <= 5 else 34,
                   acc, bold=True, font=st.get("font"))
+        unit = str(it.get("unit") or "").strip()     # 单位跟着数字走，小一号
+        if unit:
+            ru = pv.add_run()
+            ru.text = unit[:4]
+            _set_font(ru, 18, acc, bold=True, font=st.get("font"))
         _rect(s, cx + int(cw * 0.32), top + Inches(1.45), int(cw * 0.36),
               Inches(0.05), fill=_tint(acc, 0.5))
         tfl = _textbox(s, cx, top + Inches(1.75), cw, Inches(0.9))
@@ -820,7 +927,7 @@ def _add_steps(prs, th, st, sl, page_no):
     y = _title_bar(s, sl.get("title"), th, st)
     items = [x for x in (sl.get("steps") or []) if isinstance(x, dict)][:5]
     if not items:
-        return _add_content(prs, th, st, sl, page_no)
+        return _fallback_content(s, th, st, sl, y)
     acc = st.get("accent") or th["accent"]
     n = len(items)
     gap = Inches(0.25)
@@ -870,9 +977,11 @@ def _add_timeline(prs, th, st, sl, page_no):
     s = _blank(prs)
     _page_base(s, th, st, sl, page_no)
     y = _title_bar(s, sl.get("title"), th, st)
-    items = [x for x in (sl.get("items") or []) if isinstance(x, dict)][:5]
+    # 模型写时间线时，字段名五花八门：items / timeline / steps 都认
+    raw = sl.get("items") or sl.get("timeline") or sl.get("steps") or []
+    items = [x for x in raw if isinstance(x, dict)][:5]
     if not items:
-        return _add_content(prs, th, st, sl, page_no)
+        return _fallback_content(s, th, st, sl, y)
     acc = st.get("accent") or th["accent"]
     n = len(items)
     axis_y = y + Inches(1.8)
@@ -888,7 +997,8 @@ def _add_timeline(prs, th, st, sl, page_no):
         pd = tfd.paragraphs[0]
         pd.alignment = PP_ALIGN.CENTER
         rd = pd.add_run()
-        rd.text = str(it.get("title") or "")[:16]
+        rd.text = str(it.get("title") or it.get("time")
+                      or it.get("label") or "")[:16]
         _set_font(rd, 14, acc, bold=True, font=st.get("font"))
         tfb = _textbox(s, cx - Inches(1.0), axis_y + Inches(0.32), Inches(2.0),
                        Inches(1.8))
@@ -1266,7 +1376,7 @@ def build_pptx(path, title, slides, subtitle="", author="", theme=DEFAULT_THEME,
             if lay in ("section", "chapter"):
                 sec += 1
                 made += 1
-                _add_section(prs, th, st, str(s.get("title") or "章节"), sec, made + 1)
+                _add_section(prs, th, st, s, sec, made + 1)
                 continue
             has_img_intent = bool(str(s.get("image") or "").strip()
                                   or str(s.get("image_query") or "").strip())
