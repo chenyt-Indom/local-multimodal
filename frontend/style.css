@@ -1053,6 +1053,19 @@ body.dark .map-card .map-info { background: #1d2430; color: #e6ebf2; border-bott
 .map-badge.on  { background: #e6f4ea; color: #1e7f45; border: 1px solid #b7e0c4; }
 .map-badge.off { background: #fdf0e3; color: #9a5b12; border: 1px solid #f0d3ac; }
 .map-src { margin-left: 8px; font-size: 11.5px; color: #6b7684; }
+/* 「共 N 条可选」：有多条候选路线时提示 */
+.map-alt {
+  margin-left: 8px;
+  font-size: 11.5px;
+  color: #2e75b6;
+  background: #eaf2fb;
+  border-radius: 6px;
+  padding: 1px 6px;
+}
+/* 出发 / 抵达时段的天气 */
+.map-weather { margin-top: 4px; font-size: 12px; color: #4a5568; }
+/* 补充说明（比如"步行时间系估算"） */
+.map-note { margin-top: 3px; font-size: 11.5px; color: #8a6d3b; line-height: 1.5; }
 /* "非实际道路"这类提醒：要显眼，不能让人当成真数据 */
 .map-warn {
   margin-left: 8px;
@@ -1082,3 +1095,6 @@ body.dark .map-badge.on  { background: #16321f; color: #7fd39b; border-color: #2
 body.dark .map-badge.off { background: #3a2a12; color: #e0b070; border-color: #5a4020; }
 body.dark .map-src { color: #93a0ae; }
 body.dark .map-warn { background: #3a2a12; color: #e0b070; }
+body.dark .map-alt { background: #16283d; color: #7fb3e8; }
+body.dark .map-weather { color: #a8b5c4; }
+body.dark .map-note { color: #d0b070; }

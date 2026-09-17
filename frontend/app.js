@@ -264,13 +264,40 @@
       html += ` <b>${escapeHtml(rt.from || "")} → ${escapeHtml(rt.to || "")}</b>` +
         `　${escapeHtml(rt.mode || "")} ${escapeHtml(rt.distance || "")}` +
         `，约 ${escapeHtml(rt.duration || "")}`;
+      if ((rt.routes || []).length > 1) {
+        html += `<span class="map-alt">共 ${rt.routes.length} 条可选</span>`;
+      }
       if (rt.cached) {
         html += `<span class="map-src">本地缓存` +
-          (rt.cache_time ? " " + escapeHtml(rt.cache_time) : "") + `</span>`;
+          (rt.cache_time ? " " + escapeHtml(rt.cache_time) : "") +
+          (rt.stale ? "（已过期）" : "") + `</span>`;
+      }
+      // 步行/骑行的距离其实来自驾车路网、时间只是估算 —— 不能不说
+      if (rt.estimated) {
+        html += `<span class="map-warn">时间为估算</span>`;
       }
     } else if ((ui.markers || []).length) {
       html += ` <b>${escapeHtml(ui.markers[0].name || "")}</b>` +
         ((ui.markers || []).length > 1 ? ` 等 ${ui.markers.length} 个地点` : "");
+    }
+    // 天气（只有请求里带 weather:true 才有）
+    const wt = (rt && rt.weather) || null;
+    if (wt) {
+      const fn = wt.from_now || {}, ta = wt.to_arrival || {};
+      const bits = [];
+      if (fn.desc) {
+        bits.push("出发地 " + escapeHtml(fn.desc) +
+          (fn.temp != null ? " " + Math.round(fn.temp) + "℃" : ""));
+      }
+      if (ta.desc) {
+        bits.push("抵达时 " + escapeHtml(ta.desc) +
+          (ta.temp != null ? " " + Math.round(ta.temp) + "℃" : "") +
+          (ta.rain != null ? " 降水" + ta.rain + "%" : ""));
+      }
+      if (bits.length) html += `<div class="map-weather">${bits.join("　·　")}</div>`;
+    }
+    if (rt && rt.note) {
+      html += `<div class="map-note">${escapeHtml(rt.note)}</div>`;
     }
     info.innerHTML = html || "地图";
 
@@ -334,11 +361,29 @@
       span.push([mk.lat, mk.lon]);
     });
 
-    if (ui.route && (ui.route.points || []).length > 1) {
-      L.polyline(ui.route.points, { color: "#2e75b6", weight: 5, opacity: 0.85 })
+    const rt = ui.route;
+    if (rt && (rt.routes || []).length > 1) {
+      // 多条候选：**推荐的那条蓝色加粗实线**，其余灰色虚线 —— 一眼看出主次。
+      // 点线还能弹出各自的距离/时间/推荐理由。
+      rt.routes.forEach(function (r) {
+        if (!r.points || r.points.length < 2) return;
+        const rec = !!r.recommended;
+        const line = L.polyline(r.points, {
+          color: rec ? "#2e75b6" : "#9aa7b4",
+          weight: rec ? 6 : 4,
+          opacity: rec ? 0.9 : 0.65,
+          dashArray: rec ? null : "7 7",
+        }).addTo(map);
+        line.bindPopup((rec ? "<b>推荐路线</b>" : "备选路线") + "<br>" +
+          escapeHtml(r.distance || "") + "，约 " + escapeHtml(r.duration || "") +
+          (r.reason ? "<br><span style='color:#666'>" + escapeHtml(r.reason) + "</span>" : ""));
+        span.push.apply(span, r.points);
+      });
+    } else if (rt && (rt.points || []).length > 1) {
+      L.polyline(rt.points, { color: "#2e75b6", weight: 5, opacity: 0.85 })
         .addTo(map);
-      span.push.apply(span, ui.route.points);
-    } else if (ui.route && ui.route.straight) {
+      span.push.apply(span, rt.points);
+    } else if (rt && rt.straight) {
       // 离线兜底：没有路网，用橙色虚线连两点，一眼就能和真路线区分开
       const ms = ui.markers || [];
       const pa = ms.filter(function (m) { return m.name === ui.route.from; })[0] || ms[0];
@@ -364,10 +409,14 @@
     try {
       const d = await api("/api/map/stats");
       const mb = ((d.bytes || 0) / 1048576).toFixed(1);
+      const ttl = d.ttl_days || {};
       showToast(
         (d.online ? "联网模式" : "离线模式") + "｜本地地图：瓦片 " + (d.tiles || 0) +
         " 张（" + mb + " MB）、地点 " + (d.places || 0) + " 个、路线 " +
-        (d.routes || 0) + " 条；另有内置常用地名 " + (d.builtin || 0) + " 条", "ok");
+        (d.routes || 0) + " 条；内置常用地名 " + (d.builtin || 0) + " 条。" +
+        (d.newest_ago ? "数据最近更新于 " + d.newest_ago + "。" : "") +
+        " 联网时会自动刷新过期数据（地名 " + (ttl.geo || 30) + " 天 / 路线 " +
+        (ttl.route || 7) + " 天 / 瓦片 " + (ttl.tile || 60) + " 天）", "ok");
     } catch (e) { showToast("读不到缓存信息：" + e.message, "warn"); }
   }
   window.__showMapCache = showMapCache;

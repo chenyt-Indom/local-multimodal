@@ -189,9 +189,16 @@ _MAP_PLAN_SCHEMA = {
             "· 只规划路线：给 route:{\"from\":\"广州塔\",\"to\":\"广州白云机场\",\"mode\":\"driving\"}。\n"
             "· 两者可以一起给：先把途经点标出来，再画路线。\n"
             "· mode 可选 driving(驾车，默认) / foot(步行) / bike(骑行)。\n"
+            "  ⚠️ **免费路网只提供驾车路径**：选步行/骑行时，距离仍是驾车路线的距离、"
+            "时间按速度估算。这种情况返回里会带 note，**必须把这话转告用户**，"
+            "不能让他以为那是真实步行路线。\n"
+            "· 中长途会自动给**多条备选路线**并挑一条推荐，返回里带 routes 与 reason。"
+            "把「为什么推荐这条」照实说出来（那是真实差距，别自己加戏）；只有一条可行路线时也别硬凑。\n"
+            "· 用户问天气、或要把出行情况讲清楚时给 weather:true。\n"
             "· 用户说「离线也能看 / 下载地图」时给 offline:true —— 会把沿途瓦片下载到本地缓存。\n"
-            "· 返回里有真实距离与用时，**照实念给用户，不要自己算**。地图卡片会自己显示，"
-            "你只要用一两句话把结论说清楚（比如「驾车 44.7 公里，约 37 分钟，地图见上」）。"
+            "· 返回里有真实距离与用时，**照实念给用户，不要自己算**。"
+            "⚠️ 这个工具**没有任何实时路况数据**，不要凭空说「避开拥堵」「当前畅通」这类话。"
+            "地图卡片会自己显示，你只要用一两句话把结论说清楚。"
         ),
         "parameters": {
             "type": "object",
@@ -204,6 +211,8 @@ _MAP_PLAN_SCHEMA = {
                 "zoom": {"type": "integer", "description": "地图缩放级别 3~18，默认自动"},
                 "offline": {"type": "boolean",
                             "description": "true＝把沿途瓦片下载到本地，之后离线也能看"},
+                "weather": {"type": "boolean",
+                            "description": "true＝同时查出发地此刻与预计抵达时段的天气"},
             },
             "required": [],
         },
@@ -2668,7 +2677,8 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
     rinfo, approx = None, None
     if route and route.get("from") and route.get("to"):
         r = _mt.plan_route(str(route.get("from")), str(route.get("to")),
-                           str(route.get("mode") or "driving"), allow_net=net)
+                           str(route.get("mode") or "driving"), allow_net=net,
+                           want_weather=bool(a.get("weather") or a.get("天气")))
         mode_cn = {"driving": "驾车", "foot": "步行", "bike": "骑行"}.get(
             r.get("mode"), r.get("mode"))
         for k in ("from", "to"):
@@ -2677,13 +2687,48 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
                                 "lon": r[k]["lon"], "addr": "", "role": k})
         if r.get("ok"):
             rinfo = r
+            routes = r.get("routes") or []
             tail = ""
             if r.get("from_cache"):
-                tail = "  〔本地缓存 %s〕" % (_cache_time_text(r.get("cache_ts")) or "")
-            lines.append("· **从 %s 到 %s**：%s，约 %s（%s）%s"
-                         % (r["from"]["name"], r["to"]["name"],
-                            _mt.fmt_distance(r["distance_m"]),
-                            _mt.fmt_duration(r["duration_s"]), mode_cn, tail))
+                tail = "  〔本地缓存 %s%s〕" % (
+                    _cache_time_text(r.get("cache_ts")) or "",
+                    "（已过期，联网时会自动更新）" if r.get("stale") else "")
+            if len(routes) > 1:
+                lines.append("· **从 %s 到 %s**（%s）共 %d 条可选路线%s"
+                             % (r["from"]["name"], r["to"]["name"], mode_cn,
+                                len(routes), tail))
+                for rt in routes:
+                    star = "　← **推荐**" if rt.get("recommended") else ""
+                    lines.append("    %d）%s，约 %s%s"
+                                 % (rt["idx"] + 1, _mt.fmt_distance(rt["distance_m"]),
+                                    _mt.fmt_duration(rt["duration_s"]), star))
+                rec = next((x for x in routes if x.get("recommended")), routes[0])
+                if rec.get("reason"):
+                    lines.append("    **为什么推荐这条**：%s" % rec["reason"])
+            else:
+                lines.append("· **从 %s 到 %s**：%s，约 %s（%s）%s"
+                             % (r["from"]["name"], r["to"]["name"],
+                                _mt.fmt_distance(r["distance_m"]),
+                                _mt.fmt_duration(r["duration_s"]), mode_cn, tail))
+            if r.get("estimated") and r.get("note"):
+                lines.append("    ⚠️ %s" % r["note"])
+            w = r.get("weather") or {}
+            fw = (w.get("from") or {}).get("now") or {}
+            aw = (w.get("to") or {}).get("arrival") or {}
+            if fw.get("desc") or aw.get("desc"):
+                parts = []
+                if fw.get("desc"):
+                    parts.append("出发地此刻 %s%s"
+                                 % (fw["desc"],
+                                    "、%.0f℃" % fw["temp"] if fw.get("temp") is not None else ""))
+                if aw.get("desc"):
+                    parts.append("预计抵达时 %s%s（%s 前后）"
+                                 % (aw["desc"],
+                                    "、%.0f℃" % aw["temp"] if aw.get("temp") is not None else "",
+                                    aw.get("t") or ""))
+                if aw.get("rain") is not None:
+                    parts.append("抵达时段降水概率 %s%%" % aw["rain"])
+                lines.append("    **天气**：%s" % "；".join(parts))
         else:
             approx = r.get("approx")
             lines.append("· **从 %s 到 %s**：%s"
@@ -2738,6 +2783,21 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
                        "to": rinfo["to"]["name"],
                        "cached": bool(rinfo.get("from_cache")),
                        "cache_time": _cache_time_text(rinfo.get("cache_ts")),
+                       "stale": bool(rinfo.get("stale")),
+                       "estimated": bool(rinfo.get("estimated")),
+                       "note": rinfo.get("note") or "",
+                       # 多条候选：前端按这个列表画多条线，推荐的那条高亮
+                       "routes": [{"points": x["points"],
+                                   "distance": _mt.fmt_distance(x["distance_m"]),
+                                   "duration": _mt.fmt_duration(x["duration_s"]),
+                                   "recommended": bool(x.get("recommended")),
+                                   "reason": x.get("reason") or ""}
+                                  for x in (rinfo.get("routes") or [])],
+                       "weather": ({"from_name": ((rinfo.get("weather") or {}).get("from") or {}).get("name") or "",
+                                    "from_now": ((rinfo.get("weather") or {}).get("from") or {}).get("now") or {},
+                                    "to_name": ((rinfo.get("weather") or {}).get("to") or {}).get("name") or "",
+                                    "to_arrival": ((rinfo.get("weather") or {}).get("to") or {}).get("arrival") or {}}
+                                   if rinfo.get("weather") else None),
                        "straight": False} if rinfo else
                       ({"points": [], "straight": True,
                         "distance": _mt.fmt_distance(approx["distance_m"]),
