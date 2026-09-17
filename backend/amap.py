@@ -228,13 +228,21 @@ def _poi(el: dict, origin=None) -> dict:
 
 
 def place_text(keywords: str, city: str = "", page: int = 1, offset: int = 20) -> dict:
-    """关键词搜 POI（全国 / 指定城市）。"""
+    """关键词搜 POI（必须带 city，否则高德一律返回 0 条）。
+
+    ⚠️ 排序**按名字匹配度**，不按评分 —— 这个函数是拿来"找某个地方"的，
+       不是"挑评分高的"。实测按评分排会出岔子：查「广州天河城」会把
+       「番禺天河城」（评分更高）排在「天河城」前面。
+       高德自己返回的顺序本来就是按相关度，保持不动，只把**名字完全一致**的提前。
+    """
     d = _get("/place/text", keywords=keywords, city=city, page=page,
              offset=min(int(offset or 20), 25), extensions="all")
     if not d:
         return {"ok": False, "items": []}
     items = [x for x in (_poi(p) for p in (d.get("pois") or [])) if x]
-    items.sort(key=lambda x: -float(x.get("rating") or 0))   # 有评分的排前面
+    kw = str(keywords or "").strip()
+    if kw:
+        items.sort(key=lambda x: 0 if (x.get("name") or "").strip() == kw else 1)
     return {"ok": True, "items": items, "total": int(d.get("count") or len(items))}
 
 

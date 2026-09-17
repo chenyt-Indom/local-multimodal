@@ -1052,6 +1052,20 @@ body.dark .map-card .map-info { background: #1d2430; color: #e6ebf2; border-bott
 }
 .map-badge.on  { background: #e6f4ea; color: #1e7f45; border: 1px solid #b7e0c4; }
 .map-badge.off { background: #fdf0e3; color: #9a5b12; border: 1px solid #f0d3ac; }
+/* 底图来源：高德 / OSM。两家的图差别很大，标出来用户才知道"换地图了" */
+.map-basemap {
+  display: inline-block;
+  padding: 1px 7px;
+  margin-right: 4px;
+  border-radius: 9px;
+  font-size: 11.5px;
+  line-height: 17px;
+  vertical-align: 1px;
+  background: #e8eefb;
+  color: #2b5b9a;
+  border: 1px solid #c3d5f0;
+}
+body.dark .map-basemap { background: #1b2637; color: #8fb6e8; border-color: #2c3f5c; }
 .map-src { margin-left: 8px; font-size: 11.5px; color: #6b7684; }
 /* 「共 N 条可选」：有多条候选路线时提示 */
 .map-alt {

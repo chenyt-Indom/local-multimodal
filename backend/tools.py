@@ -198,11 +198,15 @@ _MAP_PLAN_SCHEMA = {
             "把「为什么推荐这条」照实说出来（那是真实差距，别自己加戏）；只有一条可行路线时也别硬凑。\n"
             "· 用户问天气、或要把出行情况讲清楚时给 weather:true。\n"
             "· 用户说「离线也能看 / 下载地图」时给 offline:true —— 会把沿途瓦片下载到本地缓存。\n"
-            "· 返回里有真实距离与用时，**照实念给用户，不要自己算**。"
-            "⚠️ 这个工具**没有任何实时路况数据**，不要凭空说「避开拥堵」「当前畅通」这类话。"
-            "⚠️ 它**也没有公交/地铁线路数据** —— 不许编「坐 X 路公交、票价 Y 元、"
-            "每 Z 分钟一班」这种具体线路（实测模型真的会编）。"
-            "要提公共交通就只说一句「这段距离也可以考虑公共交通」，不给线路。"
+            "· **用户说了在哪个城市时，一定把 city 填上**（比如「广州市内有什么商场」"
+            "→ city:\"广州\"）。不填的后果实测很离谱：往地图上标「天河城」会被解析到"
+            "「江西省南昌市进贤县天河城」—— 那儿真有个同名村子。\n"
+            "· 返回里有真实距离与用时，**照实念给用户，不要自己算**。\n"
+            "⚠️ **只有用 mode=transit 拿到的东西才能讲公共交通**。没走 transit 就"
+            "不许编「坐 X 路公交、票价 Y 元、每 Z 分钟一班」这种具体线路（实测模型真的会编）；"
+            "最多说一句「这段距离也可以考虑公共交通」。\n"
+            "⚠️ 驾车时间在配了高德 key 时**已经包含实时路况**，可以照实说「这个时间已含实时路况」；"
+            "但**不要**编「XX 路段现在堵」这种具体路况描述 —— 接口不给这个。"
             "地图卡片会自己显示，你只要用一两句话把结论说清楚。"
         ),
         "parameters": {
@@ -210,6 +214,9 @@ _MAP_PLAN_SCHEMA = {
             "properties": {
                 "places": {"type": "array", "items": {"type": "string"},
                            "description": "要在地图上标出的地点名（中文即可），可选"},
+                "city": {"type": "string",
+                         "description": "限定城市（如「广州」）。用户提到具体城市时**务必填**，"
+                                        "用来防止同名地点被解析到外省，可选"},
                 "route": {"type": "object",
                           "description": "{from: 起点地名（或 lat,lon）, to: 终点, "
                                          "mode: driving/foot/bike}"},
@@ -235,11 +242,17 @@ _NEARBY_SCHEMA = {
             "找一下附近的银行」这类**周边搜索**时用它。\n"
             "· 和 map_plan 的分工：map_plan 是「我要去某地，怎么走」；"
             "nearby_places 是「这一带有什么」。\n"
+            "· **凡是问「哪里有什么 XX / 有哪些 YY」的，都用这个工具去查真实数据**，"
+            "不要凭自己知道的城市地标凑几个扔给 map_plan —— 那是编的，而且经常给错。\n"
+            "  「广州市内有什么商场」→ place:\"广州市\", category:\"购物中心\", radius:30000；"
+            "「汕头有什么好吃的」→ place:\"汕头市\", category:\"餐厅\", radius:20000。\n"
             "· 参数 {\"place\": \"汕头大学\", \"category\": \"餐厅\", \"radius\": 1500}；"
-            "place 也接受 \"23.35,116.68\" 这种坐标。\n"
-            "· category 用中文日常说法即可：餐厅 / 咖啡馆 / 便利店 / 超市 / 药店 / "
-            "医院 / 银行 / 加油站 / 停车场 / 酒店 / 学校 / 公交站 / 公园 / 厕所…\n"
-            "· radius 单位米，默认 1500，最大 20000。\n"
+            "place 也接受 \"23.35,116.68\" 这种坐标，也可以是城市名。\n"
+            "· category 用中文日常说法即可：餐厅 / 咖啡馆 / 便利店 / 超市 / 购物中心 / "
+            "药店 / 医院 / 银行 / 加油站 / 停车场 / 酒店 / 学校 / 公交站 / 公园 / 厕所…\n"
+            "· radius 单位米，默认 1500，最大 50000。\n"
+            "  问「整座城市」就给 20000~40000；问「XX 附近」给 1000~3000。\n"
+            "  「整个城市里有什么」填 20000~50000；「某学校附近有什么」填 1000~3000。\n"
             "⚠️⚠️ **不要为了找「评分」改用 web_search** —— 本工具在高德模式下"
             "**直接返回真实评分（rating）和人均消费（cost）**。"
             "用户问「附近评分最高的餐厅 / 哪家评价好」时，"
@@ -2712,6 +2725,9 @@ def _do_transit(route: dict, ui_events, net: bool) -> str:
         best = plans[0] if plans else {"points": []}
         ui_events.append({
             "type": "map", "online": net,
+            # 底图用哪个（联网+有高德 key → 高德）。前端据此选瓦片端点，
+            # 并决定打点要不要做 WGS-84 → GCJ-02 的换算。
+            "tile_source": _mt.tile_source(net),
             "center": [r["from"]["lat"], r["from"]["lon"]],
             "zoom": 12,
             "markers": [{"name": r["from"]["name"], "lat": r["from"]["lat"],
@@ -2759,10 +2775,14 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
                 '例如 {"places":["广州塔"],"route":{"from":"广州塔","to":"白云机场"}}')
 
     net = _mt.online()
+    # 限定城市（模型从"广州市内有什么商场"里看出来就填 广州）。
+    # ⚠️ 不填的后果实测很离谱：查「天河城」会被高德按**地址**解析到
+    #    "江西省南昌市进贤县天河城"，而广州的正主反而出不来。
+    city = str(a.get("city") or a.get("城市") or "").strip()
     markers, lines = [], []
 
     for q in [p for p in places if str(p).strip()][:12]:
-        one = _mt.geocode_one(str(q), allow_net=net)
+        one = _mt.geocode_one(str(q), allow_net=net, city=city)
         if not one:
             if net:
                 lines.append("· 「%s」没找到（换个更完整的名字试试，比如加上城市名）" % q)
@@ -2781,6 +2801,13 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
         lines.append("· **%s** —— %s（%.5f, %.5f）%s"
                      % (one["name"], one.get("addr") or "—", one["lat"], one["lon"],
                         ("  〔%s〕" % src.strip()) if src.strip() else ""))
+        if one.get("loose"):
+            # 这不是"查到了"，是"按地址猜的"——同名地点会被猜错省份，必须说出来
+            lines.append("  ⚠️ 「%s」**没有精确匹配到地点名**，上面这个地址是"
+                         "**按地址解析**出来的，很可能只是同名的地方。"
+                         "请把地图卡片上的位置跟用户核对一下；"
+                         "要更准的话，让用户补上所在城市（或下次调用时把 city 填上）。"
+                         % q)
 
     rinfo, approx, mode_cmp = None, None, None
     if route and route.get("from") and route.get("to"):
@@ -2790,7 +2817,8 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
             return _do_transit(route, ui_events, net)
         r = _mt.plan_route(str(route.get("from")), str(route.get("to")),
                            str(route.get("mode") or "driving"), allow_net=net,
-                           want_weather=bool(a.get("weather") or a.get("天气")))
+                           want_weather=bool(a.get("weather") or a.get("天气")),
+                           city=city)
         mode_cn = {"driving": "驾车", "foot": "步行", "bike": "骑行"}.get(
             r.get("mode"), r.get("mode"))
         for k in ("from", "to"):
@@ -2905,6 +2933,9 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
         ui_events.append({
             "type": "map",
             "online": net,
+            # 底图用哪个（联网+有高德 key → 高德）。前端据此选瓦片端点，
+            # 并决定打点要不要做 WGS-84 → GCJ-02 的换算。
+            "tile_source": _mt.tile_source(net),
             "center": center,
             "zoom": zoom,
             "markers": [{"name": m["name"], "lat": m["lat"], "lon": m["lon"],
@@ -3041,6 +3072,9 @@ def _do_nearby_places(arguments=None, ui_events=None) -> str:
         ui_events.append({
             "type": "map",
             "online": net,
+            # 底图用哪个（联网+有高德 key → 高德）。前端据此选瓦片端点，
+            # 并决定打点要不要做 WGS-84 → GCJ-02 的换算。
+            "tile_source": _mt.tile_source(net),
             "center": [c["lat"], c["lon"]],
             "zoom": 15 if rad <= 1200 else 14 if rad <= 3000 else 13 if rad <= 8000 else 12,
             "markers": [{"name": c["name"], "lat": c["lat"], "lon": c["lon"],

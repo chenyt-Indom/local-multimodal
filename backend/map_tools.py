@@ -48,6 +48,21 @@ TILE_MIRRORS = [
     "https://a.tile.openstreetmap.org/%d/%d/%d.png",
 ]
 
+# 高德底图（联网+配了 key 时的首选）。实测 0.1 秒一张，比 OSM 镜像快一个量级。
+# style=7 是标准中文路网图（有中文路名、POI 标注）。
+# ⚠️⚠️ 占位符顺序必须是 **z / x / y**（跟上面 TILE_MIRRORS 一致）——
+#    取图那里是 `tpl % (z, x, y)` 统一喂进去的。写成 `&x=%d&y=%d&z=%d` 会静默错位：
+#    实测表现是**地图整片空白**（高德对越界瓦片返回 179 字节的纯色图，不报错），
+#    查了半天才发现是自己把参数喂反了。查询串的顺序本来无所谓，别手贱改。
+# ⚠️⚠️ 高德瓦片是 **GCJ-02** 的，和 OSM 的 WGS-84 差 50~500 米 ——
+#    所以两套底图的瓦片**绝不能共用缓存目录**，前端打点也必须跟着换坐标系
+#    （见 tile_source / 前端 wgs2gcj）。混用会看到"点位整体偏出去一个街区"。
+AMAP_TILE_MIRRORS = [
+    "https://wprd01.is.autonavi.com/appmaptile?z=%d&x=%d&y=%d&lang=zh_cn&size=1&style=7",
+    "https://wprd02.is.autonavi.com/appmaptile?z=%d&x=%d&y=%d&lang=zh_cn&size=1&style=7",
+    "https://wprd03.is.autonavi.com/appmaptile?z=%d&x=%d&y=%d&lang=zh_cn&size=1&style=7",
+]
+
 MAX_ZOOM = 19
 
 
@@ -70,10 +85,17 @@ def cache_stats() -> dict:
     """本地地图数据攒了多少 —— 这个直接决定"离线模式有多能打"。"""
     d = cache_dir()
     n = size = 0
+    n_osm = n_amap = 0
+    amap_dir = os.path.join(d, "amap")
     for root, _dirs, files in os.walk(d):
+        is_amap = root == amap_dir or root.startswith(amap_dir + os.sep)
         for f in files:
             if f.endswith(".png"):
                 n += 1
+                if is_amap:
+                    n_amap += 1
+                else:
+                    n_osm += 1
                 try:
                     size += os.path.getsize(os.path.join(root, f))
                 except OSError:
@@ -88,11 +110,14 @@ def cache_stats() -> dict:
             except (TypeError, ValueError):
                 pass
     return {"tiles": n, "bytes": size, "dir": d,
+            "tiles_osm": n_osm, "tiles_amap": n_amap,
             "places": len(geo), "routes": len(rts),
             "builtin": builtin_count(),
             "newest_ts": newest,
             "newest_ago": age_text(newest),      # 本地地图数据有多新
             "online": online(),
+            "tile_source": tile_source(),
+            "tile_source_name": tile_source_text(),
             "ttl_days": {"geo": _TTL_GEO // 86400,
                          "route": _TTL_ROUTE // 86400,
                          "tile": _TTL_TILE // 86400}}
@@ -126,6 +151,30 @@ def online() -> bool:
 
 def mode_text() -> str:
     return "联网模式" if online() else "离线模式"
+
+
+def tile_source(allow_net=None) -> str:
+    """底图用哪一个 —— "amap"（高德，GCJ-02）还是 "osm"（WGS-84）。
+
+    **联网 + 配了 key → 高德**（中文路网图，实测比 OSM 镜像快一个量级）；
+    其余情况（离线、没配 key）→ OSM。
+
+    离线为什么还用 OSM：本地离线缓存的那几百张瓦片就是 OSM 的，
+    换成高德等于把用户攒了半天的离线地图全作废。所以"联网用高德、
+    离线看已缓存的 OSM"，各用各的坐标系，互不干扰。
+    """
+    net = online() if allow_net is None else bool(allow_net)
+    if not net:
+        return "osm"
+    try:
+        from . import amap
+        return "amap" if amap.has_key() else "osm"
+    except Exception:
+        return "osm"
+
+
+def tile_source_text(src: str = "") -> str:
+    return "高德地图" if (src or tile_source()) == "amap" else "OpenStreetMap"
 
 
 def _source_tag(net: bool) -> str:
@@ -446,13 +495,14 @@ def _builtin_exact(query: str):
     return None
 
 
-def search_place(query: str, limit: int = 5, allow_net=None) -> list:
+def search_place(query: str, limit: int = 5, allow_net=None, city: str = "") -> list:
     """按名字找地点，返回 [{name, lat, lon, addr, kind}]。
 
-    顺序：① 本地缓存 → ② **内置表精确命中** → ③ 联网查 Photon（查到顺手存下）
-          → ④ 内置表模糊兜底。
+    顺序：① 本地缓存 → ② **内置表精确命中** → ③ 联网查（高德优先）→ ④ 内置表模糊兜底。
     离线时（allow_net=False，或「联网」开关关着）③ 跳过，其余照常。
     返回项里带 from_cache / cache_ts 便于上层告诉用户"这是本地数据"。
+
+    city：限定城市（用户说"广州市内""汕头有什么"时由调用方传进来）。
     """
     q = str(query or "").strip()
     if not q:
@@ -461,7 +511,8 @@ def search_place(query: str, limit: int = 5, allow_net=None) -> list:
     net = online() if allow_net is None else bool(allow_net)
 
     # ① 本地缓存：没过期就直接用；**过期了在联网时会重查一遍**（这就是"自动更新"）
-    hit = _load_cache(_GEO_FILE).get(_ckey(_source_tag(net) + "|" + q))
+    ck = _source_tag(net) + "|" + (str(city or "").strip() + "|" if city else "") + q
+    hit = _load_cache(_GEO_FILE).get(_ckey(ck))
     if hit and hit.get("results") and _fresh(hit.get("ts"), _TTL_GEO):
         return [dict(r, from_cache=True, cache_ts=hit.get("ts"))
                 for r in hit["results"][:limit]]
@@ -471,16 +522,35 @@ def search_place(query: str, limit: int = 5, allow_net=None) -> list:
     if ex:
         return [ex]
 
-    # ②b 联网且配了高德 key → 用高德地理编码（国内比 Photon 准得多，
-    #     连"XX小区""XX大厦"这种小机构都能查到）
+    # ②b 联网且配了高德 key：**先关键词搜 POI，搜不到再当地址解析**
+    #     ⚠️ 顺序反了会出大错（实测）：查「天河城」时 /geocode 把它当地址，
+    #     命中"江西省南昌市进贤县天河城"—— 那边真有个叫天河城的村子。
+    #     凡是想找"某个地方"而不是"某个门牌号"，都该先走 /place/text。
     if net:
         try:
             from . import amap
             if amap.has_key():
-                hits = amap.geocode(q)
+                hits = []
+                c0 = str(city or "").strip()
+                if c0:
+                    kw = q            # 调用方已经说了城市，整个查询词就是关键词
+                else:
+                    c0, kw = _split_city(q)   # 从"广州市天河城"里抠出 广州 + 天河城
+                if kw and (c0 or len(kw) >= 2):
+                    r = amap.place_text(kw, city=c0)
+                    hits = [dict(x, kind=x.get("kind") or "poi")
+                            for x in (r.get("items") or [])]
+                if not hits:
+                    hits = amap.geocode(q)        # 兜底：当地址解析
+                    # ⚠️ 这一步是"按地址解析"，对**地点名**很不可靠：实测查「天河城」
+                    #    会命中"江西省南昌市进贤县天河城"（那边真有个同名村子）。
+                    #    所以查询词不像地址（没有"路/街/号/市/区/县/镇/村"）时打个标记，
+                    #    让上层把"可能是同名地点、建议补城市名"说出来 ——
+                    #    宁可说"不确定"，也不能默默给个外省结果。
+                    if hits and not re.search(r"[路街巷号市区县镇村]", q):
+                        hits = [dict(h, loose=True) for h in hits]
                 if hits:
-                    cache_put(_GEO_FILE, _source_tag(net) + "|" + q,
-                              {"ts": _now(), "results": hits})
+                    cache_put(_GEO_FILE, _ckey(ck), {"ts": _now(), "results": hits})
                     return hits[:limit]
         except Exception:
             pass
@@ -507,8 +577,7 @@ def search_place(query: str, limit: int = 5, allow_net=None) -> list:
                 except Exception:
                     continue
             if out:
-                cache_put(_GEO_FILE, _source_tag(net) + "|" + q,
-                              {"ts": _now(), "results": out})
+                cache_put(_GEO_FILE, _ckey(ck), {"ts": _now(), "results": out})
                 return out[:limit]
         except Exception:
             pass      # 网断了 / Photon 挂了 → 继续往下走兜底
@@ -534,12 +603,16 @@ def _parse_latlon(s: str):
     return None
 
 
-def geocode_one(query: str, allow_net=None):
-    """只要最匹配的一个，返回 dict 或 None。"""
+def geocode_one(query: str, allow_net=None, city: str = ""):
+    """只要最匹配的一个，返回 dict 或 None。
+
+    city 用来限定城市（用户说"广州市内有什么商场"时，把广州带下来，
+    否则"天河城"会被解析成江西进贤县那个同名村子 —— 实测踩过）。
+    """
     c = _parse_latlon(query)
     if c:
         return c
-    r = search_place(query, limit=1, allow_net=allow_net)
+    r = search_place(query, limit=1, allow_net=allow_net, city=city)
     if not r:
         return None
     return r[0]
@@ -666,12 +739,13 @@ def _mk_routes(raw_routes: list, mode: str, a: dict, b: dict) -> list:
 
 
 def plan_route(origin: str, dest: str, mode: str = "driving", allow_net=None,
-               want_weather: bool = False):
+               want_weather: bool = False, city: str = ""):
     """规划两点之间的路线。origin/dest 传地名（会自动地理编码），也接受 "lat,lon"。
 
     返回里顶层保留 distance_m/duration_s/points（＝**推荐的那条**），
     另外加 routes:[…] 给出多条候选，每条带 recommended / reason。
     离线时：算过的路线直接重放；没算过的返回 ok=False + approx（直线距离，仅供参考）。
+    city：限定城市，透传给地理编码（避免同名地点被解析到外省）。
     """
     m = {"驾车": "driving", "开车": "driving", "driving": "driving", "car": "driving",
          "步行": "foot", "走路": "foot", "walking": "foot", "foot": "foot",
@@ -685,8 +759,8 @@ def plan_route(origin: str, dest: str, mode: str = "driving", allow_net=None,
     if hit and hit.get("routes") and _fresh(hit.get("ts"), _TTL_ROUTE):
         return _serve_cached(hit, m, net, want_weather)
 
-    a = geocode_one(origin, allow_net=net)
-    b = geocode_one(dest, allow_net=net)
+    a = geocode_one(origin, allow_net=net, city=city)
+    b = geocode_one(dest, allow_net=net, city=city)
     if not a:
         return {"ok": False, "offline": not net, "error": "找不到起点「%s」" % origin}
     if not b:
@@ -837,11 +911,19 @@ def fmt_duration(s: float) -> str:
 
 
 # ---------------------------------------------------------------- 瓦片（带本地缓存）
-def _tile_path(z: int, x: int, y: int) -> str:
+def _tile_path(z: int, x: int, y: int, src: str = "osm") -> str:
+    """⚠️ 两套底图**必须分开存** —— 同一个 z/x/y 在 OSM 和高德下指的不是同一块地
+    （坐标系差 50~500 米）。混着存会出现"一半瓦片是对的、一半整体偏移"。
+
+    OSM 沿用老路径（`map_cache/<z>/<x>/<y>.png`）不动 —— 用户已经攒下来的
+    离线瓦片不能作废。
+    """
+    if src == "amap":
+        return os.path.join(cache_dir(), "amap", str(z), str(x), "%d.png" % y)
     return os.path.join(cache_dir(), str(z), str(x), "%d.png" % y)
 
 
-def get_tile(z: int, x: int, y: int, allow_net=None):
+def get_tile(z: int, x: int, y: int, allow_net=None, src: str = ""):
     """取一张瓦片：先看本地缓存，没有再上网取并缓存。返回 (bytes, from_cache)。
 
     离线模式下**绝不联网**：缓存里有就给，没有就 (None, False) ——
@@ -853,7 +935,8 @@ def get_tile(z: int, x: int, y: int, allow_net=None):
     n = 1 << z
     if not (0 <= x < n and 0 <= y < n):
         return None, False
-    p = _tile_path(z, x, y)
+    src = src or tile_source(allow_net)
+    p = _tile_path(z, x, y, src)
     old = None
     if os.path.exists(p) and os.path.getsize(p) > 0:
         try:
@@ -869,12 +952,17 @@ def get_tile(z: int, x: int, y: int, allow_net=None):
     if not (online() if allow_net is None else bool(allow_net)):
         return (old, True) if old else (None, False)
 
-    for tpl in TILE_MIRRORS:
+    for tpl in (AMAP_TILE_MIRRORS if src == "amap" else TILE_MIRRORS):
         try:
             data = _get(tpl % (z, x, y), timeout=12)
         except Exception:
             continue
+        # ⚠️ 明显是"空白瓦片"的就别缓存 —— 高德对越界/查不到的瓦片会回一张
+        #    ~179 字节的纯色 PNG，看着像成功。要是把它按 60 天 TTL 存下来，
+        #    那块地就**永远白着了**（实测踩过：整片地图空白，还查不出原因）。
         if data and data[:4] == b"\x89PNG":
+            if len(data) < 300:
+                continue
             try:
                 os.makedirs(os.path.dirname(p), exist_ok=True)
                 with open(p, "wb") as f:
@@ -894,6 +982,22 @@ def _lonlat_to_tile(lat: float, lon: float, z: int):
     return max(0, min(n - 1, x)), max(0, min(n - 1, y))
 
 
+def _tile_latlon(lat: float, lon: float, src: str):
+    """把 WGS-84 的坐标换成"瓦片所在坐标系"的坐标。
+
+    高德瓦片是 GCJ-02 的：拿 WGS-84 去算瓦片号，会正好错开半条街，
+    预下载下来的图对不上点位。这一步不能省。
+    """
+    if src != "amap":
+        return lat, lon
+    try:
+        from . import amap
+        lng, la = amap.wgs84_to_gcj02(float(lon), float(lat))
+        return la, lng
+    except Exception:
+        return lat, lon
+
+
 def prefetch_route(points, zoom: int = 12, span: int = 2, max_tiles: int = 220,
                    allow_net=None):
     """把一条路线沿途的瓦片下到本地（之后离线也能看）。返回下载/命中统计。
@@ -905,14 +1009,16 @@ def prefetch_route(points, zoom: int = 12, span: int = 2, max_tiles: int = 220,
     if not net:
         return {"requested": 0, "new": 0, "cached": 0, "failed": 0,
                 "error": "离线模式下没法预下载，先把「联网」开关打开再试。"}
+    src = tile_source(True)
     todo = set()
     zs = [z for z in (zoom, zoom - 1, zoom - 2) if 0 <= z <= MAX_ZOOM]
     # 路线点抽稀，别把每个点都算一遍
     step = max(1, len(points) // 120)
     for i in range(0, len(points), step):
-        lat, lon = points[i][0], points[i][1]
+        # ⚠️ 高德瓦片按 GCJ-02 编号，先转换再算瓦片号，否则下到的图对不上点位
+        tlat, tlon = _tile_latlon(points[i][0], points[i][1], src)
         for z in zs:
-            tx, ty = _lonlat_to_tile(lat, lon, z)
+            tx, ty = _lonlat_to_tile(tlat, tlon, z)
             for dx in range(-span, span + 1):
                 for dy in range(-span, span + 1):
                     todo.add((z, tx + dx, ty + dy))
@@ -927,7 +1033,7 @@ def prefetch_route(points, zoom: int = 12, span: int = 2, max_tiles: int = 220,
 
     hit = new = fail = 0
     for (z, x, y) in sorted(todo):
-        data, cached = get_tile(z, x, y)
+        data, cached = get_tile(z, x, y, allow_net=True, src=src)
         if data is None:
             fail += 1
         elif cached:
@@ -935,7 +1041,8 @@ def prefetch_route(points, zoom: int = 12, span: int = 2, max_tiles: int = 220,
         else:
             new += 1
         time.sleep(0.03)          # 别把人家服务器打爆
-    return {"requested": len(todo), "new": new, "cached": hit, "failed": fail}
+    return {"requested": len(todo), "new": new, "cached": hit, "failed": fail,
+            "source": src, "source_name": tile_source_text(src)}
 
 
 def prefetch_area(center_lat: float, center_lon: float, zoom: int = 13, span: int = 2):
@@ -971,7 +1078,9 @@ _CAT_TAGS = [
     (("咖啡", "咖啡馆", "cafe", "coffee"), '["amenity"="cafe"]'),
     (("便利", "小卖", "杂货", "便利店", "convenience"),
      '["shop"~"convenience|grocery|general"]'),
-    (("超市", "supermarket", "商场", "mall"), '["shop"~"supermarket|mall|department_store"]'),
+    (("购物中心", "商场", "商城", "百货", "综合体", "mall", "shopping"),
+     '["shop"~"mall|department_store"]'),
+    (("超市", "supermarket"), '["shop"~"supermarket|department_store"]'),
     (("药店", "药房", "pharmacy"), '["amenity"="pharmacy"]'),
     (("医院", "诊所", "卫生院", "hospital", "clinic"), '["amenity"~"hospital|clinic|doctors"]'),
     (("银行", "bank"), '["amenity"="bank"]'),
@@ -997,7 +1106,11 @@ _CAT_TAGS = [
 
 
 def _cat_tag(category: str) -> tuple:
-    """把用户说的类别翻译成 Overpass 标签。返回 (标签, 标准类别名) 或 (None, "")。"""
+    """把用户说的类别翻译成 Overpass 标签。返回 (标签, 标准类别名) 或 (None, "")。
+
+    标准类别名还会被当成**关键词发给高德**（高德的类型码太杂，用中文词更稳），
+    所以每组第一个词要选"最适合当搜索词"的那个。
+    """
     c = str(category or "").strip().lower()
     if not c:
         return None, ""
@@ -1006,6 +1119,59 @@ def _cat_tag(category: str) -> tuple:
             if k in c:
                 return tag, keys[0]
     return None, ""
+
+
+# 常见城市名（不带"市"字），用来从查询词里抠出"要在哪个城市找"。
+# ⚠️ 为什么非要有这个：高德的 /place/text **必须带地区限定**才出结果 ——
+#    实测纯关键词（哪怕加 citylimit=false）一律返回 0 条；
+#    而它的 /geocode 是**按地址解析**的：查「天河城」会命中
+#    "江西省南昌市进贤县天河城"（那边真有个叫天河城的村子），
+#    广州那个正主反而出不来。所以"搜 POI"和"解析地址"是两条路，不能混。
+_CITIES = [
+    "北京", "上海", "天津", "重庆", "广州", "深圳", "珠海", "汕头", "佛山", "韶关",
+    "湛江", "肇庆", "江门", "茂名", "惠州", "梅州", "汕尾", "河源", "阳江", "清远",
+    "东莞", "中山", "潮州", "揭阳", "云浮",
+    "杭州", "宁波", "温州", "嘉兴", "绍兴", "金华", "台州",
+    "苏州", "无锡", "常州", "南通", "徐州", "南京",
+    "合肥", "福州", "厦门", "泉州", "南昌", "赣州", "济南", "青岛", "烟台", "威海",
+    "郑州", "洛阳", "武汉", "宜昌", "长沙", "株洲", "成都", "绵阳", "昆明", "大理",
+    "贵阳", "南宁", "桂林", "柳州", "海口", "三亚", "西安", "兰州", "西宁", "银川",
+    "乌鲁木齐", "呼和浩特", "包头", "拉萨", "沈阳", "大连", "长春", "吉林",
+    "哈尔滨", "石家庄", "唐山", "太原", "大同",
+]
+
+
+def _split_city(q: str) -> tuple:
+    """从查询词里抠出 (城市名, 剩余关键词)。
+
+    ⚠️ 两个不能省的保护：
+      ① 只在**开头**匹配，而且剩余部分得有 ≥2 个字 ——
+         否则「广州塔」会被拆成 city=广州 + kw=塔，搜出来一堆别的塔；
+      ② 剩下的部分不能是个**裸的通用词** —— 否则「汕头大学」会被拆成
+         city=汕头 + kw=大学，搜出"汕头广播电视大学"这种。
+         这种情况宁可整串当地址解析（高德对"汕头大学"是能解析的）。
+    """
+    s = str(q or "").strip()
+    best = ""
+    for c in _CITIES:
+        for form in (c + "市", c):
+            if s.startswith(form) and len(s) - len(form) >= 2:
+                if len(form) > len(best):
+                    best = form
+                break
+    if not best:
+        return "", s
+    kw = s[len(best):].strip()
+    if kw in _GENERIC_SUFFIX:
+        return "", s
+    return best[:-1] if best.endswith("市") else best, kw
+
+
+# 「城市名 + 这些词」不该被拆开当关键词搜（会搜出一堆别的同名机构）
+_GENERIC_SUFFIX = {
+    "大学", "中学", "小学", "学院", "学校", "医院", "公园", "车站", "机场",
+    "广场", "大厦", "酒店", "银行", "市场", "政府", "火车站", "高铁站",
+}
 
 
 def _poi_info(t: dict) -> dict:
@@ -1117,7 +1283,8 @@ def nearby(lat: float, lon: float, category: str, radius: int = 1500,
                                      "超市 / 药店 / 医院 / 银行 / 加油站 / 停车场 / "
                                      "酒店 / 学校 / 公交站 / 公园 / 厕所…" % category}
     net = online() if allow_net is None else bool(allow_net)
-    radius = max(100, min(20000, int(radius or 1500)))
+    # 高德最大支持 50000 米；「整个城市里有什么」这种问法需要大半径
+    radius = max(100, min(50000, int(radius or 1500)))
     limit = max(1, min(60, int(limit or 20)))
     # ⚠️ 缓存键必须带**数据源** —— 高德和 OSM 的结果质量差很多，
     # 共用一个键会出这种事（实测踩过）：刚配好高德 key，看到的却还是旧的 OSM 数据。

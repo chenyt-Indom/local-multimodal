@@ -252,7 +252,10 @@
     const info = document.createElement("div");
     info.className = "map-info";
     let html = `<span class="map-badge ${online ? "on" : "off"}">` +
-      (online ? "联网" : "离线") + `</span>`;
+      (online ? "联网" : "离线") + `</span>` +
+      // 底图是哪家，直接标出来 —— 不然用户看不出这张图是"换了个地图"
+      // （高德底图是中文路网图，和 OSM 那种清淡的志愿者图一眼就能分辨）
+      `<span class="map-basemap">${ui.tile_source === "amap" ? "高德底图" : "OSM 底图"}</span>`;
     if (rt && rt.straight) {
       // 离线兜底：没有路网数据，只能给直线距离 —— 必须说清楚，
       // 否则用户会把"直线 6 公里"当成"开车 6 公里"。
@@ -367,6 +370,46 @@
     el.appendChild(d);
   }
 
+  // ---------- 坐标系：WGS-84 → GCJ-02（火星坐标） ----------
+  // 为什么必须有这个：高德底图是 **GCJ-02** 的，而我们的数据（GPS / OpenStreetMap）
+  // 是 **WGS-84** 的，两者在国内差 **50~500 米**。直接把 WGS-84 的点画到高德底图上，
+  // 视觉上就是"点和路整体错开一个街区" —— 看起来像数据查错了，其实只是没换算。
+  // 这里跟后端 backend/amap.py 的算法保持一致（同一套公式，结果才是同一处）。
+  const GCJ_A = 6378245.0;
+  const GCJ_EE = 0.00669342162296594323;
+
+  function gcjOutOfChina(lng, lat) {
+    return !(lng > 73.66 && lng < 135.05 && lat > 3.86 && lat < 53.55);
+  }
+  function gcjTfLat(x, y) {
+    let r = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y +
+      0.2 * Math.sqrt(Math.abs(x));
+    r += (20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0 / 3.0;
+    r += (20.0 * Math.sin(y * Math.PI) + 40.0 * Math.sin(y / 3.0 * Math.PI)) * 2.0 / 3.0;
+    r += (160.0 * Math.sin(y / 12.0 * Math.PI) + 320 * Math.sin(y * Math.PI / 30.0)) * 2.0 / 3.0;
+    return r;
+  }
+  function gcjTfLng(x, y) {
+    let r = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x));
+    r += (20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0 / 3.0;
+    r += (20.0 * Math.sin(x * Math.PI) + 40.0 * Math.sin(x / 3.0 * Math.PI)) * 2.0 / 3.0;
+    r += (150.0 * Math.sin(x / 12.0 * Math.PI) + 300.0 * Math.sin(x / 30.0 * Math.PI)) * 2.0 / 3.0;
+    return r;
+  }
+  // 入参/出参都是 [lat, lon]（跟着 Leaflet 的习惯走，免得来回调顺序出错）
+  function wgs2gcj(lat, lon) {
+    if (gcjOutOfChina(lon, lat)) return [lat, lon];
+    let dLat = gcjTfLat(lon - 105.0, lat - 35.0);
+    let dLon = gcjTfLng(lon - 105.0, lat - 35.0);
+    const rad = lat / 180.0 * Math.PI;
+    let magic = Math.sin(rad);
+    magic = 1 - GCJ_EE * magic * magic;
+    const sq = Math.sqrt(magic);
+    dLat = (dLat * 180.0) / ((GCJ_A * (1 - GCJ_EE)) / (magic * sq) * Math.PI);
+    dLon = (dLon * 180.0) / (GCJ_A / sq * Math.cos(rad) * Math.PI);
+    return [lat + dLat, lon + dLon];
+  }
+
   function initMapCard(elId, ui) {
     const el = document.getElementById(elId);
     if (!el) return;
@@ -375,17 +418,33 @@
         '（frontend/lib/leaflet 缺文件）</div>';
       return;
     }
+    // ---- 底图：联网 + 配了高德 key → 高德；其余（离线 / 没配 key）→ OSM ----
+    // 离线之所以还用 OSM：本地缓存的那些瓦片就是 OSM 的，换源等于把攒下来的
+    // 离线地图全作废。两套各用各的坐标系、各存各的缓存目录，互不干扰。
+    const useAmap = ui.tile_source === "amap";
+    const toTile = useAmap
+      ? function (la, lo) { return wgs2gcj(la, lo); }
+      : function (la, lo) { return [la, lo]; };
+    const ptsOf = function (arr) {
+      return (arr || []).map(function (p) { return toTile(p[0], p[1]); });
+    };
     const center = ui.center || [23.13, 113.26];
     const map = L.map(el, { zoomControl: true, attributionControl: true })
-      .setView([center[0], center[1]], ui.zoom || 12);
+      .setView(toTile(center[0], center[1]), ui.zoom || 12);
 
     // 瓦片一律走后端（后端走本地缓存）。离线时后端不联网，
     // 没缓存过的瓦片直接 404，所以这里要接住 tileerror。
     let tileErr = 0;
-    const layer = L.tileLayer("/api/map/tile/{z}/{x}/{y}.png", {
-      minZoom: 3, maxZoom: 19,
-      attribution: "地图数据 © OpenStreetMap 贡献者（缓存在本地）",
-    });
+    const layer = L.tileLayer(
+      // ⚠️ 高德这条带 `?v=1`：之前参数喂反时高德回过一批**空白瓦片**，
+      //    浏览器按 7 天 TTL 缓存住了，光改后端救不回来（页面里还是白的）。
+      //    换掉 URL 就等于把那份坏缓存作废。以后瓦片格式/参数再变，把这个版本号 +1。
+      useAmap ? "/api/map/amap/{z}/{x}/{y}.png?v=1" : "/api/map/tile/{z}/{x}/{y}.png", {
+        minZoom: 3, maxZoom: 19,
+        attribution: useAmap
+          ? "地图数据 © 高德地图（GCJ-02）"
+          : "地图数据 © OpenStreetMap 贡献者（缓存在本地）",
+      });
     layer.on("tileerror", function () {
       tileErr++;
       if (ui.online === false && tileErr >= 5) mapOfflineTip(el);
@@ -394,13 +453,14 @@
 
     const span = [];
     (ui.markers || []).forEach(function (mk) {
+      const p = toTile(mk.lat, mk.lon);
       const icon = L.divIcon({ className: "mm-pin", html: "<i></i>",
                                iconSize: [18, 18], iconAnchor: [9, 9] });
-      const m1 = L.marker([mk.lat, mk.lon], { icon: icon, title: mk.name || "" }).addTo(map);
+      const m1 = L.marker(p, { icon: icon, title: mk.name || "" }).addTo(map);
       const body = "<b>" + escapeHtml(mk.name || "") + "</b>" +
         (mk.addr ? "<br><span style='color:#666'>" + escapeHtml(mk.addr) + "</span>" : "");
       m1.bindPopup(body);
-      span.push([mk.lat, mk.lon]);
+      span.push(p);
     });
 
     const rt = ui.route;
@@ -410,7 +470,8 @@
       rt.routes.forEach(function (r) {
         if (!r.points || r.points.length < 2) return;
         const rec = !!r.recommended;
-        const line = L.polyline(r.points, {
+        const pts = ptsOf(r.points);       // 高德底图时这里会转成 GCJ-02
+        const line = L.polyline(pts, {
           color: rec ? "#2e75b6" : "#9aa7b4",
           weight: rec ? 6 : 4,
           opacity: rec ? 0.9 : 0.65,
@@ -419,12 +480,13 @@
         line.bindPopup((rec ? "<b>推荐路线</b>" : "备选路线") + "<br>" +
           escapeHtml(r.distance || "") + "，约 " + escapeHtml(r.duration || "") +
           (r.reason ? "<br><span style='color:#666'>" + escapeHtml(r.reason) + "</span>" : ""));
-        span.push.apply(span, r.points);
+        span.push.apply(span, pts);
       });
     } else if (rt && (rt.points || []).length > 1) {
-      L.polyline(rt.points, { color: "#2e75b6", weight: 5, opacity: 0.85 })
+      const pts = ptsOf(rt.points);
+      L.polyline(pts, { color: "#2e75b6", weight: 5, opacity: 0.85 })
         .addTo(map);
-      span.push.apply(span, rt.points);
+      span.push.apply(span, pts);
     } else if (rt && rt.straight) {
       // 离线兜底：没有路网，用橙色虚线连两点，一眼就能和真路线区分开
       const ms = ui.markers || [];
@@ -432,7 +494,7 @@
       const pb = ms.filter(function (m) { return m.name === ui.route.to; })[0] ||
                  ms[ms.length - 1];
       if (pa && pb) {
-        L.polyline([[pa.lat, pa.lon], [pb.lat, pb.lon]],
+        L.polyline([toTile(pa.lat, pa.lon), toTile(pb.lat, pb.lon)],
                    { color: "#e08a2e", weight: 3, dashArray: "8 8", opacity: 0.9 })
           .addTo(map);
       }
@@ -453,9 +515,13 @@
       const mb = ((d.bytes || 0) / 1048576).toFixed(1);
       const ttl = d.ttl_days || {};
       showToast(
-        (d.online ? "联网模式" : "离线模式") + "｜本地地图：瓦片 " + (d.tiles || 0) +
-        " 张（" + mb + " MB）、地点 " + (d.places || 0) + " 个、路线 " +
-        (d.routes || 0) + " 条；内置常用地名 " + (d.builtin || 0) + " 条。" +
+        (d.online ? "联网模式" : "离线模式") +
+        "｜底图：" + (d.tile_source_name || "OpenStreetMap") +
+        "（离线用本地缓存的 OSM）" +
+        "｜本地地图：瓦片 " + (d.tiles || 0) + " 张（" + mb + " MB）" +
+        (d.tiles_amap ? "，其中高德 " + d.tiles_amap + " 张" : "") +
+        "、地点 " + (d.places || 0) + " 个、路线 " + (d.routes || 0) +
+        " 条；内置常用地名 " + (d.builtin || 0) + " 条。" +
         (d.newest_ago ? "数据最近更新于 " + d.newest_ago + "。" : "") +
         " 联网时会自动刷新过期数据（地名 " + (ttl.geo || 30) + " 天 / 路线 " +
         (ttl.route || 7) + " 天 / 瓦片 " + (ttl.tile || 60) + " 天）", "ok");
