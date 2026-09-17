@@ -292,6 +292,15 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 }
 .pill.on { color: var(--text); border-color: var(--accent); background: #1c2947; }
 .pill.on .sw { background: var(--green); box-shadow: 0 0 8px var(--green); }
+/* 「地图缓存」是个按钮、不是开关：外观复用 .pill，但要压掉 button 的默认样式 */
+button.pill-btn {
+  font-family: inherit;
+  font-size: 13px;
+  line-height: normal;
+  -webkit-appearance: none;
+  appearance: none;
+}
+button.pill-btn:hover { color: var(--text); border-color: var(--accent); }
 
 /* （旧的分区式记忆编辑器样式已移除：记忆改成"每个对话一块"后不再使用） */
 
@@ -1031,3 +1040,45 @@ body.dragging .drop-overlay,
 /* 深色底时地图卡片也跟着暗一点，别刺眼 */
 body.dark .map-card { border-color: #2c3440; }
 body.dark .map-card .map-info { background: #1d2430; color: #e6ebf2; border-bottom-color: #2c3440; }
+/* 模式徽标：一眼看出这次是联网查的还是离线本地给的 */
+.map-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 9px;
+  font-size: 11.5px;
+  line-height: 17px;
+  margin-right: 4px;
+  vertical-align: 1px;
+}
+.map-badge.on  { background: #e6f4ea; color: #1e7f45; border: 1px solid #b7e0c4; }
+.map-badge.off { background: #fdf0e3; color: #9a5b12; border: 1px solid #f0d3ac; }
+.map-src { margin-left: 8px; font-size: 11.5px; color: #6b7684; }
+/* "非实际道路"这类提醒：要显眼，不能让人当成真数据 */
+.map-warn {
+  margin-left: 8px;
+  font-size: 11.5px;
+  color: #9a5b12;
+  background: #fdf0e3;
+  border-radius: 6px;
+  padding: 1px 6px;
+}
+/* 离线且这块区域没缓存时，压在地图上的说明条 */
+.map-offline-tip {
+  position: absolute;
+  left: 50%; top: 14px;
+  transform: translateX(-50%);
+  z-index: 900;
+  background: rgba(32, 39, 48, .88);
+  color: #fff;
+  font-size: 12.5px;
+  line-height: 1.6;
+  padding: 8px 14px;
+  border-radius: 8px;
+  text-align: center;
+  max-width: 82%;
+  pointer-events: none;
+}
+body.dark .map-badge.on  { background: #16321f; color: #7fd39b; border-color: #24512f; }
+body.dark .map-badge.off { background: #3a2a12; color: #e0b070; border-color: #5a4020; }
+body.dark .map-src { color: #93a0ae; }
+body.dark .map-warn { background: #3a2a12; color: #e0b070; }

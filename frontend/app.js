@@ -248,15 +248,28 @@
     wrap.appendChild(box);
 
     const rt = ui.route || null;
+    const online = ui.online !== false;      // 后端会把当前模式带下来
     const info = document.createElement("div");
     info.className = "map-info";
-    let html = "";
-    if (rt) {
-      html += `<b>${escapeHtml(rt.from || "")} → ${escapeHtml(rt.to || "")}</b>` +
+    let html = `<span class="map-badge ${online ? "on" : "off"}">` +
+      (online ? "联网" : "离线") + `</span>`;
+    if (rt && rt.straight) {
+      // 离线兜底：没有路网数据，只能给直线距离 —— 必须说清楚，
+      // 否则用户会把"直线 6 公里"当成"开车 6 公里"。
+      html += ` <b>${escapeHtml(rt.from || "")} → ${escapeHtml(rt.to || "")}</b>` +
+        `　直线 ${escapeHtml(rt.distance || "")}` +
+        (rt.bearing ? `，在起点${escapeHtml(rt.bearing)}方向` : "") +
+        `<span class="map-warn">非实际道路</span>`;
+    } else if (rt) {
+      html += ` <b>${escapeHtml(rt.from || "")} → ${escapeHtml(rt.to || "")}</b>` +
         `　${escapeHtml(rt.mode || "")} ${escapeHtml(rt.distance || "")}` +
         `，约 ${escapeHtml(rt.duration || "")}`;
+      if (rt.cached) {
+        html += `<span class="map-src">本地缓存` +
+          (rt.cache_time ? " " + escapeHtml(rt.cache_time) : "") + `</span>`;
+      }
     } else if ((ui.markers || []).length) {
-      html += `<b>${escapeHtml(ui.markers[0].name || "")}</b>` +
+      html += ` <b>${escapeHtml(ui.markers[0].name || "")}</b>` +
         ((ui.markers || []).length > 1 ? ` 等 ${ui.markers.length} 个地点` : "");
     }
     info.innerHTML = html || "地图";
@@ -275,21 +288,40 @@
     return wrap;
   }
 
+  // 离线时地图上大片空白 → 给一句明白话，别让用户对着灰底猜"是不是坏了"
+  function mapOfflineTip(el) {
+    if (el.querySelector(".map-offline-tip")) return;
+    const d = document.createElement("div");
+    d.className = "map-offline-tip";
+    d.innerHTML = "离线模式：这块区域还没缓存到本地。" +
+      "<br>联网时问一次这条路线，之后断网也能看。";
+    el.appendChild(d);
+  }
+
   function initMapCard(elId, ui) {
     const el = document.getElementById(elId);
     if (!el) return;
     if (typeof L === "undefined") {
       el.innerHTML = '<div class="hint" style="padding:10px">地图组件没加载出来' +
-        '（frontend/vendor/leaflet 缺文件）</div>';
+        '（frontend/lib/leaflet 缺文件）</div>';
       return;
     }
     const center = ui.center || [23.13, 113.26];
     const map = L.map(el, { zoomControl: true, attributionControl: true })
       .setView([center[0], center[1]], ui.zoom || 12);
-    L.tileLayer("/api/map/tile/{z}/{x}/{y}.png", {
+
+    // 瓦片一律走后端（后端走本地缓存）。离线时后端不联网，
+    // 没缓存过的瓦片直接 404，所以这里要接住 tileerror。
+    let tileErr = 0;
+    const layer = L.tileLayer("/api/map/tile/{z}/{x}/{y}.png", {
       minZoom: 3, maxZoom: 19,
-      attribution: "地图数据 © OpenStreetMap 贡献者（已缓存在本地）",
-    }).addTo(map);
+      attribution: "地图数据 © OpenStreetMap 贡献者（缓存在本地）",
+    });
+    layer.on("tileerror", function () {
+      tileErr++;
+      if (ui.online === false && tileErr >= 5) mapOfflineTip(el);
+    });
+    layer.addTo(map);
 
     const span = [];
     (ui.markers || []).forEach(function (mk) {
@@ -306,6 +338,17 @@
       L.polyline(ui.route.points, { color: "#2e75b6", weight: 5, opacity: 0.85 })
         .addTo(map);
       span.push.apply(span, ui.route.points);
+    } else if (ui.route && ui.route.straight) {
+      // 离线兜底：没有路网，用橙色虚线连两点，一眼就能和真路线区分开
+      const ms = ui.markers || [];
+      const pa = ms.filter(function (m) { return m.name === ui.route.from; })[0] || ms[0];
+      const pb = ms.filter(function (m) { return m.name === ui.route.to; })[0] ||
+                 ms[ms.length - 1];
+      if (pa && pb) {
+        L.polyline([[pa.lat, pa.lon], [pb.lat, pb.lon]],
+                   { color: "#e08a2e", weight: 3, dashArray: "8 8", opacity: 0.9 })
+          .addTo(map);
+      }
     }
     try {
       if (span.length > 1) map.fitBounds(L.latLngBounds(span).pad(0.18));
@@ -320,8 +363,11 @@
   async function showMapCache() {
     try {
       const d = await api("/api/map/stats");
-      showToast("本地地图缓存：" + (d.tiles || 0) + " 张，占 " +
-        ((d.bytes || 0) / 1048576).toFixed(1) + " MB", "ok");
+      const mb = ((d.bytes || 0) / 1048576).toFixed(1);
+      showToast(
+        (d.online ? "联网模式" : "离线模式") + "｜本地地图：瓦片 " + (d.tiles || 0) +
+        " 张（" + mb + " MB）、地点 " + (d.places || 0) + " 个、路线 " +
+        (d.routes || 0) + " 条；另有内置常用地名 " + (d.builtin || 0) + " 条", "ok");
     } catch (e) { showToast("读不到缓存信息：" + e.message, "warn"); }
   }
   window.__showMapCache = showMapCache;

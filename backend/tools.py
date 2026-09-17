@@ -2607,8 +2607,22 @@ def _do_make_xlsx(arguments=None, ui_events=None) -> str:
                urllib.parse.quote(base), base, tip))
 
 
+def _cache_time_text(ts) -> str:
+    """把缓存时间戳写成「09月17日 21:30」，让用户知道这份数据有多新。"""
+    try:
+        return time.strftime("%m月%d日 %H:%M", time.localtime(float(ts)))
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
 def _do_map_plan(arguments=None, ui_events=None) -> str:
-    """查地点 / 规划路线，并把地图数据推给前端画成卡片。"""
+    """查地点 / 规划路线，并把地图数据推给前端画成卡片。
+
+    **两种跑法**（一起跟随前端的「联网」开关）：
+      · 联网 —— 本地没有就上网查，查到顺手存到本地（下次离线也有）；
+      · 离线 —— 只认本地：以前查过的地名/算过的路线 + 内置常用地名表，
+               **一个网络请求都不发**。算不出真路线时只给直线距离，并说明白。
+    """
     from . import map_tools as _mt
 
     a = arguments or {}
@@ -2627,36 +2641,64 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
         return ("错误：至少要给 places（要找的地点）或 route（要规划的路线）。"
                 '例如 {"places":["广州塔"],"route":{"from":"广州塔","to":"白云机场"}}')
 
+    net = _mt.online()
     markers, lines = [], []
+
     for q in [p for p in places if str(p).strip()][:12]:
-        one = _mt.geocode_one(str(q))
+        one = _mt.geocode_one(str(q), allow_net=net)
         if not one:
-            lines.append("· 「%s」没找到（换个更完整的名字试试，比如加上城市名）" % q)
+            if net:
+                lines.append("· 「%s」没找到（换个更完整的名字试试，比如加上城市名）" % q)
+            else:
+                lines.append("· 「%s」没找到。现在是离线模式，只能查本地记录过的地点；"
+                             "打开「联网」开关就能查到。" % q)
             continue
+        if one.get("kind") == "builtin":
+            src = "内置地名表"
+        elif one.get("from_cache"):
+            src = "本地缓存 %s" % (_cache_time_text(one.get("cache_ts")) or "")
+        else:
+            src = ""
         markers.append({"name": one["name"], "lat": one["lat"], "lon": one["lon"],
                         "addr": one.get("addr") or "", "query": str(q)})
-        lines.append("· **%s** —— %s（%.5f, %.5f）"
-                     % (one["name"], one.get("addr") or "—", one["lat"], one["lon"]))
+        lines.append("· **%s** —— %s（%.5f, %.5f）%s"
+                     % (one["name"], one.get("addr") or "—", one["lat"], one["lon"],
+                        ("  〔%s〕" % src.strip()) if src.strip() else ""))
 
-    rinfo = None
+    rinfo, approx = None, None
     if route and route.get("from") and route.get("to"):
         r = _mt.plan_route(str(route.get("from")), str(route.get("to")),
-                           str(route.get("mode") or "driving"))
-        if not r.get("ok"):
-            lines.append("· 路线没规划出来：%s" % r.get("error"))
-        else:
+                           str(route.get("mode") or "driving"), allow_net=net)
+        mode_cn = {"driving": "驾车", "foot": "步行", "bike": "骑行"}.get(
+            r.get("mode"), r.get("mode"))
+        for k in ("from", "to"):
+            if r.get(k):
+                markers.append({"name": r[k]["name"], "lat": r[k]["lat"],
+                                "lon": r[k]["lon"], "addr": "", "role": k})
+        if r.get("ok"):
             rinfo = r
-            lines.append("· **从 %s 到 %s**：%s，约 %s（%s）"
+            tail = ""
+            if r.get("from_cache"):
+                tail = "  〔本地缓存 %s〕" % (_cache_time_text(r.get("cache_ts")) or "")
+            lines.append("· **从 %s 到 %s**：%s，约 %s（%s）%s"
                          % (r["from"]["name"], r["to"]["name"],
                             _mt.fmt_distance(r["distance_m"]),
-                            _mt.fmt_duration(r["duration_s"]),
-                            {"driving": "驾车", "foot": "步行", "bike": "骑行"}.get(r["mode"], r["mode"])))
-            for k in ("from", "to"):
-                markers.append({"name": r[k]["name"], "lat": r[k]["lat"], "lon": r[k]["lon"],
-                                "addr": "", "role": k})
+                            _mt.fmt_duration(r["duration_s"]), mode_cn, tail))
+        else:
+            approx = r.get("approx")
+            lines.append("· **从 %s 到 %s**：%s"
+                         % (r.get("from", {}).get("name", route.get("from")),
+                            r.get("to", {}).get("name", route.get("to")),
+                            r.get("error") or "没规划出来"))
+            if approx:
+                lines.append("  两地**直线**距离 %s，终点在起点的**%s**方向。"
+                             "⚠️ 这是直线距离、不是实际道路距离，只能当大致参考。"
+                             % (_mt.fmt_distance(approx["distance_m"]), approx["bearing"]))
+            if r.get("hint"):
+                lines.append("  %s" % r["hint"])
 
     if not markers:
-        return "地图：什么都没查到。\n" + "\n".join(lines)
+        return "地图（%s）：什么都没查到。\n" % _mt.mode_text() + "\n".join(lines)
 
     # 地图卡片数据：中心点 + 缩放级别
     lats = [m["lat"] for m in markers]
@@ -2671,13 +2713,18 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
     offline_note = ""
     if a.get("offline") or a.get("prefetch"):
         pts = (rinfo or {}).get("points") or [[m["lat"], m["lon"]] for m in markers]
-        st = _mt.prefetch_route(pts, zoom=min(14, zoom + 1))
-        offline_note = "\n· 已把沿途 %d 张地图瓦片存到本地（%d 张新下载），断网也能看。" \
-                       % (st["requested"], st["new"])
+        st = _mt.prefetch_route(pts, zoom=min(14, zoom + 1), allow_net=net)
+        if st.get("error"):
+            offline_note = "\n· 预下载没做：%s" % st["error"]
+        else:
+            offline_note = ("\n· 已把沿途 %d 张瓦片存到本地（新下载 %d 张，已有 %d 张）——"
+                            "这条路线和这些地点也都记在本地了，断网照样能用。"
+                            % (st["requested"], st["new"], st["cached"]))
 
     if isinstance(ui_events, list):
         ui_events.append({
             "type": "map",
+            "online": net,
             "center": center,
             "zoom": zoom,
             "markers": [{"name": m["name"], "lat": m["lat"], "lon": m["lon"],
@@ -2688,10 +2735,19 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
                        "mode": {"driving": "驾车", "foot": "步行",
                                 "bike": "骑行"}.get(rinfo["mode"], rinfo["mode"]),
                        "from": rinfo["from"]["name"],
-                       "to": rinfo["to"]["name"]} if rinfo else None),
+                       "to": rinfo["to"]["name"],
+                       "cached": bool(rinfo.get("from_cache")),
+                       "cache_time": _cache_time_text(rinfo.get("cache_ts")),
+                       "straight": False} if rinfo else
+                      ({"points": [], "straight": True,
+                        "distance": _mt.fmt_distance(approx["distance_m"]),
+                        "bearing": approx["bearing"],
+                        "from": r["from"]["name"], "to": r["to"]["name"],
+                        "mode": mode_cn} if approx else None)),
         })
 
-    head = "地图结果（卡片会自动显示给用户，你只要把结论说清楚）："
+    head = ("地图结果（%s；卡片会自动显示给用户，你只要把结论说清楚）："
+            % _mt.mode_text())
     return head + "\n" + "\n".join(lines) + offline_note
 
 
