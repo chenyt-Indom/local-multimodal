@@ -204,7 +204,12 @@
     const esc = escapeHtml(text);
     let html = esc.replace(/\[([^\]]{1,40})\]\((\/api\/[^\s)]+)\)/g,
       (_, label, url) => dlGroup(label, fixApiUrl(url)));
-    html = html.replace(/(^|[\s（(])(\/api\/(?:doclib\/download|ws\/zip)[^\s<)）]*)/g,
+    // 裸路径也要变按钮。⚠️ 前面那个字符类别只写「空格和半角括号」——
+    // 模型很爱写成「下载链接：/api/…」这种**全角冒号**开头的（实测踩到，
+    // 结果链接没渲染成按钮，用户只能看到一长串路径）。
+    // 同理尾部要挡住中文标点，否则会把句号、逗号一起吞进 URL 里。
+    html = html.replace(
+      /(^|[\s（(【\[:：,，、>])(\/api\/(?:doclib\/download|ws\/zip)[^\s<)）】\]，。；：、"'']*)/g,
       (_, pre, url) => `${pre}${dlGroup("点击下载", fixApiUrl(url))}`);
     bubble.innerHTML = html.replace(/\n/g, "<br>");
   }
@@ -241,16 +246,27 @@
   function bridgeApi() {
     return (window.pywebview && window.pywebview.api) || null;
   }
+  let savingNow = false;
   async function saveViaDesktop(url) {
     const api = bridgeApi();
     if (!api || typeof api.save_file !== "function") return false;
+    // ⚠️ 防重入：手快点两下会**并发**发出多个保存请求，第 2 个抢不到系统对话框
+    // → 立刻返回空 → 界面连着弹「已取消保存」，看起来就像"点了没用"（实测踩到：
+    // 日志里 1 秒内三条「另存为：用户取消了」）。
+    if (savingNow) {
+      showToast("上一次保存还没结束，稍等一下再点", "warn");
+      return true;
+    }
+    savingNow = true;
     try {
       const r = await api.save_file(url, "");
       if (r && r.ok) showToast("已保存：" + r.path, "ok");
-      else if (r && r.cancelled) showToast("已取消保存", "warn");
+      else if (r && r.cancelled) showToast("已取消保存（在「另存为」里选了取消）", "warn");
       else showToast("保存失败：" + ((r && r.error) || "未知原因"), "warn");
     } catch (e) {
       showToast("保存失败：" + String(e.message || e), "warn");
+    } finally {
+      savingNow = false;
     }
     return true;                       // true = 已经接管，别再走默认行为
   }

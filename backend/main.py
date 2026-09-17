@@ -1339,8 +1339,10 @@ _TEXT_TOOL_DOCS = {
                  '**你只管想内容，排版由工具做，不用写代码。**'
                  '参数 {"title": "封面主标题", "subtitle": "副标题（可选）", '
                  '"author": "落款（可选）", "theme": "blue/green/warm/purple/mono/red", '
+                 '"cover_image": "封面整页背景图（本地路径；用户给了图并说放封面就用它）", '
                  '"slides": [{"title": "页标题", '
                  '"bullets": ["要点1", "- 二级要点", {"text": "重点", "hl": true}], '
+                 '"image": "本页配图（本地路径，可用用户附的图）", '
                  '"image_query": "配图搜索词（可选，会自动搜图插入）", '
                  '"badge": "右上角小标签（可选，如 重点/必考/KPI）", '
                  '"caption": "页脚题注（可选，如 数据来源：…）", '
@@ -2224,15 +2226,21 @@ async def chat(req: ChatRequest):
     # session 必须提前取到：记忆是按对话隔离的，注入时必须知道是哪个对话。
     session = req.session_id or ""
     sys_prompt = _SystemPrompt.build(last_user, session, req.docs, no_tools=code_model_on)
-    if attach_paths and not code_model_on:
-        # 把落盘路径交给模型 —— 这是"按用户提供的图片做文档/PPT"能成立的前提
+    if attach_paths:
+        # 把落盘路径交给模型 —— 这是"按用户提供的图片做文档/PPT"能成立的前提。
+        # ⚠️ **代码模型那一轮也要注入**：用户说「做个 PPT」会命中造物规则、
+        #    被路由给 qwen2.5-coder，如果这时不告诉它图片路径，它就会
+        #    **凭空做一份没有图的 PPT，还照样说"封面含您的照片背景"**（实测踩到）。
         sys_prompt += (
             "\n\n【本轮用户附了图片，已存到本机】\n"
             + "\n".join("- %s" % p for p in attach_paths)
-            + "\n要把它们放进文档/PPT，就把上面的路径填进："
-              "make_pptx 每页的 image、make_docx 的 image 块 src、"
-              "或 edit_office 里 add_image 的 src。**不要只描述图片内容、"
-              "也不要说「我无法插入图片」** —— 路径已经给你了。\n"
+            + "\n按用户的说法把上面的路径填到对应参数里（**不要只描述图片内容、"
+              "也不要说「我无法插入图片」** —— 路径已经给你了）：\n"
+              "· 说要「放封面 / 当背景 / 做封面图」→ make_pptx 的 **cover_image**\n"
+              "· 说「插到第 N 页 / 配在某页上」→ 那一页的 **image**\n"
+              "· Word 里插图 → make_docx 的 image 块的 **src**\n"
+              "· 给已有文件加图 → edit_office 的 add_image 的 **src**\n"
+              "路径原样填进去就行（绝对路径，带盘符）。\n"
         )
     # ⚠️ 这两段都在描述工具（run_python / ask_user / library）。代码模型那一轮
     # 工具已被清空，留着它们只会让模型"照着描述编"（实测：声称已保存文件、却没给代码）。
