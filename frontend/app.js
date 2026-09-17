@@ -235,6 +235,98 @@
   }
   window.__openInLibrary = openInLibrary;
 
+  // ---------- 地图卡片 ----------
+  // 后端把地点 / 路线算好（真实坐标、真实距离用时），前端只负责画。
+  // 瓦片走后端代理 `/api/map/tile/{z}/{x}/{y}.png` → 看过的区域会**缓存到本地**，
+  // 断网也能看；Leaflet 本身也放在本地 vendor 里，不依赖外网 CDN。
+  let mapSeq = 0;
+  function makeMapCard(ui) {
+    const wrap = document.createElement("div");
+    wrap.className = "msg bot";
+    const box = document.createElement("div");
+    box.className = "map-card";
+    wrap.appendChild(box);
+
+    const rt = ui.route || null;
+    const info = document.createElement("div");
+    info.className = "map-info";
+    let html = "";
+    if (rt) {
+      html += `<b>${escapeHtml(rt.from || "")} → ${escapeHtml(rt.to || "")}</b>` +
+        `　${escapeHtml(rt.mode || "")} ${escapeHtml(rt.distance || "")}` +
+        `，约 ${escapeHtml(rt.duration || "")}`;
+    } else if ((ui.markers || []).length) {
+      html += `<b>${escapeHtml(ui.markers[0].name || "")}</b>` +
+        ((ui.markers || []).length > 1 ? ` 等 ${ui.markers.length} 个地点` : "");
+    }
+    info.innerHTML = html || "地图";
+
+    const canvas = document.createElement("div");
+    canvas.className = "map-canvas";
+    canvas.id = "mmMap" + (++mapSeq);
+
+    box.appendChild(info);
+    box.appendChild(canvas);
+    messagesEl.appendChild(wrap);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    const id = canvas.id;
+    // 等这一帧排完再初始化，否则容器高度还是 0，地图画不出来
+    requestAnimationFrame(() => initMapCard(id, ui));
+    return wrap;
+  }
+
+  function initMapCard(elId, ui) {
+    const el = document.getElementById(elId);
+    if (!el) return;
+    if (typeof L === "undefined") {
+      el.innerHTML = '<div class="hint" style="padding:10px">地图组件没加载出来' +
+        '（frontend/vendor/leaflet 缺文件）</div>';
+      return;
+    }
+    const center = ui.center || [23.13, 113.26];
+    const map = L.map(el, { zoomControl: true, attributionControl: true })
+      .setView([center[0], center[1]], ui.zoom || 12);
+    L.tileLayer("/api/map/tile/{z}/{x}/{y}.png", {
+      minZoom: 3, maxZoom: 19,
+      attribution: "地图数据 © OpenStreetMap 贡献者（已缓存在本地）",
+    }).addTo(map);
+
+    const span = [];
+    (ui.markers || []).forEach(function (mk) {
+      const icon = L.divIcon({ className: "mm-pin", html: "<i></i>",
+                               iconSize: [18, 18], iconAnchor: [9, 9] });
+      const m1 = L.marker([mk.lat, mk.lon], { icon: icon, title: mk.name || "" }).addTo(map);
+      const body = "<b>" + escapeHtml(mk.name || "") + "</b>" +
+        (mk.addr ? "<br><span style='color:#666'>" + escapeHtml(mk.addr) + "</span>" : "");
+      m1.bindPopup(body);
+      span.push([mk.lat, mk.lon]);
+    });
+
+    if (ui.route && (ui.route.points || []).length > 1) {
+      L.polyline(ui.route.points, { color: "#2e75b6", weight: 5, opacity: 0.85 })
+        .addTo(map);
+      span.push.apply(span, ui.route.points);
+    }
+    try {
+      if (span.length > 1) map.fitBounds(L.latLngBounds(span).pad(0.18));
+      else if (span.length === 1) map.setView(span[0], ui.zoom || 14);
+    } catch (e) { /* 只有一个点之类，保持默认视野即可 */ }
+    // 卡片在聊天流里，容器尺寸可能要等一帧才稳定
+    setTimeout(function () { try { map.invalidateSize(); } catch (e) {} }, 260);
+    window.__mmMaps = (window.__mmMaps || []).concat([map]);
+  }
+
+  // 地图缓存情况（点一下看有多少瓦片存在本地）
+  async function showMapCache() {
+    try {
+      const d = await api("/api/map/stats");
+      showToast("本地地图缓存：" + (d.tiles || 0) + " 张，占 " +
+        ((d.bytes || 0) / 1048576).toFixed(1) + " MB", "ok");
+    } catch (e) { showToast("读不到缓存信息：" + e.message, "warn"); }
+  }
+  window.__showMapCache = showMapCache;
+  window.__makeMapCard = makeMapCard;      // 导出一下，方便排查"地图没画出来"
+
   // ---------- 站内下载：桌面壳里改走原生「另存为」 ----------
   // ⚠️ 这是用户实际报过的坑：桌面窗口是 WebView2，而 pywebview 的
   //    settings['ALLOW_DOWNLOADS'] **默认是 False** —— 后端在 DownloadStarting
@@ -2008,6 +2100,10 @@
             else if (obj.ui.type === "library") {
               // 模型动了生成文库 → 面板跟着刷新，让用户马上看到结果
               if (typeof loadDoclib === "function") loadDoclib(obj.ui.rel);
+            }
+            else if (obj.ui.type === "map") {
+              // 地图卡片：地点/路线已经算好，这里把它画出来
+              makeMapCard(obj.ui);
             }
             else if (obj.ui.type === "code") {
               answerWrap.appendChild(makeCodeCard(obj.ui));

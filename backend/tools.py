@@ -177,6 +177,116 @@ _MAKE_PPTX_SCHEMA = {
 }
 
 # ---------- Word 文档生成 ----------
+_MAP_PLAN_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "map_plan",
+        "description": (
+            "【地图】查地点、规划路线，并把结果**画成一张地图卡片**发给用户看。\n"
+            "用户说「帮我规划路线 / 怎么走 / 从A到B多远多久 / 找一下某个地方在哪 / "
+            "这几个地方在地图上的位置」时用它。\n"
+            "· 只查地点：给 places:[\"广州塔\", \"汕头大学\"]（会自动找到坐标并在地图上打点）。\n"
+            "· 只规划路线：给 route:{\"from\":\"广州塔\",\"to\":\"广州白云机场\",\"mode\":\"driving\"}。\n"
+            "· 两者可以一起给：先把途经点标出来，再画路线。\n"
+            "· mode 可选 driving(驾车，默认) / foot(步行) / bike(骑行)。\n"
+            "· 用户说「离线也能看 / 下载地图」时给 offline:true —— 会把沿途瓦片下载到本地缓存。\n"
+            "· 返回里有真实距离与用时，**照实念给用户，不要自己算**。地图卡片会自己显示，"
+            "你只要用一两句话把结论说清楚（比如「驾车 44.7 公里，约 37 分钟，地图见上」）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "places": {"type": "array", "items": {"type": "string"},
+                           "description": "要在地图上标出的地点名（中文即可），可选"},
+                "route": {"type": "object",
+                          "description": "{from: 起点地名（或 lat,lon）, to: 终点, "
+                                         "mode: driving/foot/bike}"},
+                "zoom": {"type": "integer", "description": "地图缩放级别 3~18，默认自动"},
+                "offline": {"type": "boolean",
+                            "description": "true＝把沿途瓦片下载到本地，之后离线也能看"},
+            },
+            "required": [],
+        },
+    },
+}
+
+
+_MAKE_XLSX_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "make_xlsx",
+        "description": (
+            "【做表格】把数据排成一份真正的 .xlsx（Excel / WPS 都能打开），返回可点下载链接。\n"
+            "用户说「做个表格 / Excel / 统计表 / 对比表 / 数据表 / 报表 / 汇总表 / 台账 / 预算表」"
+            "或给了你一堆数据要整理时，用它。\n"
+            "**你只填数据，不用写代码。** 排版（表头配色、隔行底纹、冻结首行、筛选、合计行、"
+            "数字/货币/百分比格式、数据条、图表）都由工具做。\n"
+            "· 一个工作簿可放多张表：给 sheets 数组，每张表一个 name。\n"
+            "· 每张表：header（表头）+ rows（二维数组）。数字就写数字（别加千分位或￥符号）。\n"
+            "· formats：每列的格式关键字 —— text / int / number / money / percent / date；"
+            "也可以直接写 Excel 格式串。\n"
+            "· 想要合计行给 total_row:true（默认会跳过「单价/比率」这类不该求和的列，"
+            "也可以自己指定 total_cols:[列号…]）；\n"
+            "· 想要图表给 chart:{kind: column|line|pie|doughnut|area, title, "
+            "categories_col: 按哪列分类, value_cols:[数值列号…]}；\n"
+            "· 还有 freeze（冻结首行）/ autofilter（筛选）/ zebra（隔行底色）/ "
+            "conditional:{col,type:data_bar|3_color_scale|duplicate} / title（大标题，跨列合并）/ "
+            "note（表下方小字说明，如数据来源）。\n"
+            "配色主题 theme：blue(默认) / green / warm / purple / mono / red。"
+            "生成后把返回的下载链接**原样**给用户。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filename": {"type": "string",
+                             "description": "保存的文件名，不用带 .xlsx；不给就用 title"},
+                "theme": {"type": "string",
+                          "description": "配色：blue(默认) / green / warm / purple / mono / red"},
+                "sheets": {
+                    "type": "array",
+                    "description": "一个工作表一项，按顺序排。先给明细表、再给汇总表（可选）。",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "工作表名（页签名）"},
+                            "title": {"type": "string",
+                                      "description": "表内大标题（跨列合并的粗体一行），可选"},
+                            "header": {"type": "array", "items": {"type": "string"},
+                                       "description": "表头文字"},
+                            "rows": {"type": "array",
+                                     "description": "数据行，每行一个数组；数字写数字类型",
+                                     "items": {"type": "array"}},
+                            "formats": {"type": "array", "items": {"type": "string"},
+                                        "description": "每列格式：text/int/number/money/"
+                                                       "percent/date，或直接写 Excel 格式串"},
+                            "widths": {"type": "array", "items": {"type": "number"},
+                                       "description": "每列列宽（字符数），不给就自动估算"},
+                            "total_row": {"type": "boolean", "description": "是否加合计行"},
+                            "total_cols": {"type": "array", "items": {"type": "integer"},
+                                           "description": "只对这些列求和（列号从 0 开始）"},
+                            "total_label": {"type": "string", "description": "合计行文字，默认「合计」"},
+                            "note": {"type": "string", "description": "表下方小字说明，如「数据来源：…」"},
+                            "chart": {"type": "object",
+                                      "description": "{kind: column|line|pie|doughnut|area, "
+                                                     "title, categories_col, value_cols:[…], "
+                                                     "position:'A12' 可选（默认放表下方）}"},
+                            "conditional": {"type": "object",
+                                            "description": "{col: 列号, type: data_bar|"
+                                                           "3_color_scale|duplicate}"},
+                            "freeze": {"type": "boolean", "description": "冻结表头（默认 true）"},
+                            "autofilter": {"type": "boolean", "description": "加筛选（默认 true）"},
+                            "zebra": {"type": "boolean", "description": "隔行浅底色（默认 true）"},
+                        },
+                        "required": ["header", "rows"],
+                    },
+                },
+            },
+            "required": ["sheets"],
+        },
+    },
+}
+
+
 _MAKE_DOCX_SCHEMA = {
     "type": "function",
     "function": {
@@ -734,6 +844,8 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
     schemas.append(_MAKE_PPTX_SCHEMA)
     # 写 Word 文档 + 改已有的 Word/PPT（同样不联网、不跑用户代码，始终可用）。
     schemas.append(_MAKE_DOCX_SCHEMA)
+    schemas.append(_MAKE_XLSX_SCHEMA)
+    schemas.append(_MAP_PLAN_SCHEMA)
     schemas.append(_EDIT_OFFICE_SCHEMA)
     # ⚠️ `write_code`（让专用代码模型代写代码）**暂时不启用** ——
     # 用户 2026-09-16 试过之后要求换回"按轮切换代码模型"的架构。
@@ -1069,6 +1181,10 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
         return _do_make_pptx(arguments, ui_events)
     if name == "make_docx":
         return _do_make_docx(arguments, ui_events)
+    if name == "make_xlsx":
+        return _do_make_xlsx(arguments, ui_events)
+    if name == "map_plan":
+        return _do_map_plan(arguments, ui_events)
     if name == "edit_office":
         return _do_edit_office(arguments, ui_events)
     if name == "web_read":
@@ -2415,6 +2531,168 @@ def _do_make_docx(arguments=None, ui_events=None) -> str:
             "之后要改它，用 edit_office 传这个文件名。）%s"
             % (title, r.get("blocks") or len(blocks), len(data) / 1024.0,
                urllib.parse.quote(base), base, tip))
+
+
+def _do_make_xlsx(arguments=None, ui_events=None) -> str:
+    """把模型给的数据排成 xlsx，存进生成文库并给下载链接。"""
+    import tempfile
+    from . import doclib as _dl          # 同其它 maker：函数内导入
+    from . import xlsx_maker as _xl
+    a = arguments or {}
+    sheets = a.get("sheets") or []
+    # 容错：模型可能写成 sheets 以外的名字，或者直接把单张表塞在顶层
+    if not sheets:
+        for k in ("data", "tables", "worksheets", "list"):
+            if isinstance(a.get(k), list) and a[k]:
+                sheets = a[k]
+                break
+    if not sheets and (a.get("header") or a.get("rows")):
+        sheets = [{"name": a.get("sheet_name") or a.get("name") or "数据",
+                   "header": a.get("header") or [], "rows": a.get("rows") or []}]
+    for _i, _sh in enumerate(sheets):
+        if isinstance(_sh, dict) and not str(_sh.get("name") or "").strip():
+            _sh["name"] = "工作表%d" % (_i + 1)
+    if not sheets:
+        return ("错误：缺少 sheets（至少要有一张表）。例如 "
+                '{"sheets":[{"name":"明细","header":["项目","数量","金额"],'
+                '"rows":[["A",3,120.5]],"formats":["text","int","money"],"total_row":true}]}')
+
+    # 标题兜底：没给 filename 就从第一张表的 title / name 取
+    title = str(a.get("title") or a.get("filename") or "").strip()
+    if not title:
+        first = sheets[0] if isinstance(sheets[0], dict) else {}
+        title = str(first.get("title") or first.get("name") or "数据表").strip()
+    base = str(a.get("filename") or title).strip()
+    base = _BAD_FN.sub("", base).strip(" .")[:60] or "数据表"
+
+    if not base.lower().endswith(".xlsx"):
+        base += ".xlsx"          # 扩展名必须带上，否则下载回来是个没法双击打开的文件
+
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        r = _xl.build_xlsx(tmp, sheets,
+                           theme=str(a.get("theme") or "blue"),
+                           author="本地多模态助手")
+        if not r.get("ok"):
+            return "生成表格失败：%s" % r.get("error")
+        with open(tmp, "rb") as f:
+            data = f.read()
+    except Exception as e:
+        return "生成表格失败：%s: %s" % (type(e).__name__, e)
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+    w = _dl.save_bytes(base, data)
+    if not w.get("ok"):
+        return "写入生成文库失败：%s" % w.get("error")
+
+    if isinstance(ui_events, list):
+        # 让「生成文库」面板立刻刷新并选中它（同 make_pptx / make_docx）
+        ui_events.append({"type": "library", "act": "write", "rel": base})
+
+    tip = ""
+    if r.get("warnings"):
+        tip = "\n（提示：%s）" % "；".join(r["warnings"][:3])
+    return ("已生成表格《%s》——%d 张工作表、共 %d 行数据，%.0f KB。\n"
+            "下载链接（**直接点就能存下来，原样给用户**）：\n"
+            "/api/doclib/download?rel=%s\n"
+            "（源文件也放在「生成文库」里，文件名 %s。之后要改它，用 edit_office 传这个文件名。）%s"
+            % (title, r.get("sheets") or 0, r.get("rows") or 0, len(data) / 1024.0,
+               urllib.parse.quote(base), base, tip))
+
+
+def _do_map_plan(arguments=None, ui_events=None) -> str:
+    """查地点 / 规划路线，并把地图数据推给前端画成卡片。"""
+    from . import map_tools as _mt
+
+    a = arguments or {}
+    places = a.get("places") or a.get("地点") or []
+    if isinstance(places, str):
+        places = [places]
+    route = a.get("route") or {}
+    if not isinstance(route, dict):
+        route = {}
+    # 容错：模型可能写成 from/to 平铺在顶层
+    if not route and (a.get("from") or a.get("origin")):
+        route = {"from": a.get("from") or a.get("origin"),
+                 "to": a.get("to") or a.get("dest") or a.get("destination"),
+                 "mode": a.get("mode") or a.get("travel_mode") or "driving"}
+    if not places and not route:
+        return ("错误：至少要给 places（要找的地点）或 route（要规划的路线）。"
+                '例如 {"places":["广州塔"],"route":{"from":"广州塔","to":"白云机场"}}')
+
+    markers, lines = [], []
+    for q in [p for p in places if str(p).strip()][:12]:
+        one = _mt.geocode_one(str(q))
+        if not one:
+            lines.append("· 「%s」没找到（换个更完整的名字试试，比如加上城市名）" % q)
+            continue
+        markers.append({"name": one["name"], "lat": one["lat"], "lon": one["lon"],
+                        "addr": one.get("addr") or "", "query": str(q)})
+        lines.append("· **%s** —— %s（%.5f, %.5f）"
+                     % (one["name"], one.get("addr") or "—", one["lat"], one["lon"]))
+
+    rinfo = None
+    if route and route.get("from") and route.get("to"):
+        r = _mt.plan_route(str(route.get("from")), str(route.get("to")),
+                           str(route.get("mode") or "driving"))
+        if not r.get("ok"):
+            lines.append("· 路线没规划出来：%s" % r.get("error"))
+        else:
+            rinfo = r
+            lines.append("· **从 %s 到 %s**：%s，约 %s（%s）"
+                         % (r["from"]["name"], r["to"]["name"],
+                            _mt.fmt_distance(r["distance_m"]),
+                            _mt.fmt_duration(r["duration_s"]),
+                            {"driving": "驾车", "foot": "步行", "bike": "骑行"}.get(r["mode"], r["mode"])))
+            for k in ("from", "to"):
+                markers.append({"name": r[k]["name"], "lat": r[k]["lat"], "lon": r[k]["lon"],
+                                "addr": "", "role": k})
+
+    if not markers:
+        return "地图：什么都没查到。\n" + "\n".join(lines)
+
+    # 地图卡片数据：中心点 + 缩放级别
+    lats = [m["lat"] for m in markers]
+    lons = [m["lon"] for m in markers]
+    center = [sum(lats) / len(lats), sum(lons) / len(lons)]
+    span = max(max(lats) - min(lats), max(lons) - min(lons))
+    zoom = int(a.get("zoom") or 0)
+    if not zoom:
+        zoom = 14 if span < 0.02 else 13 if span < 0.06 else 11 if span < 0.3 \
+               else 9 if span < 1.2 else 7 if span < 5 else 5
+
+    offline_note = ""
+    if a.get("offline") or a.get("prefetch"):
+        pts = (rinfo or {}).get("points") or [[m["lat"], m["lon"]] for m in markers]
+        st = _mt.prefetch_route(pts, zoom=min(14, zoom + 1))
+        offline_note = "\n· 已把沿途 %d 张地图瓦片存到本地（%d 张新下载），断网也能看。" \
+                       % (st["requested"], st["new"])
+
+    if isinstance(ui_events, list):
+        ui_events.append({
+            "type": "map",
+            "center": center,
+            "zoom": zoom,
+            "markers": [{"name": m["name"], "lat": m["lat"], "lon": m["lon"],
+                         "addr": m.get("addr") or ""} for m in markers],
+            "route": ({"points": rinfo["points"],
+                       "distance": _mt.fmt_distance(rinfo["distance_m"]),
+                       "duration": _mt.fmt_duration(rinfo["duration_s"]),
+                       "mode": {"driving": "驾车", "foot": "步行",
+                                "bike": "骑行"}.get(rinfo["mode"], rinfo["mode"]),
+                       "from": rinfo["from"]["name"],
+                       "to": rinfo["to"]["name"]} if rinfo else None),
+        })
+
+    head = "地图结果（卡片会自动显示给用户，你只要把结论说清楚）："
+    return head + "\n" + "\n".join(lines) + offline_note
 
 
 def _do_edit_office(arguments=None, ui_events=None) -> str:

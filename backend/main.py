@@ -1352,6 +1352,25 @@ _TEXT_TOOL_DOCS = {
                  'table 表格 / chart 图表 / cards 卡片 / stats 大数字 / steps 步骤 / '
                  'timeline 时间线 / quote 引言 / toc 目录。'
                  '生成后把返回的下载链接**原样**告诉用户。',
+    "map_plan": '【地图】查地点 / 规划路线，并把结果画成地图卡片给用户看。'
+                '用户说「怎么走 / 规划路线 / 从A到B多远多久 / 某地方在哪」时用它。'
+                '参数 {"places": ["广州塔", "汕头大学"], '
+                '"route": {"from": "广州塔", "to": "广州白云机场", "mode": "driving"}, '
+                '"offline": true} —— places 和 route 至少给一个；'
+                'mode 可选 driving(默认)/foot/bike；offline=true 会把沿途瓦片下到本地。'
+                '返回里是**真实**距离与用时，照实说，别自己算。',
+    "make_xlsx": '生成一份真正的 Excel 表格（.xlsx），存进生成文库并给出可点下载链接。'
+                 '用户说「做个表格 / Excel / 统计表 / 对照表 / 报表 / 台账 / 预算表」'
+                 '或给了一堆数据要整理时用它。**你只填数据，不用写代码。**'
+                 '参数 {"filename": "文件名（可省）", "theme": "blue/green/warm/purple/mono/red", '
+                 '"sheets": [{"name": "工作表名", "title": "表内大标题（可省）", '
+                 '"header": ["列1","列2"], "rows": [["A", 120.5], ["B", 300]], '
+                 '"formats": ["text","money"], "widths": [14,12], "total_row": true, '
+                 '"total_cols": [1], "note": "数据来源：…", '
+                 '"chart": {"kind":"column","title":"…","categories_col":0,"value_cols":[1]}, '
+                 '"conditional": {"col":1,"type":"data_bar"}}]}'
+                 ' —— 可放多张表（先明细后汇总）。formats 支持 text/int/number/money/'
+                 'percent/date。数字直接写数字，别加千分位或￥。',
     "make_docx": '生成一份真正的 Word 文档（.docx），存进生成文库并给出可点下载链接。'
                  '**用户要「文档 / 报告 / 方案 / 说明书 / 写成 Word」时用它，'
                  '不要用 library 写 .md 再让用户自己转。**'
@@ -2267,7 +2286,9 @@ async def chat(req: ChatRequest):
         "    · 要 **Word 文档**（「写成文档」「来个报告/方案/说明书」「导出成 Word」）"
         "→ 用 **make_docx**（封面/目录/表格/提示框一次成型），**不要**用 library 写 .md 再让用户自己转；\n"
         "    · 要 **PPT / 演示稿 / 汇报材料** → 用 **make_pptx**；\n"
-        "    · 要**改已有的 Word 或 PPT**（「把第 3 页标题换掉」「加一页」「换个配色」）"
+        "    · 要 **Excel / 表格 / 统计表 / 报表 / 台账 / 预算表**"
+        "（尤其用户直接给了一堆数据）→ 用 **make_xlsx**；\n"
+        "    · 要**改已有的 Word / PPT / 表格**（「把第 3 页标题换掉」「加一页」「换个配色」）"
         "→ 用 **edit_office**（先 action=inspect 看结构，再 action=edit 改）；\n"
         "    · 要**纯文本 / 代码 / 数据文件**（.md .txt .py .json .csv）→ 才用 library。\n"
         "   生成完只把**下载链接**给用户，**别描述界面按钮或操作步骤**（界面上没有那些）。\n"
@@ -3531,6 +3552,36 @@ def library_backup():
     if not r.get("ok"):
         raise HTTPException(status_code=400, detail=r.get("error") or "备份失败")
     return r
+
+
+# ---------------------------------------------------------------- 地图
+@app.get("/api/map/tile/{z}/{x}/{y}.png")
+def map_tile(z: int, x: int, y: int):
+    """地图瓦片（走本地缓存：第一次取网上，之后离线也能看）。
+
+    ⚠️ 必须由后端代理：一是国内直连 OSM 官方瓦片经常超时（实测），
+       二是这样才能把看过的区域**缓存到本地**。
+    """
+    from . import map_tools as _mt
+    data, _cached = _mt.get_tile(z, x, y)
+    if not data:
+        raise HTTPException(status_code=404, detail="这张瓦片取不到")
+    return Response(content=data, media_type="image/png",
+                    headers={"Cache-Control": "public, max-age=604800"})
+
+
+@app.get("/api/map/search")
+def map_search(q: str, limit: int = 5):
+    """按名字找地点（给前端/模型用）。"""
+    from . import map_tools as _mt
+    return {"ok": True, "places": _mt.search_place(q, limit)}
+
+
+@app.get("/api/map/stats")
+def map_stats():
+    """本地地图缓存情况（张数 / 占用）。"""
+    from . import map_tools as _mt
+    return {"ok": True, **_mt.cache_stats()}
 
 
 @app.get("/api/doclib/download")

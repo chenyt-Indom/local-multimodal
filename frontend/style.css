@@ -1001,3 +1001,33 @@ body.dragging .drop-overlay,
   0%, 100% { background: transparent; }
   50% { background: rgba(46, 117, 182, .28); }
 }
+
+/* ---------- 聊天气泡里的地图卡片 ---------- */
+.bubble .map-card, .map-card {
+  background: #fff;
+  border: 1px solid #e3e8ef;
+  border-radius: 10px;
+  overflow: hidden;
+  max-width: 720px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .06);
+}
+.map-card .map-info {
+  padding: 9px 13px;
+  font-size: 13.5px;
+  color: #1f2a37;
+  border-bottom: 1px solid #eef2f7;
+  background: #f8fafc;
+}
+.map-card .map-canvas { height: 360px; width: 100%; background: #eef2f6; }
+/* 自绘的定位点（不用默认图标，省得图标 404） */
+.mm-pin i {
+  display: block;
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  background: #e5484d;
+  border: 3px solid #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .35);
+}
+/* 深色底时地图卡片也跟着暗一点，别刺眼 */
+body.dark .map-card { border-color: #2c3440; }
+body.dark .map-card .map-info { background: #1d2430; color: #e6ebf2; border-bottom-color: #2c3440; }

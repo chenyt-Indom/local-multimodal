@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>本地多模态助手</title>
+  <link rel="stylesheet" href="/static/lib/leaflet/leaflet.css" />
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
@@ -258,6 +259,8 @@
   <!-- 独立的「🧩 VS Code」覆盖层已删除：VS Code 现在就是开发台**唯一的编辑器**
        （见 .studio-editor 里的 #stVs），不再需要第二个入口。 -->
 
+  <!-- 地图组件（Leaflet）**放在本地**，不依赖外网 CDN —— 断网也能画 -->
+  <script src="/static/lib/leaflet/leaflet.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>
