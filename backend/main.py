@@ -1342,6 +1342,23 @@ _TEXT_TOOL_DOCS = {
                  '"slides": [{"title": "页标题", "bullets": ["要点1", "- 二级要点"], '
                  '"section": false}]} —— section=true 是章节过渡页。'
                  '生成后把返回的下载链接**原样**告诉用户。',
+    "make_docx": '生成一份真正的 Word 文档（.docx），存进生成文库并给出可点下载链接。'
+                 '**用户要「文档 / 报告 / 方案 / 说明书 / 写成 Word」时用它，'
+                 '不要用 library 写 .md 再让用户自己转。**'
+                 '参数 {"title": "标题", "cover": true, "toc": true, '
+                 '"theme": "blue/green/warm/purple/mono/red", '
+                 '"blocks": [{"type": "heading", "level": 1, "text": "一、背景"}, '
+                 '{"type": "para", "text": "正文，可用 **加粗**"}, '
+                 '{"type": "bullet", "items": ["要点", "- 二级要点"]}, '
+                 '{"type": "table", "header": ["列1","列2"], "rows": [["a","b"]]}]}'
+                 ' —— 块类型还有 quote/callout/code/image/divider/pagebreak/number/end。',
+    "edit_office": '查看或修改生成文库里的 .docx / .pptx（改文字、换配色、加删页、调样式）。'
+                   '参数 {"rel": "文件名.docx", "action": "inspect"} 先看结构；'
+                   '再 {"rel": "...", "action": "edit", "ops": [{"op":"replace_text",'
+                   '"find":"旧","replace":"新"}, {"op":"set_text","slide":3,"shape":1,'
+                   '"text":"新标题"}, {"op":"add_text","slide":3,"text":"...","x":1,"y":6,'
+                   '"w":6,"h":0.5,"size":16}, {"op":"set_theme","theme":"green"}]}。'
+                   '**编号要用 inspect 给的那些，别猜。**',
     "get_time": '获取当前日期与时间。参数 {}',
 }
 _TEXT_TOOL_NAMES = set(_TEXT_TOOL_DOCS)
@@ -2209,8 +2226,14 @@ async def chat(req: ChatRequest):
         "- 拿到补充信息后**直接开始写正文**，不要再说「好的我这就写」之类的话，也不要重复问。\n"
         "- 写法：标题 + 小标题 + 段落，**篇幅要够**（没指定字数时一般 800 字以上），"
         "多用具体细节和例子，别写空话套话。\n"
-        "- 用户**明确要文件**时（「写成文档」「给我一个 Python 模块」「导出成 Word」"
-        "「保存到文件」）→ 用 library 工具写进**生成文库**，并告诉他存哪了。\n"
+        "- ⚠️ **要什么文件就用哪个工具，别搞混**：\n"
+        "    · 要 **Word 文档**（「写成文档」「来个报告/方案/说明书」「导出成 Word」）"
+        "→ 用 **make_docx**（封面/目录/表格/提示框一次成型），**不要**用 library 写 .md 再让用户自己转；\n"
+        "    · 要 **PPT / 演示稿 / 汇报材料** → 用 **make_pptx**；\n"
+        "    · 要**改已有的 Word 或 PPT**（「把第 3 页标题换掉」「加一页」「换个配色」）"
+        "→ 用 **edit_office**（先 action=inspect 看结构，再 action=edit 改）；\n"
+        "    · 要**纯文本 / 代码 / 数据文件**（.md .txt .py .json .csv）→ 才用 library。\n"
+        "   生成完只把**下载链接**给用户，**别描述界面按钮或操作步骤**（界面上没有那些）。\n"
         "- 只是让你「写一篇作文 / 拟个方案」→ **直接写在回答里**，不要自作主张建文件。\n"
         "- ⚠️ 用户说「**把这篇 / 刚才那篇**存起来、导出」时，content 必须是**你上一轮写的正文原文**，"
         "**完整复制过去** —— 不许只写摘要、不许留占位符（如「（在此粘贴正文）」）、不许自己另编一版。"

@@ -18,6 +18,7 @@ import sys
 import time
 import glob
 import json
+import logging
 import urllib.parse
 
 from . import t2i
@@ -58,14 +59,24 @@ _MAKE_PPTX_SCHEMA = {
         "name": "make_pptx",
         "description": (
             "【做PPT】把内容排成一份真正的 .pptx 演示文稿，返回可直接点击的下载链接。"
-            "用户说「做个PPT / 写个演示稿 / 汇报材料 / 答辩PPT / 方案演示 / 讲解稿」时用它。"
-            "**你只管想内容**（封面标题 + 每页要点），排版由工具完成，不用写代码。"
-            "用法：先想清楚大纲（每页一个 title + 若干条 bullets），再一次性传进来。"
-            "要点里如果以「- 」或两个空格开头，会被排成二级条目（用于细分说明）。"
-            "slides 里把 section 设为 true 就是一张章节过渡页（只显示大标题，不带要点）。"
-            "配色按主题选：blue 通用/学术、green 环保/健康、warm 生活/文创、"
-            "purple 科技/创意、mono 极简/正式、red 警示/总结。"
-            "生成后把返回的下载链接**原样**给用户。"
+            "用户说「做个PPT / 写个演示稿 / 汇报材料 / 答辩PPT / 方案演示 / 讲解稿」时，"
+            "**第一个就该想到本工具**。\n"
+            "⚠️ 标题和内容**必须严格按用户这一轮说的主题**写，别被记忆或前文里的别的主题带跑。\n"
+            "⚠️ 生成后只把**下载链接**给用户，**不要描述界面操作步骤**（没有那些按钮）。\n"
+            "**你只管想内容**，排版由工具完成，不用写代码。\n"
+            "· 每页用 layout 选版式（不写就按内容自动判断）：\n"
+            "  content 标题+要点(默认) / two_col 左右两栏(用 left/right，可配 left_title/right_title)\n"
+            "  / image_right|image_left 图文并排 / image_full 整页大图\n"
+            "  / table 表格(给 table:{header,rows}) / cards 卡片组(给 cards:[{title,text}])\n"
+            "  / stats 大数字(给 stats:[{value,label}]) / steps 流程步骤(给 steps:[{title,text}])\n"
+            "  / timeline 时间线(给 items:[{title,text}]) / quote 整页引言(给 quote:{text,from})\n"
+            "  / toc 目录(给 items 字符串数组) / section 章节过渡页(只要 title)\n"
+            "· 装饰：每页可加 decor，可选 page_number / band 侧边色带 / corner 角标圆 / dots 圆点。\n"
+            "· 微调：每页可直接写 accent 强调色 / bg 底色 / title_color / title_size / "
+            "body_size / card_bg / title_align（也可放进 style 对象里）。\n"
+            "· 单条要点微调：bullets 里可以写 {\"text\":\"...\",\"bold\":true,\"color\":\"C53030\","
+            "\"size\":18} 这样的对象，只影响那一条。\n"
+            "· 要点以「- 」或两个空格开头＝二级条目。配色 blue/green/warm/purple/mono/red。"
         ),
         "parameters": {
             "type": "object",
@@ -85,8 +96,38 @@ _MAKE_PPTX_SCHEMA = {
                         "type": "object",
                         "properties": {
                             "title": {"type": "string", "description": "这一页的标题"},
-                            "bullets": {"type": "array", "items": {"type": "string"},
-                                        "description": "要点列表；「- 」或两空格开头＝二级条目"},
+                            "layout": {"type": "string",
+                                       "description": "版式，见工具说明；不写按内容自动判断"},
+                            "bullets": {
+                                "type": "array",
+                                "description": "要点列表；字符串，或 {text,bold,color,size} 对象",
+                                "items": {"type": "string"},
+                            },
+                            "left": {"type": "array", "items": {"type": "string"},
+                                     "description": "two_col 左栏要点"},
+                            "right": {"type": "array", "items": {"type": "string"},
+                                      "description": "two_col 右栏要点"},
+                            "left_title": {"type": "string", "description": "two_col 左栏小标题"},
+                            "right_title": {"type": "string", "description": "two_col 右栏小标题"},
+                            "image": {"type": "string",
+                                      "description": "图片路径（本地绝对路径，或文库里的文件名）"},
+                            "image_caption": {"type": "string", "description": "图片说明，可选"},
+                            "table": {"type": "object",
+                                      "description": "layout=table 时用：{header:[...],rows:[[...]]}"},
+                            "cards": {"type": "array", "description":
+                                      "layout=cards 时用：[{title,text}]，2~4 张"},
+                            "stats": {"type": "array", "description":
+                                      "layout=stats 时用：[{value,label}]，2~4 个"},
+                            "steps": {"type": "array", "description":
+                                      "layout=steps 时用：[{title,text}]，2~5 步"},
+                            "items": {"type": "array",
+                                      "description": "layout=timeline/toc 时用，见工具说明"},
+                            "quote": {"type": "object",
+                                      "description": "layout=quote 时用：{text,from}"},
+                            "decor": {"type": "array", "items": {"type": "string"},
+                                      "description": "装饰：page_number/band/corner/dots"},
+                            "accent": {"type": "string", "description": "本页强调色，如 C53030"},
+                            "bg": {"type": "string", "description": "本页底色，如 FFF9F9"},
                             "notes": {"type": "string", "description": "演讲者备注，可选"},
                             "section": {"type": "boolean",
                                         "description": "true＝章节过渡页（只有大标题）"},
@@ -96,6 +137,105 @@ _MAKE_PPTX_SCHEMA = {
                 },
             },
             "required": ["title", "slides"],
+        },
+    },
+}
+
+# ---------- Word 文档生成 ----------
+_MAKE_DOCX_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "make_docx",
+        "description": (
+            "【写文档】把内容排成一份真正的 .docx（Word）文档，返回可直接点击的下载链接。"
+            "用户说「写个文档 / 报告 / 方案 / 总结 / 说明书 / 通知 / 论文 / 材料 / 写成 Word」时，"
+            "**第一个就该想到本工具**。\n"
+            "⚠️ 不要用 `library` 先写 .md 再让用户自己导出 —— 本工具一次成型，直接给成品。\n"
+            "⚠️ 生成后只把**下载链接**给用户，**不要描述界面操作步骤**（没有那些按钮）。\n"
+            "**你只管想内容**，排版由工具完成，不用写代码。\n"
+            "blocks 是内容块列表，按顺序排，每块一个 type：\n"
+            "  heading 标题（配 level 1~4）/ para 段落（text）\n"
+            "  bullet 无序列表（items 数组）/ number 有序列表（items）\n"
+            "  quote 引用（text + 可选 from）/ callout 提示框（tag + text，带底色和色条）\n"
+            "  table 表格（header 数组 + rows 二维数组 + 可选 caption）\n"
+            "  image 图片（src）/ code 代码块（text）/ divider 分隔线\n"
+            "  pagebreak 分页 / toc 目录 / end 结束语\n"
+            "· 正文里可用 **加粗**、*斜体*、`等宽` 做局部强调。\n"
+            "· 列表里以「- 」或两个空格开头＝二级条目。\n"
+            "· 每一块都能带 style 做微调：size 字号 / color 颜色 / bold / align"
+            "(left|center|right|justify) / indent 缩进 / bg 底色 / line 行距。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "文档标题"},
+                "subtitle": {"type": "string", "description": "副标题，做封面时用"},
+                "author": {"type": "string", "description": "署名，如「姓名 · 单位」"},
+                "date_text": {"type": "string", "description": "落款日期文字，如「2026 年 9 月」"},
+                "theme": {"type": "string",
+                          "description": "配色：blue(默认) / green / warm / purple / mono / red"},
+                "font": {"type": "string",
+                         "description": "字体：yahei 雅黑(默认) / song 宋体正文+黑体标题 / kai 楷体"},
+                "filename": {"type": "string", "description": "文件名，不用带 .docx 后缀"},
+                "cover": {"type": "boolean", "description": "是否生成封面页（标题居中）"},
+                "header": {"type": "string", "description": "页眉文字，可选"},
+                "toc": {"type": "boolean",
+                        "description": "是否插入目录页（打开文档时自动生成）"},
+                "blocks": {
+                    "type": "array",
+                    "description": "内容块列表，见工具说明",
+                    "items": {"type": "object",
+                              "properties": {"type": {"type": "string"}},
+                              "required": ["type"]},
+                },
+            },
+            "required": ["title", "blocks"],
+        },
+    },
+}
+
+# ---------- 已有文档 / PPT 的读取与修改 ----------
+_EDIT_OFFICE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "edit_office",
+        "description": (
+            "【改文档/改PPT】查看和修改生成文库里的 .docx / .pptx。"
+            "用户说「改一下这个PPT / 这份文档」「把第3页标题换掉」「加一页」「换个配色」"
+            "「标题改大一点」「正文加一段」时用它。\n"
+            "⚠️ **改之前必须先 action=inspect 看结构**：它会列出每一页/每一段的编号和现有文字，"
+            "ops 里的编号就用它给的那些，别自己猜（猜错就改到别的地方）。\n"
+            "action=edit 时给 ops，常用操作：\n"
+            "  {\"op\":\"replace_text\",\"find\":\"旧字\",\"replace\":\"新字\",\"slide\":3}  全文或指定页查找替换\n"
+            "  {\"op\":\"set_text\",\"slide\":3,\"shape\":1,\"text\":\"新文字\"}  改某个元素的文字\n"
+            "  {\"op\":\"set_text_style\",\"slide\":3,\"shape\":1,\"size\":34,\"color\":\"C53030\",\"bold\":true}\n"
+            "  {\"op\":\"add_text\",\"slide\":3,\"text\":\"...\",\"x\":0.9,\"y\":6.3,\"w\":6,\"h\":0.5,\"size\":16,\"color\":\"...\",\"align\":\"center\"}\n"
+            "  {\"op\":\"add_image\",\"slide\":3,\"src\":\"图片路径\",\"x\":1,\"y\":1.5,\"w\":5,\"h\":4}\n"
+            "  {\"op\":\"add_shape\",\"slide\":3,\"kind\":\"rect|round|oval\",\"x\":1,\"y\":1,\"w\":2,\"h\":1,\"fill\":\"2E75B6\"}\n"
+            "  {\"op\":\"delete_shape\",\"slide\":3,\"shape\":2} / {\"op\":\"set_bg\",\"slide\":3,\"color\":\"FFF7E6\"}\n"
+            "  {\"op\":\"set_notes\",\"slide\":3,\"text\":\"备注\"} / {\"op\":\"set_theme\",\"theme\":\"green\"} 整份换配色\n"
+            "  {\"op\":\"duplicate_slide\",\"slide\":3} / {\"op\":\"move_slide\",\"slide\":3,\"to\":1} / {\"op\":\"delete_slide\",\"slide\":3}\n"
+            "  {\"op\":\"add_slide\",\"slide_spec\":{...和 make_pptx 的一页同格式...}}\n"
+            "Word 文档用它：\n"
+            "  {\"op\":\"replace_text\",\"find\":\"旧\",\"replace\":\"新\"} / {\"op\":\"set_para\",\"index\":12,\"text\":\"新内容\"}\n"
+            "  {\"op\":\"set_para_style\",\"index\":4,\"size\":26,\"color\":\"2D6A4F\",\"bold\":true,\"align\":\"center\"}\n"
+            "  {\"op\":\"insert_para\",\"after\":20,\"block\":{...和 make_docx 的块同格式...}}\n"
+            "  {\"op\":\"append\",\"block\":{...}} / {\"op\":\"delete_para\",\"index\":30} / "
+            "{\"op\":\"set_header\",\"text\":\"...\"}\n"
+            "改完把结果原样告诉用户（工具会返回改了什么）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "rel": {"type": "string",
+                        "description": "生成文库里的文件名，带扩展名，如「机器学习入门.pptx」"},
+                "action": {"type": "string",
+                           "description": "inspect＝只看结构（不改），edit＝执行修改"},
+                "ops": {"type": "array",
+                        "description": "修改操作清单，见工具说明",
+                        "items": {"type": "object"}},
+            },
+            "required": ["rel"],
         },
     },
 }
@@ -551,6 +691,9 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
     # 生成 PPT：纯本机操作（不联网、不执行用户代码），所以**不挂任何开关**，
     # 始终可用 —— 和「记忆」「文库」一样的待遇。
     schemas.append(_MAKE_PPTX_SCHEMA)
+    # 写 Word 文档 + 改已有的 Word/PPT（同样不联网、不跑用户代码，始终可用）。
+    schemas.append(_MAKE_DOCX_SCHEMA)
+    schemas.append(_EDIT_OFFICE_SCHEMA)
     # ⚠️ `write_code`（让专用代码模型代写代码）**暂时不启用** ——
     # 用户 2026-09-16 试过之后要求换回"按轮切换代码模型"的架构。
     # 原因：这台机器 12GB 显存装不下两个模型，每调一次 write_code 就要重新加载大脑，
@@ -643,7 +786,11 @@ _LIBRARY_SCHEMA = {
     "function": {
         "name": "library",
         "description": (
-            "【生成文库】存放**你自己产出**的文件（作文 / 方案 / 报告 / 代码模块 / 表格等）。\n"
+            "【生成文库】存放**你自己产出的纯文本**文件（.md / .txt / .py / .json 等）。\n"
+            "🚫 **用户要 Word 文档或 PPT 时，不要用本工具。** 直接调 make_docx / make_pptx /\n"
+            "   edit_office —— 它们一次成型（封面/目录/表格/版式都有），比\"先写 .md、再让用户\n"
+            "   自己去导出\"好得多。**也不要指挥用户点界面按钮**（界面上没有那些按钮）。\n"
+            "   本工具的 export_docx 只用于补救：文库里的 .md **已经写好了**，现在要转成 Word。\n"
             "⚠️ 和「知识库」是两个不同的地方，别搞混：\n"
             "  · 知识库 = 用户的资料，**只能读、绝不能改**；\n"
             "  · 生成文库 = 你的产出，**可以写、可以改、可以删**。\n"
@@ -658,8 +805,12 @@ _LIBRARY_SCHEMA = {
             "· delete —— 删除（会移进回收站，可恢复）\n"
             "· copy —— 复制成新文件（name + new_name）\n"
             "· backup —— 整库备份\n"
-            "· export_docx —— 把已写好的文本文件导出成 Word（name，会自动加 .docx 后缀）\n"
-            "  Word 文档 WPS 也能直接打开，用户要「WPS 格式 / Word 文档」就用这个。\n"
+            "· export_docx —— 把**已经存在于文库里的文本文件**（.md/.txt）转成排版好的\n"
+            "  Word 文档（name，自动加 .docx 后缀；可选 theme / toc）。\n"
+            "  ⚠️ 只用于「先写好了正文、现在想转成 Word」的场景。\n"
+            "  如果用户一上来就要一份 Word（「写个报告/方案」），**直接用 make_docx**，\n"
+            "  它一次成型（封面/目录/表格/提示框都有），比先写文本再转更省事。\n"
+            "  Word 文档 WPS 也能直接打开，用户要「WPS 格式 / Word 文档」都能满足。\n"
             "什么时候写进文库：用户**明确要一个文件**时（「写成文档」「给我一个 Python 模块」"
             "「导出成 Word」「保存到文件」）。\n"
             "什么时候不写：只是让你「写篇作文 / 拟个方案」→ **直接写在回答里**就行，"
@@ -675,6 +826,10 @@ _LIBRARY_SCHEMA = {
                          "description": "文件名（可带子目录，如 作文/我的大学.md）。不要写盘符或 .."},
                 "content": {"type": "string", "description": "write/append 时要写入的正文"},
                 "new_name": {"type": "string", "description": "copy 时的目标文件名"},
+                "theme": {"type": "string", "description":
+                          "export_docx 的配色：blue/green/warm/purple/mono/red"},
+                "toc": {"type": "boolean",
+                        "description": "export_docx 时是否插入目录页"},
             },
             "required": ["action"],
         },
@@ -871,6 +1026,10 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
         return _do_workspace_pack(arguments)
     if name == "make_pptx":
         return _do_make_pptx(arguments)
+    if name == "make_docx":
+        return _do_make_docx(arguments)
+    if name == "edit_office":
+        return _do_edit_office(arguments)
     if name == "web_read":
         return _do_web_read(arguments)
     if name == "github_push":
@@ -2000,9 +2159,15 @@ def _do_make_pptx(arguments=None) -> str:
 
     a = arguments or {}
     title = str(a.get("title") or "").strip()
-    slides = a.get("slides") or []
+    slides = _pick_slides(a)
     if not title:
-        return "错误：缺少 title（封面主标题）。"
+        # 同上：模型忘给 title 时，用第一页的标题兜底，别让它反复重试
+        for sl in slides:
+            if str(sl.get("title") or "").strip():
+                title = str(sl["title"]).strip()[:60]
+                break
+        if not title:
+            title = str(a.get("filename") or "").strip() or "演示文稿"
     if not slides:
         return ("错误：缺少 slides（至少要有一页内容）。"
                 "请先想好大纲：每页给一个 title 和几条 bullets。")
@@ -2020,6 +2185,8 @@ def _do_make_pptx(arguments=None) -> str:
         author=str(a.get("author") or ""),
         theme=str(a.get("theme") or "blue"),
         end_text=str(a.get("end_text") or "谢谢观看"),
+        font=str(a.get("font") or "yahei"),
+        img_bases=_img_bases(),
     )
     if not r.get("ok"):
         return "生成 PPT 失败：%s" % r.get("error")
@@ -2040,12 +2207,237 @@ def _do_make_pptx(arguments=None) -> str:
         return "写入生成文库失败：%s" % w.get("error")
 
     n_pages = r.get("slides") or len(slides)
+    tip = ""
+    if r.get("warnings"):
+        tip = "\n（提示：%s）" % "；".join(r["warnings"][:3])
     return ("已生成 PPT《%s》——共 %d 页，%.0f KB。\n"
             "下载链接（**直接点就能存下来，原样给用户**）：\n"
             "/api/doclib/download?rel=%s\n"
-            "（源文件也放在「生成文库」里，文件名 %s，可以随时再下。）"
+            "（源文件也放在「生成文库」里，文件名 %s。"
+            "之后要改它，用 edit_office 传这个文件名。）%s"
             % (title, n_pages, len(data) / 1024.0,
-               urllib.parse.quote(base), base))
+               urllib.parse.quote(base), base, tip))
+
+
+def _img_bases() -> list:
+    """图片搜索目录：模型给的图片常常只说个文件名。
+
+    素材可能来自生成文库、当前工作区项目、图片库，三处都找一遍。
+    """
+    from . import doclib as _dl
+    bases = [_dl.LIB_DIR]
+    try:
+        from . import workspace as _ws
+        bases.append(_ws.root())          # 当前工作区项目目录
+    except Exception:
+        pass
+    try:
+        from . import image_library as _il
+        bases.append(_il.DIR)
+    except Exception:
+        pass
+    return [b for b in bases if b]
+
+
+def _pick_blocks(a: dict) -> list:
+    """取文档内容块，**容错字段名**。
+
+    ⚠️ 实测模型经常不写 `blocks`，而是写它更习惯的 `content`（library 工具
+    就是那个字段名）。只认 `blocks` 的话它会**反复重试同一个错** ——
+    实测连续调了 5 次 make_docx 都因为参数名不对被拒。
+    这里统一收口：content / sections / body / paragraphs 都当 blocks；
+    给的是字符串就按 Markdown 解析（模型很爱整篇贴 Markdown）。
+    """
+    from . import docx_maker as _dm
+    for key in ("blocks", "content", "sections", "body", "paragraphs"):
+        v = a.get(key)
+        if not v:
+            continue
+        if isinstance(v, str):
+            if v.strip().startswith("{") or v.strip().startswith("["):
+                try:
+                    v = json.loads(v)
+                except Exception:
+                    pass
+            if isinstance(v, str):
+                return _dm.markdown_blocks(v)
+        if isinstance(v, dict):
+            v = [v]
+        if isinstance(v, list):
+            out = [x for x in v if isinstance(x, dict)]
+            # 模型有时给 {"title":..,"content":..} 这种，补一个 type
+            for x in out:
+                if not x.get("type"):
+                    x["type"] = ("table" if x.get("header") or x.get("rows")
+                                 else "bullet" if x.get("items")
+                                 else "para")
+            return out
+    return []
+
+
+def _pick_slides(a: dict) -> list:
+    """取 PPT 每页，同样容错字段名（pages / content / items）。"""
+    for key in ("slides", "pages", "content", "items"):
+        v = a.get(key)
+        if not v:
+            continue
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except Exception:
+                continue
+        if isinstance(v, dict):
+            v = [v]
+        if isinstance(v, list):
+            return [x for x in v if isinstance(x, dict)]
+    return []
+
+
+def _do_make_docx(arguments=None) -> str:
+    """把结构化内容生成 .docx，存进生成文库，返回可点下载链接。
+
+    ⚠️ 生成的是**二进制**，必须走 `doclib.save_bytes` + `/api/doclib/download`，
+    不能走 `doclib.write_file`（那是给文本用的，二进制会被写坏）。
+    """
+    import tempfile
+
+    from . import doclib as _dl
+    from . import docx_maker as _dm
+
+    a = arguments or {}
+    title = str(a.get("title") or "").strip()
+    blocks = _pick_blocks(a)
+    if not title:
+        # ⚠️ 模型常常只给正文、忘了给 title，只报错会让它**反复重试同一个错**
+        # （实测连试 3 次都因为没 title 被拒）。这里从第一个标题兜底取。
+        for b in blocks:
+            if str(b.get("type") or "").lower() in ("heading", "title", "h1") \
+                    and str(b.get("text") or "").strip():
+                title = str(b["text"]).strip()[:60]
+                break
+        if not title:
+            title = str(a.get("filename") or "").strip() or "文档"
+    if not blocks:
+        return ("错误：缺少 blocks（文档内容），至少要有一个内容块。"
+                "例如 [{\"type\":\"heading\",\"level\":1,\"text\":\"一、背景\"},"
+                "{\"type\":\"para\",\"text\":\"正文…\"}]")
+
+    base = str(a.get("filename") or title).strip()
+    base = _BAD_FN.sub("", base).strip(" .")[:60] or "文档"
+    if not base.lower().endswith(".docx"):
+        base += ".docx"
+
+    tmp = os.path.join(tempfile.gettempdir(),
+                       "mm_docx_%d.docx" % int(time.time() * 1000))
+    r = _dm.build_docx(
+        tmp, title, blocks,
+        subtitle=str(a.get("subtitle") or ""),
+        author=str(a.get("author") or ""),
+        date_text=str(a.get("date_text") or ""),
+        theme=str(a.get("theme") or "blue"),
+        font=str(a.get("font") or "yahei"),
+        cover=bool(a.get("cover")),
+        header=str(a.get("header") or ""),
+        toc=bool(a.get("toc")),
+        bases=_img_bases(),
+    )
+    if not r.get("ok"):
+        return "生成文档失败：%s" % r.get("error")
+
+    try:
+        with open(tmp, "rb") as f:
+            data = f.read()
+    except Exception as e:
+        return "读取生成的临时文件失败：%s" % e
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+    w = _dl.save_bytes(base, data)
+    if not w.get("ok"):
+        return "写入生成文库失败：%s" % w.get("error")
+
+    tip = ""
+    if r.get("warnings"):
+        tip = "\n（提示：%s）" % "；".join(r["warnings"][:3])
+    return ("已生成文档《%s》——共 %d 个内容块，%.0f KB。\n"
+            "下载链接（**直接点就能存下来，原样给用户**）：\n"
+            "/api/doclib/download?rel=%s\n"
+            "（源文件也放在「生成文库」里，文件名 %s。"
+            "之后要改它，用 edit_office 传这个文件名。）%s"
+            % (title, r.get("blocks") or len(blocks), len(data) / 1024.0,
+               urllib.parse.quote(base), base, tip))
+
+
+def _do_edit_office(arguments=None) -> str:
+    """查看 / 修改生成文库里的 .docx 或 .pptx。"""
+    from . import doclib as _dl
+    from . import office_edit as _oe
+
+    a = arguments or {}
+    rel = str(a.get("rel") or "").strip().strip('"')
+    if not rel:
+        return "错误：缺少 rel（要改的文件名，如「机器学习入门.pptx」）。"
+
+    ext = os.path.splitext(rel)[1].lower()
+    if ext not in (".docx", ".pptx"):
+        # 只给了名字没给后缀时，去文库目录里找一个同名的
+        cands = [f for f in _dl.list_files()
+                 if os.path.splitext(str(f.get("rel") or f.get("name") or ""))[0] == rel
+                 or str(f.get("name") or "").startswith(rel)]
+        hit = ""
+        for c in cands:
+            n = str(c.get("rel") or c.get("name") or "")
+            if os.path.splitext(n)[1].lower() in (".docx", ".pptx"):
+                hit = n
+                break
+        if not hit:
+            return ("错误：rel 要带 .docx 或 .pptx 后缀，或者在生成文库里有同名文件。"
+                    "当前文库里的文档/PPT：%s"
+                    % ("、".join(f.get("name") or f.get("rel") or ""
+                                 for f in _dl.list_files()
+                                 if str(f.get("name") or "").lower().endswith(
+                                     (".docx", ".pptx"))) or "（还没有）"))
+        rel = hit
+        ext = os.path.splitext(rel)[1].lower()
+
+    path = _dl.file_path(rel)
+    if not os.path.exists(path):
+        return ("找不到文件「%s」。生成文库里的文档/PPT有：%s"
+                % (rel, "、".join(f.get("name") or f.get("rel") or ""
+                                  for f in _dl.list_files()
+                                  if str(f.get("name") or "").lower().endswith(
+                                      (".docx", ".pptx"))) or "（还没有）"))
+
+    action = str(a.get("action") or "inspect").strip().lower()
+    if action in ("inspect", "read", "看", "查看", ""):
+        return (_oe.inspect(path)
+                + "\n\n（要改哪一处，就把上面方括号里的编号填进 ops 的 "
+                  "slide/shape（PPT）或 index（Word）里。）")
+
+    ops = a.get("ops") or []
+    if not ops:
+        return "错误：action=edit 时必须要给 ops（修改操作清单）。"
+
+    # 改之前先备份一份 —— 改坏了用户还能捞回来
+    try:
+        _dl.copy_file(rel, "改前备份_%s" % os.path.basename(rel))
+    except Exception:
+        pass
+
+    ok, msg, warns = _oe.edit(path, ops, img_bases=_img_bases())
+    name = os.path.basename(rel)
+    link = "/api/doclib/download?rel=%s" % urllib.parse.quote(rel)
+    if not ok:
+        return "修改失败：%s%s" % (msg, ("\n警告：" + "；".join(warns)) if warns else "")
+    out = ("已修改《%s》：%s。\n下载链接（原样给用户）：%s"
+           % (name, msg, link))
+    if warns:
+        out += "\n⚠️ 有几处没做成：%s" % "；".join(warns[:5])
+    out += "\n（改前版本备份在文库里，名字以「改前备份_」开头。）"
+    return out
 
 
 def _strip_code_fence(text: str) -> str:
@@ -2386,8 +2778,34 @@ def _do_library(arguments, ui_events=None):
             out = re.sub(r"\.(md|markdown|txt|text)$", "", base, flags=re.I) + ".docx"
             if out == base:
                 out = base + ".docx"
-            data = docx_write.text_to_docx(rd.get("text") or "",
-                                           title=os.path.splitext(os.path.basename(base))[0])
+            doc_title = os.path.splitext(os.path.basename(base))[0]
+            text = rd.get("text") or ""
+            # 优先走完整排版模块（认 Markdown 的标题/列表/表格/引用，样式统一）；
+            # 万一它不可用，退回原来的纯标准库实现，保证这条路永远不断。
+            try:
+                import tempfile
+
+                from . import docx_maker as _dm
+                tmp = os.path.join(tempfile.gettempdir(),
+                                   "mm_exp_%d.docx" % int(time.time() * 1000))
+                r = _dm.build_docx_text(tmp, doc_title, text,
+                                        theme=str((arguments or {}).get("theme")
+                                                  or "blue"),
+                                        font=str((arguments or {}).get("font")
+                                                 or "yahei"),
+                                        toc=bool((arguments or {}).get("toc")))
+                if not r.get("ok"):
+                    raise RuntimeError(r.get("error") or "生成失败")
+                with open(tmp, "rb") as f:
+                    data = f.read()
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+            except Exception as e:
+                logging.getLogger("uvicorn.error").warning(
+                    "排版模块导出失败，退回简易版：%s", e, exc_info=True)
+                data = docx_write.text_to_docx(text, title=doc_title)
             w = library_mod.save_bytes(out, data)
             if not w.get("ok"):
                 return "导出失败：%s" % w.get("error")

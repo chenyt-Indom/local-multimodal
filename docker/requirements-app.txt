@@ -14,3 +14,5 @@ pypdf>=4.0
 
 # 生成 PPT（make_pptx 工具）。纯 Python（lxml + XlsxWriter），无编译依赖。
 python-pptx>=1.0.0
+# 生成 Word 文档（make_docx 工具）。纯 Python，带 lxml。
+python-docx>=1.0.0
