@@ -2784,7 +2784,17 @@ async def chat(req: ChatRequest):
         # 有了这层沉淀，久远的聊天记录才能安全清理。
         if cfg.get("auto_memorize", True):
             try:
-                _schedule_memory_extract(session, full[-_MEM_WINDOW_TURNS:], model, cfg,
+                # ⚠️⚠️ 提炼**固定用默认模型**，不要跟着本轮路由走。
+                # 这里原来传的是 `model`（本轮路由后的模型），后果实测：
+                # 只要这一轮被判成代码任务（`_route_code_model` 切到 qwen2.5-coder:14b），
+                # 提炼就也用 14B 代码模型 —— 而它**根本不做这类抽取**：
+                #     同一条 prompt，qwen3-vl:8b → 56.8 秒，正确给出 3 条要点；
+                #     qwen2.5-coder:14b → 10.1 秒，只回一个「无」字，**0 条**。
+                # 表现就是"聊了代码之后，那几轮的内容一条都没记进去"，
+                # 而且**没有任何报错**（返回了非空文本，解析后 kept=0）。
+                # 另外 14B 模型 12GB 显存装不下，`ollama ps` 实测 26% 跑在 CPU 上，就算它能干也慢。
+                _mem_model = cfg.get("default_model") or model
+                _schedule_memory_extract(session, full[-_MEM_WINDOW_TURNS:], _mem_model, cfg,
                                          urgent=_looks_memorable(last_user))
             except Exception:
                 pass
