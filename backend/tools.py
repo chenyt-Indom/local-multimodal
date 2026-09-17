@@ -188,10 +188,12 @@ _MAP_PLAN_SCHEMA = {
             "· 只查地点：给 places:[\"广州塔\", \"汕头大学\"]（会自动找到坐标并在地图上打点）。\n"
             "· 只规划路线：给 route:{\"from\":\"广州塔\",\"to\":\"广州白云机场\",\"mode\":\"driving\"}。\n"
             "· 两者可以一起给：先把途经点标出来，再画路线。\n"
-            "· mode 可选 driving(驾车，默认) / foot(步行) / bike(骑行)。\n"
-            "  ⚠️ **免费路网只提供驾车路径**：选步行/骑行时，距离仍是驾车路线的距离、"
-            "时间按速度估算。这种情况返回里会带 note，**必须把这话转告用户**，"
-            "不能让他以为那是真实步行路线。\n"
+            "· mode 可选 driving(驾车，默认) / foot(步行) / bike(骑行) / transit(公交)。\n"
+            "  · **transit** 走高德公交换乘，返回**具体线路、票价、换乘站** —— "
+            "用户问「坐几路车 / 怎么换乘 / 公交多久」时用它。\n"
+            "  · 配了高德 key 时：驾车带**实时路况**，步行/骑行是**真实路径**。\n"
+            "  · 没配 key（自动回退 OSRM）时：免费路网只给驾车路径、步行骑行时间是估算，"
+            "返回里会带 note，**必须把这话转告用户**，不能让他以为是真实步行路线。\n"
             "· 中长途会自动给**多条备选路线**并挑一条推荐，返回里带 routes 与 reason。"
             "把「为什么推荐这条」照实说出来（那是真实差距，别自己加戏）；只有一条可行路线时也别硬凑。\n"
             "· 用户问天气、或要把出行情况讲清楚时给 weather:true。\n"
@@ -238,13 +240,18 @@ _NEARBY_SCHEMA = {
             "· category 用中文日常说法即可：餐厅 / 咖啡馆 / 便利店 / 超市 / 药店 / "
             "医院 / 银行 / 加油站 / 停车场 / 酒店 / 学校 / 公交站 / 公园 / 厕所…\n"
             "· radius 单位米，默认 1500，最大 20000。\n"
-            "⚠️⚠️ **本工具没有任何评分数据** —— OpenStreetMap 不提供评分/星级/评论，"
-            "所以返回里也没有分数。**绝不许自己编一个评分、星级或评价**"
-            "（「评分 4.5」「口碑很好」「味道不错」这类全是编的）。\n"
-            "每条只带一句「这条记录全不全」的说明，照实转述即可。\n"
-            "⚠️ 中国的小微店铺在 OSM 上覆盖很稀疏，**查不到不等于没有**；"
-            "如实说明，并建议换类别词或扩大半径再试。\n"
-            "⚠️ **只准转述返回里确实有的字段**（名字/距离/地址/电话/营业时间/说明），"
+            "⚠️⚠️ **不要为了找「评分」改用 web_search** —— 本工具在高德模式下"
+            "**直接返回真实评分（rating）和人均消费（cost）**。"
+            "用户问「附近评分最高的餐厅 / 哪家评价好」时，"
+            "**就用本工具**（可以把 radius 放大到 3000 拿更多候选），"
+            "拿到结果后按 rating 从高到低排，**不要跑去联网搜点评网站**。\n"
+            "· 数据源：配了高德 key 时走**高德地图**（POI 全、**有真实评分和人均消费**）；"
+            "没配或离线时回退 OpenStreetMap（**没有评分**）。\n"
+            "⚠️ **返回里带 rating 就照实念** —— 那是真实评分，可以直接用来推荐和排序；"
+            "带 cost 的是人均消费。\n"
+            "⚠️ **没有 rating 字段时绝不许自己编评分、星级或评价**"
+            "（「评分 4.5」「口碑很好」「味道不错」这类就是编的）。\n"
+            "⚠️ **只准转述返回里确实有的字段**（名字/距离/评分/人均/地址/电话/营业时间），"
             "**不要补数据里没有的东西** —— 实测模型会顺口加「校内主干道旁」"
             "「校门对面」这类位置描述和「学生常去」这类评价，那全是编的。"
         ),
@@ -2671,6 +2678,60 @@ def _cache_time_text(ts) -> str:
         return ""
 
 
+def _do_transit(route: dict, ui_events, net: bool) -> str:
+    """公交换乘结果 → 文本 + 地图卡片。
+
+    ⚠️ 公交数据只有高德有。没配 key 或离线时**如实说查不了**，
+       绝对不要编线路号、票价、班次（实测模型真会编「302路 票价2元」）。
+    """
+    from . import map_tools as _mt
+
+    frm = str(route.get("from") or "")
+    to = str(route.get("to") or "")
+    r = _mt.plan_transit(frm, to, allow_net=net)
+    if not r.get("ok"):
+        return ("公交换乘没查成：%s\n"
+                "⚠️ 如实告诉用户原因，**不要编造公交线路号和票价**。" % r.get("error"))
+
+    plans = r.get("plans") or []
+    lines = ["· **%s → %s** 公交换乘方案（共 %d 个）："
+             % (r["from"]["name"], r["to"]["name"], len(plans))]
+    for i, p in enumerate(plans[:3]):
+        lines.append("  %d）约 %.0f 分钟，票价 %.1f 元，步行 %d 米，换乘 %d 次%s"
+                     % (i + 1, p["duration_s"] / 60.0, p["cost"], p["walking_m"],
+                        p["transfers"], "　← **推荐**" if i == 0 else ""))
+        for s in p["segments"][:8]:
+            if s["type"] == "bus":
+                alts = ("（也可坐 %s）" % "、".join(s["alts"])) if s.get("alts") else ""
+                lines.append("       %s：%s → %s%s"
+                             % (s["line"], s["from"] or "?", s["to"] or "?", alts))
+            else:
+                lines.append("       步行 %d 米" % s["distance_m"])
+
+    if isinstance(ui_events, list):
+        best = plans[0] if plans else {"points": []}
+        ui_events.append({
+            "type": "map", "online": net,
+            "center": [r["from"]["lat"], r["from"]["lon"]],
+            "zoom": 12,
+            "markers": [{"name": r["from"]["name"], "lat": r["from"]["lat"],
+                         "lon": r["from"]["lon"], "addr": "", "role": "from"},
+                        {"name": r["to"]["name"], "lat": r["to"]["lat"],
+                         "lon": r["to"]["lon"], "addr": "", "role": "to"}],
+            "route": {"points": best.get("points") or [], "distance": "",
+                      "duration": _mt.fmt_duration(best.get("duration_s") or 0),
+                      "mode": "公交", "from": r["from"]["name"], "to": r["to"]["name"],
+                      "routes": [], "straight": False, "transit": True},
+            "transit": {"plans": [{"duration": _mt.fmt_duration(p["duration_s"]),
+                                   "cost": p["cost"], "walking": p["walking_m"],
+                                   "transfers": p["transfers"],
+                                   "segments": p["segments"]} for p in plans[:3]]},
+        })
+
+    return ("公交换乘（卡片会显示给用户，把方案说清楚）：\n" + "\n".join(lines) +
+            "\n· 上面这些线路、票价、换乘站都是高德返回的**真实数据**，可以照实说。")
+
+
 def _do_map_plan(arguments=None, ui_events=None) -> str:
     """查地点 / 规划路线，并把地图数据推给前端画成卡片。
 
@@ -2723,6 +2784,10 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
 
     rinfo, approx, mode_cmp = None, None, None
     if route and route.get("from") and route.get("to"):
+        # 公交换乘：高德有独立接口，和驾车/步行完全不是一回事，单独走一条路
+        if str(route.get("mode") or "").strip().lower() in (
+                "transit", "bus", "public", "公交", "地铁", "公共交通", "公交车"):
+            return _do_transit(route, ui_events, net)
         r = _mt.plan_route(str(route.get("from")), str(route.get("to")),
                            str(route.get("mode") or "driving"), allow_net=net,
                            want_weather=bool(a.get("weather") or a.get("天气")))
@@ -2944,6 +3009,11 @@ def _do_nearby_places(arguments=None, ui_events=None) -> str:
         nm = it["name"] or "（这个点没有名字）"
         lines.append("· **%s** —— 距离 %s" % (nm, _mt.fmt_distance(it["dist_m"])))
         extra = []
+        # 走高德时**有真实评分**，这是最该给用户看的东西，放最前面
+        if it.get("rating"):
+            extra.append("**评分 %s**" % it["rating"])
+        if it.get("cost"):
+            extra.append("人均 %s 元" % it["cost"])
         if it.get("addr"):
             extra.append("地址：" + it["addr"])
         if it.get("phone"):
@@ -2954,18 +3024,18 @@ def _do_nearby_places(arguments=None, ui_events=None) -> str:
             extra.append("官网：" + it["website"])
         if extra:
             lines.append("  " + "；".join(extra))
-        lines.append("  %s" % it["info_note"])
+        if it.get("info_note"):
+            lines.append("  %s" % it["info_note"])
 
-    tail = ("\n⚠️ **不要给这些场所打分，也不要编评价** —— "
-            "OpenStreetMap 没有评分/星级/评论数据，我们这里也没有。"
-            "返回里只有一句「这条记录全不全」的说明，照实转述就行。\n"
-            "⚠️ **只准转述返回里确实有的信息**（名字、距离、地址、电话、营业时间、说明）。"
+    tail = ("\n⚠️ **有评分就照实念**：返回里带 rating 字段的是**真实评分**（来自高德地图），"
+            "直接告诉用户「评分 4.7」就行，也可以用来排序推荐；"
+            "带 cost 的是人均消费。\n"
+            "⚠️ **没有 rating 字段时绝不许自己编评分、星级或评价** —— "
+            "OpenStreetMap 不提供评分数据（比如「口碑很好」「味道不错」这类都是编的）。\n"
+            "⚠️ **只准转述返回里确实有的信息**（名字、距离、评分、人均、地址、电话、营业时间）。"
             "不要补数据里没有的东西 —— 实测模型会顺口加上「校内主干道旁」「校门对面」"
             "这类位置描述和「学生常去」这类评价，那都是编的。\n"
-            "· 数据来自 OpenStreetMap（志愿者测绘），中国的小微店铺覆盖稀疏，"
-            "「没查到」不等于「没有」。\n"
-            "· 用户问「靠不靠谱」时：照实说这条记录全不全、建议先确认，"
-            "**绝不要给星、给分，也不要编卫生/口味/服务之类的评价**。")
+            "· 「没查到」不等于「没有」：换个别说法或把 radius 调大再试。")
 
     if isinstance(ui_events, list):
         ui_events.append({
@@ -2977,19 +3047,23 @@ def _do_nearby_places(arguments=None, ui_events=None) -> str:
                          "addr": "", "role": "center"}] +
                        [{"name": m["name"] or "（无名）", "lat": m["lat"], "lon": m["lon"],
                          "addr": m.get("addr") or "",
-                         "dist": _mt.fmt_distance(m["dist_m"])} for m in items[:limit]],
+                         "dist": _mt.fmt_distance(m["dist_m"]),
+                         "rating": m.get("rating") or ""} for m in items[:limit]],
             "route": None,
             "nearby": {
                 "category": r.get("category"),
                 "center_name": c["name"],
                 "radius": rad,
                 "total": r.get("total"),
+                "source": r.get("source") or "",
                 "items": [{"name": m["name"] or "（无名）", "lat": m["lat"], "lon": m["lon"],
                            "dist": _mt.fmt_distance(m["dist_m"]),
                            "addr": m.get("addr") or "",
                            "phone": m.get("phone") or "",
                            "hours": m.get("hours") or "",
-                           "note": m["info_note"]} for m in items[:limit]],
+                           "rating": m.get("rating") or "",
+                           "cost": m.get("cost") or "",
+                           "note": m.get("info_note") or ""} for m in items[:limit]],
             },
         })
 

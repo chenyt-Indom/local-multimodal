@@ -1114,6 +1114,20 @@ body.dark .map-card .map-info { background: #1d2430; color: #e6ebf2; border-bott
 .nb-score.lo  { color: #9a5b12; background: #fdf0e3; }
 .nb-extra { color: #6b7684; font-size: 11.5px; margin-top: 2px; }
 .nb-note { color: #8a6d3b; font-size: 11px; margin-top: 2px; }
+/* 真实评分（走高德时才有；OpenStreetMap 没有评分数据） */
+.nb-rating {
+  margin-left: 7px;
+  font-size: 11.5px;
+  color: #a8640b;
+  background: #fdf3e0;
+  border-radius: 5px;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+/* 数据来源标注（高德 / OpenStreetMap） */
+.nb-src { font-size: 11px; color: #97a1ad; margin-bottom: 4px; }
+body.dark .nb-rating { background: #3a3212; color: #e8c878; }
+body.dark .nb-src { color: #7d8894; }
 body.dark .mode-chip { background: #232c38; border-color: #2f3a48; color: #9aa7b4; }
 body.dark .mode-chip.on { background: #16321f; border-color: #24512f; color: #7fd39b; }
 body.dark .map-nearby { border-top-color: #2c3440; }

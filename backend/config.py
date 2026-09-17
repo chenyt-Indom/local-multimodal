@@ -80,6 +80,14 @@ DEFAULT_CONFIG = {
     "auto_memorize": True,       # 对话后自动提取重要内容存入短期记忆
     # 联网搜索每轮最多注入结果条数
     "web_top_k": 4,
+    # 高德地图 Web 服务 key（**可选**，留空即不用）。
+    # 填了之后：联网模式下地图全走高德 —— 真实 POI（连小卖店都搜得到）、
+    # 场所评分、实时路况、公交换乘、真实步行/骑行路径；
+    # 没填、或「联网」开关关着，就回退到 OpenStreetMap（能力弱但免 key）。
+    # 申请：https://console.amap.com/dev/key/app → 新建应用 → 添加 Key，
+    # ⚠️ 服务平台必须选「**Web 服务**」（选成"Web端(JS API)"是另一套 key，不能用）。
+    # ⚠️ 别提交到仓库 —— config.json 已在 .gitignore 里。
+    "amap_key": "",
     # RAG 每轮最多检索文档数
     "rag_top_k": 4,
     # 记忆每轮最多注入条数

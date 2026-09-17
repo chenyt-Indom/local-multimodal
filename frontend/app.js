@@ -321,18 +321,25 @@
     if (nb && (nb.items || []).length) {
       const rows = nb.items.map(function (it) {
         const extra = [];
+        if (it.cost) extra.push("人均 " + escapeHtml(it.cost) + " 元");
         if (it.addr) extra.push(escapeHtml(it.addr));
         if (it.phone) extra.push("电话 " + escapeHtml(it.phone));
         if (it.hours) extra.push("营业 " + escapeHtml(it.hours));
+        // 走高德时有**真实评分** —— 这是用户最想看的
+        const rt = it.rating
+          ? `<span class="nb-rating">★ ${escapeHtml(it.rating)}</span>` : "";
         return `<li><b>${escapeHtml(it.name)}</b>` +
-          `<span class="nb-dist">${escapeHtml(it.dist)}</span>` +
+          `<span class="nb-dist">${escapeHtml(it.dist)}</span>` + rt +
           (extra.length ? `<div class="nb-extra">${extra.join("　·　")}</div>` : "") +
           (it.note ? `<div class="nb-note">${escapeHtml(it.note)}</div>` : "") +
           `</li>`;
       }).join("");
       // 信息栏已经写了「汕头大学 周边 2000 米内的餐厅（3 家）」，
       // 这里别再放一遍标题（实测会连着出现两遍，很啰嗦）
-      html += `<div class="map-nearby"><ul>${rows}</ul></div>`;
+      html += `<div class="map-nearby">` +
+        (nb.source === "amap"
+          ? `<div class="nb-src">数据来自高德地图</div>` : "") +
+        `<ul>${rows}</ul></div>`;
     }
     info.innerHTML = html || "地图";
 

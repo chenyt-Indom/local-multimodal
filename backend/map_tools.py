@@ -128,6 +128,21 @@ def mode_text() -> str:
     return "联网模式" if online() else "离线模式"
 
 
+def _source_tag(net: bool) -> str:
+    """当前实际会用哪个数据源 —— **只用来区分缓存键**。
+
+    为什么要它：高德和 OSM 的结果质量差很多（有没有评分、POI 密度差十倍），
+    共用一个缓存键会导致「刚配好高德 key，看到的却还是旧的 OSM 数据」（实测踩过）。
+    """
+    if not net:
+        return "off"
+    try:
+        from . import amap
+        return "amap" if amap.has_key() else "osm"
+    except Exception:
+        return "osm"
+
+
 # ---------------------------------------------------------------- 结果缓存
 # 为什么要它：离线模式能干什么，全看这里攒了多少东西。
 # 联网查过的地名、算过的路线都留在本地，之后断网还能重放。
@@ -446,7 +461,7 @@ def search_place(query: str, limit: int = 5, allow_net=None) -> list:
     net = online() if allow_net is None else bool(allow_net)
 
     # ① 本地缓存：没过期就直接用；**过期了在联网时会重查一遍**（这就是"自动更新"）
-    hit = _load_cache(_GEO_FILE).get(_ckey(q))
+    hit = _load_cache(_GEO_FILE).get(_ckey(_source_tag(net) + "|" + q))
     if hit and hit.get("results") and _fresh(hit.get("ts"), _TTL_GEO):
         return [dict(r, from_cache=True, cache_ts=hit.get("ts"))
                 for r in hit["results"][:limit]]
@@ -455,6 +470,20 @@ def search_place(query: str, limit: int = 5, allow_net=None) -> list:
     ex = _builtin_exact(q)
     if ex:
         return [ex]
+
+    # ②b 联网且配了高德 key → 用高德地理编码（国内比 Photon 准得多，
+    #     连"XX小区""XX大厦"这种小机构都能查到）
+    if net:
+        try:
+            from . import amap
+            if amap.has_key():
+                hits = amap.geocode(q)
+                if hits:
+                    cache_put(_GEO_FILE, _source_tag(net) + "|" + q,
+                              {"ts": _now(), "results": hits})
+                    return hits[:limit]
+        except Exception:
+            pass
 
     # ③ 联网查 ⚠️ 不要带 &lang=zh —— 带了中文查询会全部返回空
     if net:
@@ -478,7 +507,8 @@ def search_place(query: str, limit: int = 5, allow_net=None) -> list:
                 except Exception:
                     continue
             if out:
-                cache_put(_GEO_FILE, q, {"ts": _now(), "results": out})
+                cache_put(_GEO_FILE, _source_tag(net) + "|" + q,
+                              {"ts": _now(), "results": out})
                 return out[:limit]
         except Exception:
             pass      # 网断了 / Photon 挂了 → 继续往下走兜底
@@ -523,6 +553,56 @@ def geocode_one(query: str, allow_net=None):
 # 并明确标成估算（estimated=True），绝不假装那是真的步行路线。
 _WALK_KMH = 4.8
 _BIKE_KMH = 15.0
+
+
+def plan_transit(origin: str, dest: str, allow_net=None) -> dict:
+    """**公交换乘方案** —— 只有高德能给，OpenStreetMap 完全没有这类数据。
+
+    高德的公交接口要求传起点城市（city 参数），所以先从地理编码结果里拿。
+    """
+    net = online() if allow_net is None else bool(allow_net)
+    if not net:
+        return {"ok": False, "offline": True,
+                "error": "公交查询必须联网 —— 离线时本地没有公交数据。"}
+    try:
+        from . import amap
+        if not amap.has_key():
+            return {"ok": False, "error": "公交查询需要高德 key（在设置里填上即可）。"}
+        a = geocode_one(origin, allow_net=net)
+        b = geocode_one(dest, allow_net=net)
+        if not a or not b:
+            return {"ok": False,
+                    "error": "找不到%s" % ("起点" if not a else "终点")}
+        r = amap.transit(a["lat"], a["lon"], b["lat"], b["lon"],
+                         city=a.get("city") or "")
+        if not r.get("ok"):
+            return {"ok": False, "error": r.get("error") or "没找到公交方案"}
+        r["from"] = {"name": a["name"], "lat": a["lat"], "lon": a["lon"]}
+        r["to"] = {"name": b["name"], "lat": b["lat"], "lon": b["lon"]}
+        return r
+    except Exception as e:
+        return {"ok": False, "error": "公交查询失败：%s" % e}
+
+
+def _route_amap(a: dict, b: dict, m: str):
+    """走高德路径规划。没配 key / 失败 → 返回 None，调用方自动回退 OSRM。
+
+    ⚠️ 关键差别：高德的步行/骑行是**真实路径**（会走人行道、小路），
+       不像免费 OSRM 只能给驾车路网、再拿速度换算时间。
+       所以走高德时**不能**再标 estimated=True。
+    """
+    try:
+        from . import amap
+        if not amap.has_key():
+            return None
+        r = amap.route(a["lat"], a["lon"], b["lat"], b["lon"], m,
+                       alternatives=(m == "driving"))
+        if not r.get("ok") or not r.get("routes"):
+            return None
+        return {"ok": True, "routes": r["routes"],
+                "traffic_aware": bool(r.get("traffic_aware"))}
+    except Exception:
+        return None
 
 
 def _best_and_reason(routes: list) -> tuple:
@@ -598,7 +678,7 @@ def plan_route(origin: str, dest: str, mode: str = "driving", allow_net=None,
          "骑行": "bike", "自行车": "bike", "cycling": "bike", "bike": "bike"}.get(
         str(mode or "").strip().lower(), "driving")
     net = online() if allow_net is None else bool(allow_net)
-    key = "%s|%s|%s" % (m, _ckey(origin), _ckey(dest))
+    key = "%s|%s|%s|%s" % (_source_tag(net), m, _ckey(origin), _ckey(dest))
 
     # ① 本地缓存：没过期直接用；过期了联网时重算
     hit = _load_cache(_ROUTE_FILE).get(key)
@@ -612,9 +692,31 @@ def plan_route(origin: str, dest: str, mode: str = "driving", allow_net=None,
     if not b:
         return {"ok": False, "offline": not net, "error": "找不到终点「%s」" % dest}
 
-    # ② 联网算（**始终按 driving 请求**，见上面 _WALK_KMH 的注释）
+    # ② 联网算：**优先走高德**（真实步行/骑行路径 + 实时路况 + 备选方案），
+    #    没配 key 或请求失败再回退 OSRM
     why = ""
     if net:
+        _am = _route_amap(a, b, m)
+        if _am:
+            routes = _am["routes"]
+            best, reason = _best_and_reason(routes)
+            for rt in routes:
+                rt.setdefault("tolls", 0.0)
+                rt.setdefault("traffic_lights", 0)
+                rt["recommended"] = (rt["idx"] == best)
+                rt["reason"] = reason if rt["idx"] == best else ""
+            cache_put(_ROUTE_FILE, key, {"ts": _now(), "routes": routes, "best": best,
+                                         "source": "amap",
+                                         # 起终点也要存：从缓存出结果时不能丢名字
+                                         "from_name": a["name"], "from_lat": a["lat"],
+                                         "from_lon": a["lon"],
+                                         "to_name": b["name"], "to_lat": b["lat"],
+                                         "to_lon": b["lon"]})
+            res = _shape(routes, best, m, a, b, net, want_weather, amap_ok=True)
+            res["traffic_aware"] = _am.get("traffic_aware")
+            res["source"] = "amap"
+            return res
+
         url = OSRM % ("driving", "%.6f,%.6f;%.6f,%.6f"
                       % (a["lon"], a["lat"], b["lon"], b["lat"]))
         # alternatives=true：中长途能给 2~3 条备选（实测广州塔→白云机场 2 条）；
@@ -657,7 +759,8 @@ def _serve_cached(hit: dict, m: str, net: bool, want_weather: bool) -> dict:
          "lon": hit.get("from_lon")}
     b = {"name": hit.get("to_name") or "", "lat": hit.get("to_lat"),
          "lon": hit.get("to_lon")}
-    res = _shape(routes, best, m, a, b, net, want_weather)
+    res = _shape(routes, best, m, a, b, net, want_weather,
+                 amap_ok=(hit.get("source") == "amap"))
     res["from_cache"] = True
     res["cache_ts"] = hit.get("ts")
     res["stale"] = not _fresh(hit.get("ts"), _TTL_ROUTE)
@@ -665,10 +768,14 @@ def _serve_cached(hit: dict, m: str, net: bool, want_weather: bool) -> dict:
 
 
 def _shape(routes: list, best: int, m: str, a: dict, b: dict,
-           net: bool, want_weather: bool) -> dict:
-    """统一拼装返回结构（缓存与实时走同一条路，避免两边字段不一致）。"""
+           net: bool, want_weather: bool, amap_ok: bool = False) -> dict:
+    """统一拼装返回结构（缓存与实时走同一条路，避免两边字段不一致）。
+
+    amap_ok=True 表示数据来自高德 —— 它的步行/骑行是**真实路径**，
+    所以不再标 estimated，也不显示"时间系估算"那句说明。
+    """
     b_rt = routes[best] if routes else {"distance_m": 0, "duration_s": 0, "points": []}
-    est = m in ("foot", "bike")
+    est = (m in ("foot", "bike")) and not amap_ok
     res = {
         "ok": True, "mode": m, "routes": routes, "best": best,
         "estimated": est,
@@ -960,6 +1067,42 @@ def _overpass(q: str):
     raise last
 
 
+def _nearby_amap(lat, lon, cat, radius, limit):
+    """走高德周边搜索。没配 key / 失败 → 返回 None，调用方自动回退 Overpass。"""
+    try:
+        from . import amap
+        if not amap.has_key():
+            return None
+        r = amap.place_around(lat, lon, cat, radius=radius, offset=min(int(limit), 25))
+        if not r.get("ok") or not r.get("items"):
+            return None
+        items = []
+        for it in r["items"][:limit]:
+            row = {
+                "name": it.get("name") or "",
+                "lat": it["lat"], "lon": it["lon"],
+                "dist_m": int(it.get("dist_m") or 0),
+                "kind": it.get("kind") or cat,
+                "addr": it.get("addr") or "",
+                "phone": it.get("phone") or "",
+                "website": "",
+                "hours": "",
+                "info_note": "",
+            }
+            # 高德有**真实评分**（餐饮/酒店等类目）和人均消费 —— OSM 完全没有
+            if it.get("rating"):
+                row["rating"] = str(it["rating"])
+            if it.get("cost"):
+                row["cost"] = str(it["cost"])
+            items.append(row)
+        return {"ok": True, "category": cat, "radius": radius, "center": [lat, lon],
+                "total": int(r.get("total") or len(items)), "items": items,
+                "source": "amap",
+                "note": "数据来自高德地图。"}
+    except Exception:
+        return None
+
+
 def nearby(lat: float, lon: float, category: str, radius: int = 1500,
            limit: int = 20, allow_net=None) -> dict:
     """查某个坐标周围指定类别的场所（按距离排序）。
@@ -976,7 +1119,9 @@ def nearby(lat: float, lon: float, category: str, radius: int = 1500,
     net = online() if allow_net is None else bool(allow_net)
     radius = max(100, min(20000, int(radius or 1500)))
     limit = max(1, min(60, int(limit or 20)))
-    key = "%s|%.3f,%.3f|%d" % (cat, lat, lon, radius)
+    # ⚠️ 缓存键必须带**数据源** —— 高德和 OSM 的结果质量差很多，
+    # 共用一个键会出这种事（实测踩过）：刚配好高德 key，看到的却还是旧的 OSM 数据。
+    key = "%s|%s|%.3f,%.3f|%d" % (_source_tag(net), cat, lat, lon, radius)
 
     # 先看缓存（Overpass 会 429，缓存是必须的，不是优化）
     hit = _load_cache(_NB_FILE).get(key)
@@ -994,6 +1139,16 @@ def nearby(lat: float, lon: float, category: str, radius: int = 1500,
                 "error": "离线模式下没查过这一带的「%s」，查不到。"
                          "联网问一次之后就会存到本地，下次离线也能看。" % category}
 
+    # ---- 联网：**优先走高德**（配了 key 的话）----
+    # 高德的 POI 库比 OSM 强太多：实测汕头大学 1.5km 内，
+    # OSM 只录到 3 家餐厅、便利店 **0 家**；高德分别有 7 家和 11 家，
+    # 而且带**真实评分**和人均消费 —— 这正是用户要的东西。
+    _am = _nearby_amap(lat, lon, cat, radius, limit)
+    if _am:
+        cache_put(_NB_FILE, key, {"ts": _now(), "items": _am})
+        return _am
+
+    # ---- 回退 Overpass（没配 key / 高德失败）----
     q = ('[out:json][timeout:30];('
          'node(around:%d,%.6f,%.6f)%s;'
          'way(around:%d,%.6f,%.6f)%s;'
