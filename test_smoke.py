@@ -183,6 +183,10 @@ def main():
     h3 = A.check_health(force=True, online=True)
     check("断开状态：configured=True 且 enabled=False（前端按钮据此变暗）",
           h3["configured"] is True and h3["enabled"] is False, h3["message"])
+    # 状态里必须带「联网开关」—— 前端靠它决定"按钮要不要跟着联网一起变暗"
+    h5 = A.check_health(force=True, online=False)
+    check("离线时状态里 online=False（前端据此变暗并提示先开联网）",
+          h5.get("online") is False, h5.get("skipped", ""))
     C.save_config(dict(C.load_config(), amap_enabled=True))
     h4 = A.check_health(force=True, online=True)
     check("重新连接后 enabled 回来", h4["enabled"] is True)

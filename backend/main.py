@@ -3798,14 +3798,15 @@ def map_stats():
 
 
 @app.get("/api/map/amap_status")
-def map_amap_status():
-    """高德 key 当前可不可用 —— 前端拿它决定按钮「亮起 / 变暗」。
+def map_amap_status(force: int = 0):
+    """高德当前可用不可用 —— 前端拿它决定按钮「亮起 / 变暗」。
 
     带缓存（正常 15 分钟、异常 1 分钟复查一次），所以前端可以放心轮询。
+    `?force=1` 则**无视缓存、立刻真调一次高德**（面板上那个「重新验证」按钮用）。
     """
     from . import amap as _am
     from . import map_tools as _mt
-    return {"ok": True, **_am.check_health(online=_mt.online())}
+    return {"ok": True, **_am.check_health(force=bool(force), online=_mt.online())}
 
 
 @app.post("/api/map/amap_key")

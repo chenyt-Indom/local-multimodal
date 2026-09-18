@@ -521,28 +521,36 @@
     }
     const prev = _amapState;
     _amapState = s;
-    const armed = !!(s.configured && s.enabled);   // 配了且是"连接"状态
-    // 四种样子：
-    //   可用          → 亮起（绿 + ●）
-    //   配了但不可用  → 变暗 + 红「!」
-    //   用户主动断开  → 变暗（key 还留着，不报红）
-    //   没配          → 变暗
-    btn.classList.toggle("on", !!s.ok);
+    // ⚠️ 关掉「联网」开关时，高德**根本用不了**（一个请求都发不出去），
+    //    所以按钮也要跟着变暗 —— 但**不能报红**：那不是 key 坏了，是用户自己关的。
+    //    点它要给的是"先打开联网"的提示，不是"你的 key 有问题"。
+    const online = s.online !== false;
+    const armed = !!(s.configured && s.enabled) && online;   // 真正在用的状态
+    // 五种样子：
+    //   可用              → 亮起（绿 + ●）
+    //   联网开着但不可用  → 变暗 + 红「!」
+    //   用户主动断开      → 变暗（key 还留着，不报红）
+    //   没配              → 变暗
+    //   **联网关掉**      → 变暗（也不能报红）
+    btn.classList.toggle("on", online && !!s.ok);
     btn.classList.toggle("bad", armed && !s.ok);
-    btn.textContent = s.ok ? "高德 key ✓" : (armed ? "高德 key !" : "高德 key");
-    btn.title = s.ok
-      ? ("已连接（" + (s.key_hint || "") + "）· 点一下查看、断开或更换 key")
-      : (armed
-          ? ("⚠️ 当前不可用：" + (s.message || "原因未知") + " —— 点一下处理")
-          : (s.configured
-              ? "已断开（key 还留着）· 点一下可以重新连接"
-              : "还没配高德 key。点一下配置：填了能搜到全国小店、有真实评分和实时路况"));
+    btn.textContent = (online && s.ok) ? "高德 key ✓"
+                    : (armed ? "高德 key !" : "高德 key");
+    btn.title = !online
+      ? "离线模式：高德用不了 —— 先打开顶栏的「联网」开关"
+      : (s.ok
+          ? ("已连接（" + (s.key_hint || "") + "）· 点一下查看、验证、断开或更换 key")
+          : (armed
+              ? ("⚠️ 当前不可用：" + (s.message || "原因未知") + " —— 点一下处理")
+              : (s.configured
+                  ? "已断开（key 还留着）· 点一下可以重新连接"
+                  : "还没配高德 key。点一下配置：填了能搜到全国小店、有真实评分和实时路况")));
 
     // ⚠️ 只在"从可用变成不可用"的那一下提醒，不是每次都弹；
-    //    而且**用户自己点断开时不要弹**（那是他要的，不是故障）。
+    //    而且**用户自己点断开 / 自己关联网时不要弹**（那是他要的，不是故障）。
     const self = _amapSelfAction;
     _amapSelfAction = false;
-    if (!self && prev && prev.ok && !s.ok && s.enabled) {
+    if (!self && prev && prev.ok && !s.ok && s.enabled && online) {
       showToast("⚠️ 高德 key 现在用不了了：" + (s.message || "原因未知") +
                 "　点顶栏「高德 key」处理一下", "warn");
     }
@@ -559,10 +567,16 @@
   // 面板的交互是按用户要求定的：
   //   · **连接 / 断开** 是个开关：断开**不删 key**（"重新输入太麻烦"），只是不用它；
   //   · 已经存下的 key **只读显示**，不能直接改；
-  //   · 要换 key 得点「更改 API」：输入新的 → 验证成功才替换旧的 → 失败则原 key 一字不动。
+  //   · 要换 key 得点「更改 API」：输入新的 → 验证成功才替换旧的 → 失败则原 key 一字不动；
+  //   · 「重新验证」：无视缓存立刻真调一次高德，确认现在到底通不通。
   async function showAmapKey() {
     if (document.querySelector(".amap-layer")) return;
     await refreshAmapState();                 // 先刷新一下，弹出来的状态才是准的
+    // 关着「联网」时点它：先把话说清楚，别让用户以为是 key 出问题了。
+    // （面板照样打开 —— 状态、key、断开/更改 这些在离线时也要能看能管。）
+    if (_amapState && _amapState.online === false) {
+      showToast("现在是离线模式，高德用不了 —— 先打开顶栏的「联网」开关", "warn");
+    }
     let full = "";
     try {
       const d = await api("/api/config");
@@ -610,9 +624,15 @@
 
     function render() {
       const s = _amapState || {};
-      const armed = !!(s.configured && s.enabled);
+      const online = s.online !== false;
+      const armed = !!(s.configured && s.enabled) && online;
       let line, cls;
-      if (s.ok) {
+      if (!online) {
+        // ⚠️ 离线时**先解释清楚这是什么原因** —— 不然用户会以为是 key 坏了
+        line = "🌐 离线模式 —— 高德现在用不了（打开顶栏的「联网」开关就会自动恢复）。" +
+               (s.configured ? "key 还在，不用重输。" : "");
+        cls = "";
+      } else if (s.ok) {
         line = "✅ 配置成功，正在使用（" + (s.key_hint || "") + "）"; cls = "ok";
       } else if (armed) {
         line = "⚠️ 已配置但**当前不可用**：" + (s.message || "原因未知"); cls = "bad";
@@ -621,7 +641,7 @@
       } else if (s.configured === false) {
         line = "未配置 —— 地图在用 OpenStreetMap（数据弱一些）"; cls = "";
       } else {
-        line = "状态读取失败（后端没响应？）—— 可以点「更改 API」直接重试"; cls = "bad";
+        line = "状态读取失败（后端没响应？）—— 可以点「更改 API」或「自动验证」重试"; cls = "bad";
       }
       stateEl.textContent = line;
       stateEl.className = "amap-state " + cls;
@@ -639,6 +659,10 @@
         html += '<button class="btn ghost" data-act="cancel">取消</button>' +
                 '<button class="btn primary" data-act="save">验证并保存</button>';
       } else {
+        // 「自动验证」：无视缓存，立刻真调一次高德（离线时没有意义，不显示）
+        if (online && s.configured) {
+          html += '<button class="btn ghost" data-act="verify">自动验证</button>';
+        }
         if (s.configured) {
           html += '<button class="btn ' + (s.enabled ? "ghost" : "primary") +
                   '" data-act="toggle">' + (s.enabled ? "断开" : "连接") + '</button>';
@@ -651,6 +675,8 @@
       btnsEl.querySelector('[data-act="close"]').onclick = () => layer.remove();
       const c = btnsEl.querySelector('[data-act="cancel"]');
       if (c) c.onclick = () => { editing = false; say(""); render(); };
+      const vf = btnsEl.querySelector('[data-act="verify"]');
+      if (vf) vf.onclick = () => doVerify(vf);
       const t = btnsEl.querySelector('[data-act="toggle"]');
       if (t) t.onclick = () => doToggle();
       const ch = btnsEl.querySelector('[data-act="change"]');
@@ -681,6 +707,35 @@
         say("连不上后端：" + String(e.message || e), "bad");
       } finally {
         btnsEl.querySelectorAll("button").forEach((b) => { b.disabled = false; });
+        render();
+      }
+    }
+
+    // 「自动验证」：无视后端缓存，**立刻真调一次高德**，把结论直接摆在面板上。
+    // 为什么要这个按钮：key 会因为额度、控制台重置等原因不声不响失效，
+    // 用户想"我确认一下现在到底通不通"时，不该只能等 15 分钟一次的自动复查。
+    async function doVerify(btnEl) {
+      if (btnEl) btnEl.disabled = true;
+      say("正在连高德验证…（这一步会真的调一次高德接口）", "");
+      try {
+        const r = await api("/api/map/amap_status?force=1");
+        _amapState = r;
+        if (r && r.online === false) {
+          say("现在是离线模式，没法验证 —— 先打开顶栏的「联网」开关。", "bad");
+        } else if (r && r.ok) {
+          say("✅ 验证通过：" + (r.message || "高德可以正常使用") +
+              "\n（刚才实时查到：" + (r.key_hint || "") + "）", "ok");
+          showToast("高德验证通过，一切正常", "ok");
+        } else if (r && r.configured === false) {
+          say("还没配高德 key —— 点「填一个 key」配一下。", "bad");
+        } else {
+          say("❌ 验证没通过：" + ((r && r.message) || "原因未知") +
+              "\n（可以点「更改 API」换一个 key，或者先「断开」用回 OpenStreetMap）", "bad");
+          showToast("高德验证没通过，看面板里的原因", "warn");
+        }
+      } catch (e) {
+        say("验证请求失败：" + String(e.message || e), "bad");
+      } finally {
         render();
       }
     }

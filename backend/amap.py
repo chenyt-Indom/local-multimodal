@@ -156,16 +156,16 @@ def check_health(force: bool = False, online: bool = True) -> dict:
     now = time.time()
     if not st:
         _HEALTH.update(ok=False, message="还没配高德 key", checked=now, key_hint="")
-        return _health_dict(configured=False)
+        return _health_dict(configured=False, online=online)
     if not enabled():
         # ⚠️ 断开是**用户主动的选择**，不是故障：不检测、也不报红，
         #    而且要明确告诉他们"key 还留着"（不然会以为又要重输一遍）。
         _HEALTH.update(ok=False, message="已断开（key 还留着，点「连接」就能恢复）",
                        checked=now, key_hint=_key_hint(st))
-        return _health_dict(configured=True)
+        return _health_dict(configured=True, online=online)
     if not online:
         # 离线模式不联网：保留上次结论，但不刷新（避免把"没网"误判成"key 坏了"）
-        return _health_dict(configured=True, skipped="离线模式，暂不检测")
+        return _health_dict(configured=True, online=False, skipped="离线模式，暂不检测")
     hint = _key_hint(st)
     same = (_HEALTH["key_hint"] == hint)
     ttl = _HEALTH_TTL_OK if _HEALTH["ok"] else _HEALTH_TTL_BAD
@@ -175,9 +175,12 @@ def check_health(force: bool = False, online: bool = True) -> dict:
     return _health_dict(configured=True)
 
 
-def _health_dict(configured: bool, skipped: str = "") -> dict:
+def _health_dict(configured: bool, skipped: str = "", online: bool = True) -> dict:
     age = (time.time() - float(_HEALTH["checked"] or 0)) if _HEALTH["checked"] else None
     return {"configured": bool(configured),
+            # ⚠️ 一定要把「联网开关」也报给前端：关掉联网时高德根本用不了，
+            #    按钮该跟着变暗，点它要提示"先开联网"，而不是报"key 坏了"。
+            "online": bool(online),
             "enabled": bool(enabled()),
             "ok": bool(_HEALTH["ok"]),
             "message": _HEALTH["message"] or "",
