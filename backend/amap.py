@@ -247,31 +247,8 @@ def gcj02_to_wgs84(lng: float, lat: float):
 
 
 # ---------------------------------------------------------------- HTTP
-# ⚠️⚠️ 高德对**并发/QPS**有限制（免费个人开发者约 3 次/秒）。而查一次天气要连打 2~4 个请求
-#    （地理编码 → 反查行政区 → 实况 → 预报），地图卡一次还要问两个地点。
-#    实测：**不排队、连着打会随机失败** —— 接口返回空 lives / 空 forecasts，
-#    看着就像"这个城市没有天气数据"（排查时差点当成 adcode 写错）。
-#    所以这里加一道模块级闸门：**全局串行 + 最小间隔 0.35 秒**，稳稳压在限流线以下。
-#    代价是每次多等零点几秒，比"偶尔查不到"强得多。
-_MIN_GAP = 0.35
-_gate = {"lock": None, "last": 0.0}
-
-
-def _wait_turn():
-    """给高德请求排队（串行 + 最小间隔）。"""
-    import threading
-    if _gate["lock"] is None:
-        _gate["lock"] = threading.Lock()
-    with _gate["lock"]:
-        gap = time.time() - _gate["last"]
-        if 0 < gap < _MIN_GAP:
-            time.sleep(_MIN_GAP - gap)
-        _gate["last"] = time.time()
-
-
 def _get_url(url: str, timeout: int = 20):
     """底层请求。失败一律返回 None（调用方回退 OSM），不抛异常。"""
-    _wait_turn()
     try:
         req = urllib.request.Request(url, headers={"User-Agent": _UA})
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -347,12 +324,7 @@ def geocode(address: str, city: str = "") -> list:
 
 
 def regeo(lat: float, lon: float) -> dict:
-    """坐标 → 人话地址。
-
-    ⚠️ 返回里**单列了 province / city / district**：天气那边要靠它们判断
-    "这个点到底在哪个行政区"，**不能拿 formatted_address 去凑** ——
-    地址里**带着 POI/村镇名**，会让"伦敦镇""东京村"这种同名小地方蒙混过关。
-    """
+    """坐标 → 人话地址。"""
     d = _get("/geocode/regeo", location=to_gcj_str(lat, lon),
              extensions="base", radius=1000)
     if not d:
@@ -360,7 +332,6 @@ def regeo(lat: float, lon: float) -> dict:
     rc = d.get("regeocode") or {}
     comp = rc.get("addressComponent") or {}
     return {"addr": rc.get("formatted_address") or "",
-            "province": comp.get("province") or "",
             "city": comp.get("city") or comp.get("province") or "",
             "district": comp.get("district") or "",
             "adcode": comp.get("adcode") or ""}
@@ -613,169 +584,21 @@ def transit(origin_lat, origin_lon, dest_lat, dest_lon,
 
 
 # ---------------------------------------------------------------- 天气
-# 数据来自**中国气象局**（高德转发）。选它的原因很实际：它是国内最贴实际的公开来源 ——
-# 实况是气象站**观测值**，预报是气象台自己的产品。
-#
-# ⚠️ 为什么从 Open-Meteo 换过来（2026-09-18 实测，同一时刻的广州）：
-#     高德（气象局）：实况 晴 28℃，逐日预报 晴 / 多云 / 多云
-#     Open-Meteo  ：实况 晴 29.7℃，逐日预报却写「小毛毛雨 / 毛毛雨 / 小毛毛雨」
-#     全球模式在华南对降水虚报得很厉害 —— 用户反馈的"天气不准"就是这个。
-#
-# ⚠️⚠️ 两个坑，都实测过：
-#   1. 高德天气**只认 adcode**（行政区编码），不认城市名 → 必须先地理编码。
-#   2. **境外地名会被它匹配到国内的同名小地方**：
-#      实测「东京」→ 广西贵港平南县东京、「伦敦」→ 佛山顺德伦敦镇、「首尔」→ 重庆潼南区首尔。
-#      所以拿到结果后**必须回验行政区划**（见 _domestic），对不上就让上层退回 Open-Meteo。
-#   3. 只有 **4 天**预报（今天 + 3 天），要更多天得靠别的源补。
-def _num(v):
-    """高德的数值都是字符串（"28"/"67"），统一转 float；转不了返回 None。"""
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
-def _head2(s: str) -> str:
-    """取查询词头两个字，用来做行政区划回验。
-    「汕头大学」→「汕头」、「北京市」→「北京」、「新疆维吾尔自治区」→「新疆」。"""
-    t = re.sub(r"[市省区县镇乡自治州盟地区]", "", str(s or "").strip())
-    return t[:2]
-
-
-def _domestic(query: str, g: dict) -> dict:
-    """回验：这个地理编码结果是不是"用户说的那个国内地方"。
-
-    先看高德给的市名对不对得上；对不上就**反查坐标所在行政区**（多花一次调用换"准"）。
-    返回 {ok, adcode, city, lat, lon}。
-
-    ⚠️⚠️ 判定只用 **province / city / district 三个行政区名**，
-       **绝不能拿 formatted_address 去 has**：地址末尾带着匹配到的 POI/村镇名，
-       于是「伦敦」能靠"佛山顺德伦敦镇"、 「东京」能靠"广西平南东京村"蒙混过关（都实测过）。
-    """
-    q2 = _head2(query)
-    city = (g or {}).get("city") or ""
-    ad = (g or {}).get("adcode") or ""
-    if q2 and q2 in city:
-        return {"ok": True, "adcode": ad, "city": city,
-                "lat": g.get("lat"), "lon": g.get("lon")}
-    r = regeo(g.get("lat"), g.get("lon"))
-    blob = (r.get("province") or "") + (r.get("city") or "") + (r.get("district") or "")
-    if q2 and q2 in blob:
-        return {"ok": True, "adcode": r.get("adcode") or ad,
-                "city": r.get("city") or city,
-                "lat": g.get("lat"), "lon": g.get("lon")}
-    return {"ok": False, "adcode": ad, "city": city, "addr": r.get("addr") or ""}
-
-
-def live(adcode: str) -> dict:
-    """实况天气（气象站观测，约每小时更新）。"""
-    d = _get("/weather/weatherInfo", city=str(adcode), extensions="base")
-    lives = (d or {}).get("lives") or []
-    if not lives:
-        return {}
-    x = lives[0]
-    return {"desc": x.get("weather") or "", "temp": _num(x.get("temperature")),
-            "humidity": _num(x.get("humidity")),
-            # ⚠️ 高德的"风"是**风向 + 风力等级**（"东≤3"），不是 km/h，别当风速用
-            "wind": ((x.get("winddirection") or "") + (x.get("windpower") or "")) or "",
-            "report_time": x.get("reporttime") or "",
-            "city": x.get("city") or "", "adcode": x.get("adcode") or ""}
-
-
-def forecast(adcode: str) -> list:
-    """逐日预报（今天起 4 天）。白天/夜间天气不一样就写成「晴转多云」。"""
+def weather(adcode: str) -> dict:
+    """按**行政区编码**查天气（高德要 adcode，不是城市名）。"""
+    if not adcode:
+        return {"ok": False, "error": "缺少行政区编码"}
     d = _get("/weather/weatherInfo", city=str(adcode), extensions="all")
-    casts = (d or {}).get("forecasts") or []
-    rows = (casts[0].get("casts") if casts else []) or []
-    out = []
-    for x in rows:
-        dw, nw = x.get("dayweather") or "", x.get("nightweather") or ""
-        out.append({"date": x.get("date") or "", "week": x.get("week") or "",
-                    "desc": dw if (not nw or nw == dw) else "%s转%s" % (dw, nw),
-                    "high": _num(x.get("daytemp")), "low": _num(x.get("nighttemp")),
-                    "wind": ((x.get("daywind") or "") + (x.get("daypower") or "")) or "",
-                    # 高德的预报**不给降水量/概率**，这里如实留空（上层会按"有什么写什么"输出）
-                    "rain_mm": None, "rain_pct": None,
-                    "src": "中国气象局"})
-    return out
-
-
-def _city_adcode(ad: str) -> str:
-    """把区县 adcode 归一到**市级**：440511（金平区）→ 440500（汕头市）。
-
-    ⚠️ 只在"原 adcode 查不到"时**才**拿它重试 —— 省直辖县级市（如 429004 仙桃）
-       这样归一得到的 429000 不是有效城市，不能直接当主键用。
-    """
-    a = str(ad or "")
-    return (a[:4] + "00") if len(a) == 6 else a
-
-
-def weather(city: str, days: int = 3) -> dict:
-    """按**城市名**查天气（中国气象局数据）。
-
-    返回结构与 Open-Meteo 那条路**完全一致**，上层不用分辨来源。
-    境外 / 高德查不到 → ok=False（调用方据此回退到 Open-Meteo）。
-    """
-    q = str(city or "").strip()
-    if not q:
-        return {"ok": False, "error": "没给城市名"}
-    hits = geocode(q)
-    if not hits:
-        return {"ok": False, "error": "高德没找到「%s」" % q}
-    # 同名的国内小地方很多，先挑"地址里对得上"的那一条
-    q2 = _head2(q)
-    best = hits[0]
-    for g in hits:
-        if q2 and q2 in ((g.get("addr") or "") + (g.get("city") or "")):
-            best = g
-            break
-    chk = _domestic(q, best)
-    ad = chk.get("adcode") or ""
-    if not chk.get("ok") or not ad:
-        return {"ok": False, "foreign": True,
-                "error": "高德查不到「%s」的天气（它只管国内）" % q}
-    # 区级 adcode 一般也能查（实测 440511 有数据），查不到再用市级重试一次 ——
-    # 这样"偶尔某个粒度没数据"不至于让整次查询失败。
-    lv = live(ad) or live(_city_adcode(ad))
-    if lv and lv.get("temp") is None and not lv.get("desc"):
-        # 高德偶尔给一条**空壳记录**（实测香港：有 city 没气温没天气），
-        # 别把它当成"实况"，否则界面上会出现「实况  ℃」这种半截话。
-        lv = {}
-    want = max(1, min(int(days or 3), 16))
-    dl = forecast(ad)
-    if not dl:
-        dl = forecast(_city_adcode(ad))
-    dl = dl[:want]
-    if not lv and not dl:
-        return {"ok": False, "error": "高德没返回天气数据"}
-    cur = {}
-    if lv:
-        cur = {"desc": lv["desc"], "temp": lv["temp"], "humidity": lv["humidity"],
-               "wind": lv["wind"], "report_time": lv["report_time"]}
-    note = "实况为气象站观测"
-    if lv.get("report_time"):
-        note += "（观测时间 %s）" % lv["report_time"]
-    note += "；逐日预报为中国气象台产品。"
-    if len(dl) < want:
-        note += " 高德这次只返回 %d 天预报。" % len(dl)
-    return {"ok": True, "city": lv.get("city") or chk.get("city") or q,
-            "admin": "", "country": "中国",
-            "lat": best.get("lat"), "lon": best.get("lon"),
-            "current": cur, "daily": dl,
-            "source": "中国气象局（经高德地图）", "note": note,
-            "adcode": ad, "report_time": lv.get("report_time") or ""}
-
-
-def weather_at(lat: float, lon: float) -> dict:
-    """按坐标取**实况**（供地图卡片用）。先反查行政区拿 adcode。"""
-    r = regeo(lat, lon)
-    ad = (r or {}).get("adcode") or ""
-    if not ad:
-        return {}
-    lv = live(ad) or live(_city_adcode(ad))
-    if not lv:
-        return {}
-    return {"now": {"temp": lv["temp"], "desc": lv["desc"], "wind": lv["wind"]},
-            "city": lv.get("city") or "", "report_time": lv.get("report_time") or "",
-            "src": "中国气象局"}
-
+    if not d:
+        return {"ok": False, "error": "天气查询失败"}
+    casts = d.get("forecasts") or []
+    if not casts:
+        return {"ok": False, "error": "没拿到天气数据"}
+    c = casts[0]
+    return {"ok": True, "city": c.get("city") or "",
+            "casts": [{"date": x.get("date"), "week": x.get("week"),
+                       "day_weather": x.get("dayweather"),
+                       "night_weather": x.get("nightweather"),
+                       "day_temp": x.get("daytemp"), "night_temp": x.get("nighttemp"),
+                       "wind": (x.get("daywind") or "") + (x.get("daypower") or "")}
+                      for x in (c.get("casts") or [])]}

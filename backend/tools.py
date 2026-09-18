@@ -1169,11 +1169,6 @@ _WEATHER_SCHEMA = {
             "查询某地天气（实时 + 未来逐日预报）。"
             "**天气一律用这个，不要用 web_search**（搜索引擎只给天气网站导航页，没有数值）。"
             "支持中文城市名。"
-            "⚠️ 数据源优先用**中国气象局**（经高德地图）：实况是气象站观测、预报是气象台产品；"
-            "没配高德 key 或查境外时才退回 Open-Meteo（全球模式，国内降水容易虚报）。"
-            "返回值里有「数据源」和「观测时间」，回答时要如实说清是哪一家、几点观测的。"
-            "⚠️⚠️ 返回结果**开头会写明「本次没有这些数据」**（高德不提供体感温度、降水概率），"
-            "**没给的字段一个都不许编**，用户问到就如实说这个源不提供。"
         ),
         "parameters": {
             "type": "object",
@@ -3033,13 +3028,6 @@ def _do_map_plan(arguments=None, ui_events=None, context=None) -> str:
                 if aw.get("rain") is not None:
                     parts.append("抵达时段降水概率 %s%%" % aw["rain"])
                 lines.append("    **天气**：%s" % "；".join(parts))
-                # ⚠️ 这两个数**来源不同**（此刻＝气象站观测，抵达时段＝模式逐小时预报），
-                #    不写清楚，模型很容易把它们说成"一路都是同一个来源"。
-                if (w.get("from") or {}).get("now_src"):
-                    lines.append("    （此刻数据来自%s；抵达时段来自 %s 的逐小时预报，"
-                                 "两者口径不同，转述时别混）"
-                                 % ((w.get("from") or {}).get("now_src"),
-                                    (w.get("from") or {}).get("hours_src") or "Open-Meteo"))
         else:
             approx = r.get("approx")
             lines.append("· **从 %s 到 %s**：%s"
@@ -3096,11 +3084,7 @@ def _do_map_plan(arguments=None, ui_events=None, context=None) -> str:
                        "weather": ({"from_name": ((rinfo.get("weather") or {}).get("from") or {}).get("name") or "",
                                     "from_now": ((rinfo.get("weather") or {}).get("from") or {}).get("now") or {},
                                     "to_name": ((rinfo.get("weather") or {}).get("to") or {}).get("name") or "",
-                                    "to_arrival": ((rinfo.get("weather") or {}).get("to") or {}).get("arrival") or {},
-                                    # ⚠️ 两个数**来源不同**（实况＝气象局、抵达时段＝Open-Meteo 逐小时），
-                                    #    卡片上必须标出来，否则用户会觉得"同一个天气怎么两个说法"。
-                                    "now_src": ((rinfo.get("weather") or {}).get("from") or {}).get("now_src") or "",
-                                    "hours_src": ((rinfo.get("weather") or {}).get("from") or {}).get("hours_src") or ""}
+                                    "to_arrival": ((rinfo.get("weather") or {}).get("to") or {}).get("arrival") or {}}
                                    if rinfo.get("weather") else None),
                        "modes": [{"mode": _mt._MODE_CN.get(k, k),
                                   "distance": _mt.fmt_distance(v["distance_m"]),

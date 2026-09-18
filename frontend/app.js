@@ -298,16 +298,7 @@
           (ta.temp != null ? " " + Math.round(ta.temp) + "℃" : "") +
           (ta.rain != null ? " 降水" + ta.rain + "%" : ""));
       }
-      if (bits.length) {
-        // ⚠️ 这两个数**来源不同**：实况是气象站观测（经高德／气象局），
-        //    "抵达时"只能靠 Open-Meteo 的逐小时。不标出来，用户会觉得
-        //    "同一个天气怎么两个说法"。（两家相同时只写一个）
-        const a = wt.now_src || "", b = wt.hours_src || "";
-        let srcTxt = a ? ("实况 " + escapeHtml(a)) : "";
-        if (b && b !== a) srcTxt += (srcTxt ? "，" : "") + "到达时段 " + escapeHtml(b);
-        html += `<div class="map-weather">${bits.join("　·　")}` +
-          (srcTxt ? `<span class="map-src">（${srcTxt}）</span>` : "") + `</div>`;
-      }
+      if (bits.length) html += `<div class="map-weather">${bits.join("　·　")}</div>`;
     }
     if (rt && rt.note) {
       html += `<div class="map-note">${escapeHtml(rt.note)}</div>`;
