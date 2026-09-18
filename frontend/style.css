@@ -715,6 +715,10 @@ body.dragging .drop-overlay,
   display: flex; gap: 6px; align-items: center;
   padding: 8px 12px; border-top: 1px dashed var(--border); background: var(--panel2);
 }
+/* ⚠️ 必须显式写这条：`.code-stdin { display: flex }` 是**作者样式**，
+   会盖掉浏览器默认样式里的 `[hidden] { display: none }` ——
+   不写的话 `hidden` 属性根本不起作用，输入框会一直显示在每张卡片下面。 */
+.code-stdin[hidden] { display: none; }
 .code-stdin input {
   flex: 1 1 auto; min-width: 0; padding: 6px 10px;
   border: 1px solid var(--border); border-radius: 8px;

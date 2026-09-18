@@ -2447,12 +2447,14 @@
     // 这里就是最后一道闸 —— 否则那段 JSON 会变成一张"可编辑可运行"的代码卡片，
     // 用户点「▶ 运行」得到 `SyntaxError: '{' was never closed`，
     // 而且会看到好几张一模一样的卡片，完全不知道发生了什么。
-    const looksLikeToolCall = (lang, body) => {
+    // ⚠️ 用**函数声明**而不是 const 箭头函数：后者在初始化之前被调用会抛
+    // TDZ ReferenceError（而历史会话回放可能发生在初始化之前）。函数声明会提升。
+    function looksLikeToolCall(lang, body) {
       if (/^(tool|tool_call|tool-call)$/i.test(String(lang || "").trim())) return true;
       const s = String(body || "").trim();
       return /^\{\s*"(name|tool|function)"\s*:/.test(s)
         && /"(arguments|parameters|args|input)"\s*:/.test(s);
-    };
+    }
 
     const renderAnswerWithCode = (bubble, text, userText) => {
       const parts = [];
