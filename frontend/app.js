@@ -2820,6 +2820,16 @@
   const voiceDevEl = $("#voiceDev");
   let voiceWs = null;
   let voiceOn = false;
+  // 唤醒那一刻输入框里已有的内容（用户可能先打了草稿再说话）——
+  // 语音文本**追加**在它后面，而不是把它覆盖掉。
+  let voiceDraft = "";
+
+  // 把"草稿 + 语音识别文本"写进输入框（草稿为空时就等于纯语音）。
+  function voiceFill(text) {
+    const t = String(text == null ? "" : text).trim();
+    inputEl.value = voiceDraft ? (voiceDraft + " " + t).trim() : t;
+    autoGrow();
+  }
   let voiceDevLoaded = false;
 
   // 电平条：说话时跟着跳。**一直不动就等于"麦克风没采到声音"** ——
@@ -2883,7 +2893,7 @@
     if (text) {
       voiceTextEl.textContent = text;
     } else if (state === "awake") {
-      voiceTextEl.textContent = "🎙 已唤醒 · 请说内容（停顿 2 秒自动发送）";
+      voiceTextEl.textContent = "🎙 我在听 · 请说内容（说完停顿 2 秒自动发送）";
     } else if (state === "listening") {
       voiceTextEl.textContent = "👂 监听中 · 说「小千小千」唤醒";
     } else {
@@ -2901,17 +2911,25 @@
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
       if (msg.type === "state") {
         voiceUI(msg.state);
+        // note 用来解释"这一轮为什么结束了"（比如"没听到内容"）——
+        // 不然用户只看到提示条不再发绿，不知道发生了什么。
+        if (msg.note && voiceTextEl) voiceTextEl.textContent = "ℹ " + msg.note;
         // 提示条一露出来就把麦克风下拉填上（让用户能一眼看到"现在用的是哪只麦"）
         if (!voiceDevLoaded) voiceLoadDevices();
       } else if (msg.type === "wake") {
-        voiceUI("awake");
+        voiceUI("awake", msg.note ? "🎙 " + msg.note : undefined);
+        // ⚠️ 唤醒后**把光标放进输入框**：用户接着说的话会实时出现在这里，
+        //    他不用再去点一下（"唤醒了但不知道往哪说"就是这么来的）。
+        //    顺便把视口滚到输入区 —— 用户喊唤醒词时多半没看着窗口。
+        try { inputEl.focus(); } catch (e) {}
+        // 记下此刻输入框里的内容：用户可能先打了草稿才说话，别被语音覆盖掉
+        voiceDraft = inputEl.value.trim();
       } else if (msg.type === "partial") {
         voiceUI("awake", "🎙 " + (msg.text || "…"));
-        inputEl.value = msg.text || "";
-        autoGrow();
+        voiceFill(msg.text);
       } else if (msg.type === "final") {
-        inputEl.value = msg.text || "";
-        autoGrow();
+        voiceFill(msg.text);
+        voiceDraft = "";
         voiceUI("listening", "✅ 已识别，自动发送…");
         if (msg.auto && inputEl.value.trim()) setTimeout(() => send(), 120);
       } else if (msg.type === "level") {

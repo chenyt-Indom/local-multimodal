@@ -386,6 +386,117 @@ def main():
         check("**再喊一次照样能唤醒**（用户报的「下次喊没反应」）",
               any(e.get("type") == "wake" for e in ev))
 
+    # ---------------- ⑨ 唤醒后"停一下再说"（用户实际动作） ----------------
+    print("\n⑨ 唤醒后停一下再说：停顿不能把这一轮结束掉（绿一下就没下文 = 这个 bug）")
+    if not wavs or len(wavs) < 4:
+        check("（跳过：没有可用的中文语音合成）", True)
+    else:
+        ev9 = []
+        vl9 = new_listener(ev9)
+        vl9._noise = 0.008
+        clk9 = {"t": 9000.0}
+        vl9._now = lambda: clk9["t"]
+        rs9 = np.random.RandomState(13)
+        amb9 = lambda n: [rs9.normal(0, 0.008, V.BLOCK_SIZE).astype("float32")
+                          for _ in range(n)]
+
+        def feed9(bs):
+            for b in bs:
+                clk9["t"] += 0.1
+                vl9._feed(b)
+
+        feed9(amb9(20))                              # 2 秒环境噪声
+        feed9(blocks_of(_read16(wavs[0])))           # 只喊「小千小千」
+        check("只喊唤醒词（不带指令）也能唤醒", any(e.get("type") == "wake" for e in ev9))
+        check("唤醒事件里带一句提示（界面要显示「我在听」）",
+              any(e.get("type") == "wake" and e.get("note") for e in ev9),
+              str([e.get("note") for e in ev9 if e.get("type") == "wake"]))
+        feed9(amb9(28))                              # **停下来等 2.8 秒**
+        n_at_pause = len(ev9)
+        check("停顿 2.8 秒（> 静音阈值 2 秒）后这一轮**仍然活着**",
+              vl9._awake and vl9.state == "awake", "state=%s" % vl9.state)
+        check("等待期间**不会冒出新的内容**（噪声没被当成指令发出去）",
+              not any(e.get("type") in ("partial", "final") for e in ev9[n_at_pause:]),
+              str([e.get("type") for e in ev9[n_at_pause:]]))
+        check("等待期间也不会结束这一轮（没有 state→listening）",
+              not any(e.get("type") == "state" for e in ev9[n_at_pause:]),
+              str([e.get("note") for e in ev9[n_at_pause:]]))
+        feed9(blocks_of(_read16(wavs[3])))           # 这才说「今天天气怎么样」
+        parts9 = [e.get("text") for e in ev9 if e.get("type") == "partial"]
+        check("停顿之后说的那句话被识别出来（→ 界面输入框里能看到）",
+              any("天气" in (t or "") for t in parts9), str(parts9))
+        feed9(amb9(30))
+        fins9 = [e.get("text") for e in ev9 if e.get("type") == "final"]
+        check("说完照常自动发送", len(fins9) == 1, str(fins9))
+
+    # ---------------- ⑩ 唤醒后一直不开口 ----------------
+    print("\n⑩ 唤醒后一直不开口：超时回待机，并且告诉界面为什么")
+    ev10 = []
+    vl10 = new_listener(ev10)
+    vl10._noise = 0.008
+    clk10 = {"t": 3000.0}
+    vl10._now = lambda: clk10["t"]
+    rs10 = np.random.RandomState(17)
+    amb10 = [rs10.normal(0, 0.008, V.BLOCK_SIZE).astype("float32")
+             for _ in range(int(V.AWAIT_CMD_SEC / 0.1) + 15)]
+    if wavs:
+        for b in [rs10.normal(0, 0.008, V.BLOCK_SIZE).astype("float32") for _ in range(20)]:
+            clk10["t"] += 0.1
+            vl10._feed(b)
+        # 这一段测的是"唤醒之后没人开口会怎样"，唤醒只是前置条件 ——
+        # 把唤醒词放大一点，避免受识别随机性影响（灵敏度本身在 ⑧⑨ 已覆盖）。
+        for b in blocks_of(_read16(wavs[0]) * 2.0):
+            clk10["t"] += 0.1
+            vl10._feed(b)
+        for b in amb10:
+            clk10["t"] += 0.1
+            vl10._feed(b)
+        check("等待窗口到点后回到待机（不会一直卡在 awake）",
+              vl10.state == "listening" and not vl10._awake,
+              "state=%s" % vl10.state)
+        print("      ﹒诊断：唤醒事件=%s" % any(e.get("type") == "wake" for e in ev10))
+        notes = [e.get("note") for e in ev10
+                 if e.get("type") == "state" and e.get("note")]
+        check("这次结束带一句说明（否则用户只看到绿一下，不知道发生了什么）",
+              bool(notes), str(notes))
+        check("整轮都没有发出空消息",
+              not any(e.get("type") == "final" for e in ev10))
+    else:
+        check("（跳过：没有可用的中文语音合成）", True)
+
+    # ---------------- ⑪ 唤醒后（还没说话）又喊一遍唤醒词 ----------------
+    print("\n⑪ 等待期间又喊一遍唤醒词：窗口要刷新，不能被判超时")
+    if not wavs or len(wavs) < 4:
+        check("（跳过：没有可用的中文语音合成）", True)
+    else:
+        ev11 = []
+        vl11 = new_listener(ev11)
+        vl11._noise = 0.008
+        clk11 = {"t": 7000.0}
+        vl11._now = lambda: clk11["t"]
+        rs11 = np.random.RandomState(19)
+        amb11 = lambda n: [rs11.normal(0, 0.008, V.BLOCK_SIZE).astype("float32")
+                           for _ in range(n)]
+
+        def feed11(bs):
+            for b in bs:
+                clk11["t"] += 0.1
+                vl11._feed(b)
+
+        feed11(amb11(20))
+        feed11(blocks_of(_read16(wavs[0])))          # 第一次喊
+        feed11(amb11(int(8.0 / 0.1)))                # 等 8 秒（还没到窗口上限）
+        feed11(blocks_of(_read16(wavs[0])))          # 又喊一遍 → 应该刷新窗口
+        feed11(amb11(int(6.0 / 0.1)))                # 再等 6 秒（不刷新的话累计已超时）
+        check("窗口被刷新：仍在等待，没有被判超时",
+              vl11._awake and vl11.state == "awake", "state=%s" % vl11.state)
+        feed11(blocks_of(_read16(wavs[3])))
+        feed11(amb11(30))
+        check("刷新之后说的指令照样能收到",
+              any("天气" in (e.get("text") or "") for e in ev11
+                  if e.get("type") == "partial"),
+              str([e.get("text") for e in ev11 if e.get("type") == "partial"]))
+
     print("\n" + "=" * 64)
     print("通过 %d 项，失败 %d 项" % (PASS, FAIL))
     print("=" * 64)
@@ -401,7 +512,7 @@ def _tts_sentences():
     import wave as _w
     d = os.path.join(TMP, "wav")
     os.makedirs(d, exist_ok=True)
-    sents = ["小千小千", "小千小千，今天天气怎么样", "现在几点了"]
+    sents = ["小千小千", "小千小千，今天天气怎么样", "现在几点了", "今天天气怎么样"]
     paths = []
     try:
         import win32com.client as w

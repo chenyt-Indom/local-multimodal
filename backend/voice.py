@@ -37,7 +37,13 @@ MIN_CHARS = 2                       # 至少要识别出这么多字才允许自
 # 一轮对话就永远结束不了 —— 状态卡在 awake，下次喊「小千小千」时唤醒分支根本不会执行，
 # 表现就是"第一声能用，之后怎么喊都没反应"。这两个上限保证无论如何都能回到待机。
 MAX_UTTERANCE_SEC = 12.0            # 一轮最长收音时间，到了就按已识别的内容发出去
-MAX_EMPTY_AWAKE_SEC = 6.0           # 唤醒后一直没说出内容 → 直接回待机（不发空消息）
+# ⚠️⚠️ 唤醒后"**还没说出任何内容**"时的等待窗口。
+#     这个值必须**明显大于** SILENCE_SEC，而且在这段时间里**绝不能**用"安静 2 秒"
+#     去结束一轮 —— 实测（2026-09-19 用户报）：喊完「小千小千」停下来等反应是
+#     最自然的动作，停顿 2.5 秒这一轮就被判成结束；用户紧接着说的指令因为
+#     不含唤醒词而被整个丢掉。现象就是**提示条绿一下、然后输入框一直是空的**。
+AWAIT_CMD_SEC = 10.0                # 唤醒后一直没开口 → 回待机（不发空消息）
+                                    # ⚠️ 必须 < MAX_UTTERANCE_SEC：后者是绝对硬顶
 
 # —— 静音门控：**跟着环境底噪走**（性能关键）——
 # 常驻监听最容易踩的坑：每 100ms 就跑一次 ASR 解码，持续吃满 CPU 并持有 GIL，
@@ -51,7 +57,13 @@ MAX_EMPTY_AWAKE_SEC = 6.0           # 唤醒后一直没说出内容 → 直接�
 #     → **下次喊唤醒词没反应**（就是用户报的"下次喊小千小千就没反应了"）。
 # ⇒ 阈值必须**按环境自适应**：先估一个底噪，再按倍数定"说话"和"安静"。
 NOISE_INIT = 0.006                  # 底噪初值（启动后 0.5 秒内会用真实音频覆盖它）
-NOISE_DOWN = 0.10                   # 更安静了 → 中等速度跟随（太快会被"说话里的停顿"带下去）
+NOISE_DOWN = 0.05                   # 更安静了 → 缓慢跟随
+# ⚠️ 底噪估计的**下限**（2026-09-19 实测踩到）：合成音频/录音里的"数字静音"
+#    会把估计一路拖到 0.002，于是说话阈值掉到 SPEECH_MIN=0.008 —— 而本机
+#    （摄像头上的麦）环境底噪就有 0.007~0.009，**噪声于是被判成"有人在说话"**：
+#    噪声被喂进识别流，甚至被当成指令发出去（现象：唤醒后一直没人说话，
+#    却冒出一个「小千」来）。真实麦克风不可能录到 0.000 的静音。
+NOISE_FLOOR = 0.005
 NOISE_UP_FAST = 0.08                # 确认是**稳态背景噪声** → 快速跟上
 NOISE_UP = 0.002                    # 像说话 → **极慢**上升（否则说话声会被当成底噪）
 NOISE_CAP = 0.024                   # 底噪最高只认到这个值：避免它涨上去把说话阈值也带飞
@@ -168,6 +180,22 @@ def _tail_after(text: str, skip_chars: int) -> str:
         if seen >= skip_chars:
             return text[i + 1:].strip("，。、！？,.!?　 ")
     return ""
+
+
+def is_bare_wake(text: str) -> bool:
+    """整段**只有唤醒词**（用户又喊了一遍、还没说内容）。
+
+    用来刷新"等待指令"的窗口。⚠️ 判据必须这么严：
+    环境噪声会被模型认成乱七八糟的字，偶尔正好含「小千」两个字 ——
+    若拿"剥掉唤醒词之后为空"当判据，窗口会被无限刷新、**永远回不到待机**
+    （实测：唤醒后一直没人说话，几十秒过去了状态还挂在 awake）。
+    """
+    norm = normalize_wake(text or "")
+    if not norm or len(norm) > 8:
+        return False
+    while norm.startswith("小千"):
+        norm = norm[2:]
+    return not norm
 
 
 def strip_wake_prefix(text: str) -> str:
@@ -401,6 +429,9 @@ class VoiceListener:
         self._preroll: list = []         # 门控前的一小段音频（避免吃掉第一个字）
         self._idle_since: float | None = None
         self._awake_since: float | None = None
+        # 这一轮**从唤醒那一刻**算起的起点。它**永不被刷新**，
+        # 用来给一轮对话封顶（见 _feed 里的硬顶）。
+        self._round_start: float | None = None
         self._q = None                   # 音频队列（回调入队、工作线程出队）
         self._noise = NOISE_INIT         # 环境底噪（自适应门控的基准）
         self._dips = []                  # 最近几块里"有没有明显低谷"（区分说话与稳态噪声）
@@ -500,6 +531,9 @@ class VoiceListener:
         else:
             self._noise += (rms - self._noise) * NOISE_UP
 
+        if self._noise < NOISE_FLOOR:
+            self._noise = NOISE_FLOOR       # 见 NOISE_FLOOR 的注释：不许掉到地板以下
+
     def start(self) -> dict:
         """开始监听（幂等 + 并发安全）。"""
         with self._lock:                 # 见 __init__ 里的说明：这里必须原子
@@ -517,6 +551,7 @@ class VoiceListener:
             self._preroll = []
             self._idle_since = None
             self._awake_since = None
+            self._round_start = None
             self._silence_start = None
             self._last_partial = ""
             self._noise = NOISE_INIT
@@ -692,6 +727,36 @@ class VoiceListener:
                         "noise": round(self._noise, 5),
                         "speech_th": round(self._speech_th(), 5)})
 
+    def _round_expired(self, now: float) -> bool:
+        """这一轮是不是该结束了？**必须在门控之前调用**（原因见 _feed 里的注释）。
+
+        返回 True 表示已经结束这一轮，调用方应当直接 return。
+
+        两条界线，职责不同：
+          · `AWAIT_CMD_SEC`（10 秒，从"上次听到唤醒词"算起）—— 还没开口时的等待窗口，
+            用户重喊唤醒词会把起点往后挪（给"喊一声→停一下→再喊一声"留余地）；
+          · `MAX_UTTERANCE_SEC`（12 秒，从**唤醒那一刻**算起，**永不刷新**）—— 绝对硬顶。
+            刷新类的判据再好也会被环境噪声偶尔误触发，没有这条就会永远挂在 awake。
+        """
+        if not self._awake:
+            return False
+        has_text = len((self._text or "").strip()) >= MIN_CHARS
+        hard = bool(self._round_start
+                    and now - self._round_start >= MAX_UTTERANCE_SEC)
+        if not has_text:
+            wait = bool(self._awake_since
+                        and now - self._awake_since >= AWAIT_CMD_SEC)
+            if hard or wait:
+                self._finish_round(note="没听到内容 · 再喊一次「小千小千」")
+                return True
+            return False
+        if hard:
+            self._emit({"type": "final", "text": (self._text or "").strip(),
+                        "auto": True})
+            self._finish_round()
+            return True
+        return False
+
     def _feed(self, samples) -> None:
         """把一块音频喂给识别器，并驱动状态机（含自适应门控）。"""
         if self._stream is None:
@@ -720,10 +785,20 @@ class VoiceListener:
                         "speech_th": round(self._speech_th(), 5),
                         "state": self.state})
 
-        # —— 待机 + 安静：**不跑识别**，只维护一小段前置音频 ——
-        # 这是让"常驻监听"不吃满 CPU 的关键：绝大多数时间都是静音，
-        # 那些时刻完全不需要跑 ASR（之前没做门控，把 Web 服务都拖慢了）。
-        if not self._awake and not loud:
+        # ⚠️⚠️ 本轮该不该结束 —— **必须在门控之前判**。
+        #    门控下面会直接 return（安静就不喂识别流），把超时/等待判定放在它后面，
+        #    等于"用户一直不说话时永远不会超时"：实测唤醒后没人开口，状态在 awake
+        #    上挂了 15 秒下不来、界面就一直停在"我在听"。
+        if self._round_expired(now):
+            return
+
+        # —— 还没"开口"（待机中 / 已唤醒但还没说出内容）+ 安静：**不喂识别流** ——
+        #    前半段是常驻监听的性能关键（见 GATE 那一段的注释）；
+        #    后半段是"唤醒后还在等用户开口"：那段时间的音频全是环境噪声，
+        #    喂进去只会被认成乱七八糟的字、甚至当成指令发出去（实测过）。
+        #    两种情况都只维护一小段前置音频，等真有人声时一起补喂（保住第一个字）。
+        if (not loud and not (self._awake
+                              and len((self._text or "").strip()) >= MIN_CHARS)):
             self._preroll.append(samples)
             if len(self._preroll) > PRE_ROLL_BLOCKS:
                 self._preroll.pop(0)
@@ -762,10 +837,21 @@ class VoiceListener:
                 self._awake = True
                 self.state = "awake"
                 self._awake_since = now
+                self._round_start = now
+                # ⚠️ 只有 1 个字的"尾巴"不算内容：唤醒那一刻解码器常常还没吐完
+                #    （「小千小千」后面跟半个字），当内容的话输入框会闪一个残字，
+                #    还会让"还没开口"的等待窗口提前失效。
+                rest = rest if len(rest) >= MIN_CHARS else ""
                 self._text = rest
-                self._silence_start = now if not rest else None
+                # ⚠️ **不要**在这儿给"还没内容"的情况启动静音计时：
+                #    用户喊完唤醒词后停下来等反应是最自然的动作，一停就超过
+                #    SILENCE_SEC=2 秒，这一轮会被立刻结束，紧接着说的指令
+                #    因为不含唤醒词而被整个丢掉（详见 AWAIT_CMD_SEC 的注释）。
+                #    "还没开口"的结束时机由下面的兜底一（AWAIT_CMD_SEC）负责。
+                self._silence_start = None
                 self._last_partial = ""
-                self._emit({"type": "wake", "state": "awake"})
+                self._emit({"type": "wake", "state": "awake",
+                            "note": "我在听，请说…"})
                 # 把窗口弹到最前（用户喊唤醒词时多半没看着窗口）
                 _fire_wake_hook()
                 if rest:
@@ -776,26 +862,33 @@ class VoiceListener:
         if text:
             # 模型给的是整段结果，开头还带着唤醒词，必须先剥掉再当指令
             cmd = strip_wake_prefix(text)
-            self._text = cmd
-            if cmd != self._last_partial:
-                self._last_partial = cmd
-                self._emit({"type": "partial", "text": cmd})
+            # ⚠️ **只有非空结果才更新**：流式结果是累积的、不会倒退，
+            #    出现空结果说明这一块是噪声/误识别 —— 拿它去赋值会把用户
+            #    已经说出来的内容清掉（输入框里的字"闪一下没了"）。
+            if len(cmd) >= MIN_CHARS:
+                if cmd != self._text:
+                    self._text = cmd
+                if cmd != self._last_partial:
+                    self._last_partial = cmd
+                    self._emit({"type": "partial", "text": cmd})
+            elif (is_bare_wake(text) and self._awake_since
+                  and now - self._awake_since >= 1.0):
+                # 整段**只有唤醒词本身**（用户又说了一遍「小千小千」）→ 刷新等待窗口。
+                # 不刷新的话，"喊一声 → 停一下 → 再喊一声确认"这种动作会撞上
+                # AWAIT_CMD_SEC 被判超时，用户会以为"喊了没反应"。
+                self._awake_since = now
 
-        # ⚠️ 兜底一：**收音最长 12 秒**。安静判定靠不住的时候（环境噪声贴着阈值），
-        #    没有这条就会永远停在 awake —— 下次喊唤醒词毫无反应（实测踩过）。
-        if self._awake_since and now - self._awake_since >= MAX_UTTERANCE_SEC:
-            final_text = (self._text or "").strip()
-            if len(final_text) >= MIN_CHARS:
-                self._emit({"type": "final", "text": final_text, "auto": True})
-            self._finish_round()
+        # ⚠️ "已经开口"的判据是"**至少 MIN_CHARS 个字**"，不能只看"非空"：
+        #    唤醒那一刻解码器常把唤醒词的尾音多吐一个字（实测「小千小千」后面
+        #    跟一个「小」），只看非空的话 has_text 立刻为真 → 静音 2 秒就把这一轮
+        #    结束了 —— 用户完全没机会开口。这正是"绿一下、没下文"的成因之一。
+        #
+        #    （超时/等待窗口在 _feed 开头就用 _round_expired 判过了，
+        #      那儿才是对的判位置 —— 见那一段的注释。）
+        if len((self._text or "").strip()) < MIN_CHARS:
             return
 
-        # ⚠️ 兜底二：唤醒后一直没说出内容（可能只是误唤醒）→ 回待机，别卡住
-        if (not (self._text or "").strip() and self._awake_since
-                and now - self._awake_since >= MAX_EMPTY_AWAKE_SEC):
-            self._finish_round()
-            return
-
+        # —— 已经说出内容了：安静 SILENCE_SEC 秒就自动发送 ——
         if quiet:
             if self._silence_start is None:
                 self._silence_start = now
@@ -809,16 +902,19 @@ class VoiceListener:
         else:
             self._silence_start = None
 
-    def _finish_round(self) -> None:
+    def _finish_round(self, note: str = "") -> None:
         """一轮结束，回到待机监听。
 
         注意：**底噪 `_noise` 不重置**（那是环境的属性，不是这一轮的属性），
         只清掉与"这一轮"有关的状态。
+        `note` 会随 state 事件发给界面：用来解释"这一轮为什么结束了"
+        （比如"没听到内容"），否则用户只看到提示条不再发绿，不知道发生了什么。
         """
         self._awake = False
         self._text = ""
         self._silence_start = None
         self._awake_since = None
+        self._round_start = None
         self._last_partial = ""
         self._preroll = []
         self._idle_since = None
@@ -826,7 +922,10 @@ class VoiceListener:
         self._speech_ref = 0.0
         self._reset_stream()
         self.state = "listening"
-        self._emit({"type": "state", "state": "listening"})
+        ev = {"type": "state", "state": "listening"}
+        if note:
+            ev["note"] = note
+        self._emit(ev)
 
 
 # —— 全局单例（供 FastAPI 路由使用）——
