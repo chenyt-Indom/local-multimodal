@@ -10,6 +10,7 @@
   · 联网查完**磁盘上不新增任何文件**（这是"去掉缓存"最硬的证据）
   · 断网后查同一条**拿不到** —— 证明真的没有缓存（不是"藏在别处"）
   · 老的缓存入口（cache_stats / prefetch_route）确实已经不存在了
+  · 地图按钮跟着「联网」开关**立刻**变（2026-09-18 实测反馈：原来要再点一下才变）
 
 跑法：用**应用自己的解释器**跑：
     "%LOCALAPPDATA%\\Programs\\Python\\Python314\\python.exe" test_map_offline.py
@@ -67,6 +68,11 @@ def no_net(label):
 
 def online(v):
     mt.online = lambda: v
+
+
+# ⚠️ 上面那个 online() 会把 mt.online 整个换掉，后面想验"真实的开关读取 + 缓存"
+#    就得留着原函数 —— 不然测的是自己的替身。
+_REAL_ONLINE = mt.online
 
 
 def data_files():
@@ -184,6 +190,55 @@ def main():
         check("换成了「高德 key」入口", "amapKeyBtn" in html)
     except OSError:
         check("能读到前端页面", False, idx)
+
+    # ------------------------------------------------------------------
+    print()
+    print("【5】地图按钮必须跟着「联网」开关**立刻**变（2026-09-18 实测反馈）")
+    # 现象：关掉联网后按钮不立刻变暗，非要再点它一下才变 —— 看着像按钮坏了。
+    # 根因有两个：① 前端只靠 45 秒轮询；② 后端 online() 有 2 秒小缓存。
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        js = io.open(os.path.join(root, "frontend", "app.js"),
+                     encoding="utf-8").read()
+        check("关/开「联网」时立刻同步地图按钮（不再等 45 秒轮询）",
+              "await refreshAmapState(on);" in js)
+        check("重新打开「联网」时会强制重新校验一次 key（?force=1）",
+              'amap_status" + (force ? "?force=1" : "")' in js)
+    except OSError:
+        check("能读到 frontend/app.js", False, root)
+
+    try:
+        css = io.open(os.path.join(root, "frontend", "style.css"),
+                      encoding="utf-8").read()
+        seg = css.split(".pill-btn.on {", 1)[1].split("}", 1)[0]
+        check("「高德 key」亮起态与顶栏其它开关同族（复用 accent 配色）",
+              "var(--accent)" in seg and "box-shadow" not in seg)
+        check("它不再靠降低透明度装\"暗\"（其它开关都没这招）",
+              ".pill-btn { opacity" not in css)
+        check("样式里没有引用**未定义**的变量 --line",
+              "var(--line)" not in css)
+    except (OSError, IndexError):
+        check("能读到 frontend/style.css 且含 .pill-btn.on", False, root)
+
+    # 2 秒在线状态小缓存：改完配置必须**立刻**能看到新值
+    # （这里必须用**真实的** online，不是上面那个替身）
+    mt.online = _REAL_ONLINE
+    from backend import config as C
+    C.save_config(dict(C.load_config(), web_enabled=True))
+    check("开关打开后 online() = True", mt.online() is True)
+    C.save_config(dict(C.load_config(), web_enabled=False))   # 此刻缓存是"热"的
+    check("（这 2 秒缓存正是\"按钮愣一下\"的根源）缓存期内仍返回旧值",
+          mt.online() is True)
+    mt.invalidate_online()
+    check("invalidate_online() 后立刻读到新值 → 按钮能马上变暗",
+          mt.online() is False)
+    try:
+        main_src = io.open(os.path.join(root, "backend", "main.py"),
+                           encoding="utf-8").read()
+        check("保存配置的接口里调了 invalidate_online()",
+              "_mt.invalidate_online()" in main_src)
+    except OSError:
+        check("能读到 backend/main.py", False, root)
 
     print()
     print("=" * 64)

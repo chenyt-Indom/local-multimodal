@@ -1063,6 +1063,14 @@ def update_config(body: dict):
         if k in config.DEFAULT_CONFIG:
             merged[k] = v
     config.save_config(merged)
+    # ⚠️ 「联网」开关刚可能被改过 → 立刻丢掉地图模块里那个 2 秒的在线状态小缓存。
+    #    不然用户点完开关、前端紧接着来问"现在联网吗"，还可能拿到改之前的答案，
+    #    表现就是地图按钮 / 底图要愣一下才跟着变。
+    try:
+        from . import map_tools as _mt
+        _mt.invalidate_online()
+    except Exception:
+        pass
     return {"ok": True, "config": merged}
 
 

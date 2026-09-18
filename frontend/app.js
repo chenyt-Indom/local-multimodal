@@ -510,15 +510,24 @@
   //    不声不响地失效 —— 用户只会觉得"地图怎么突然变难用了"，根本不知道原因。
   let _amapState = null;          // 上一次的状态，用来判断"刚刚变坏了"
   let _amapSelfAction = false;    // 刚才是用户自己点的连接/断开 —— 那是主动行为，别报警
-  async function refreshAmapState() {
+  let _amapSeq = 0;               // 请求序号：只认最后一次发出的那个请求的结果
+  // force=true 时走 `?force=1`：**无视后端缓存、真调一次高德**。
+  // 用在两个地方：① 用户刚把「联网」打开（那时必须重新确认 key 通不通）；
+  //              ② 面板上的「重新验证」按钮。
+  async function refreshAmapState(force) {
     const btn = document.getElementById("amapKeyBtn");
     if (!btn) return null;
+    const seq = ++_amapSeq;
     let s = null;
     try {
-      s = await api("/api/map/amap_status");
+      s = await api("/api/map/amap_status" + (force ? "?force=1" : ""));
     } catch (e) {
       return null;                // 读不到就别瞎标，保持现状
     }
+    // ⚠️ 期间又发起了更新的请求（比如用户连着拨了两次「联网」开关）→
+    //    这一份已经过期，丢掉。不加这个守卫的话，先发的慢请求**后到**，
+    //    会把界面刷回旧状态，看着就是"按钮没跟上开关"。
+    if (seq !== _amapSeq) return null;
     const prev = _amapState;
     _amapState = s;
     // ⚠️ 关掉「联网」开关时，高德**根本用不了**（一个请求都发不出去），
@@ -534,8 +543,9 @@
     //   **联网关掉**      → 变暗（也不能报红）
     btn.classList.toggle("on", online && !!s.ok);
     btn.classList.toggle("bad", armed && !s.ok);
-    btn.textContent = (online && s.ok) ? "高德 key ✓"
-                    : (armed ? "高德 key !" : "高德 key");
+    // 文字保持固定，状态靠**颜色 + 右上角标记**表达（●=可用 / !=异常）——
+    // 这样它和顶栏其它开关长得一样，不再是一个"跳出来"的按钮。
+    btn.textContent = "高德 key";
     btn.title = !online
       ? "离线模式：高德用不了 —— 先打开顶栏的「联网」开关"
       : (s.ok
@@ -948,8 +958,16 @@
       p.classList.toggle("on");
       await saveToggles();
       if (key === "web_enabled") {
-        showToast(p.classList.contains("on") ? "已开启联网模式" : "已关闭联网模式",
-                  p.classList.contains("on") ? "ok" : "");
+        const on = p.classList.contains("on");
+        showToast(on ? "已开启联网模式" : "已关闭联网模式", on ? "ok" : "");
+        // ⚠️ 联网开关一变，高德**还能不能用**这件事就立刻变了 ——
+        //    必须**马上**同步地图按钮，等 45 秒轮询是不行的：
+        //    实测用户关了联网后按钮还亮着，非要点它一下才变暗，
+        //    看着就像"这个按钮坏了"。
+        //    关掉时不必重新验证（离线必然用不了）；打开时要 force 一次，
+        //    真确认 key 还好使，没问题才重新亮起。
+        //    （app.js 整个包在一个 IIFE 里，直接调即可。）
+        await refreshAmapState(on);
       }
       // 开启"本地算代码"是**有风险的操作**，必须明确说清而不是默默打开
       if (key === "code_exec_enabled" && p.classList.contains("on")) {

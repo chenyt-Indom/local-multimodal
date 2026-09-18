@@ -945,7 +945,7 @@ body.dragging .drop-overlay,
 
 /* 运行目标下拉：藏在工具栏里，和 VS Code 的终端各司其职 */
 .studio-runsel { max-width: 190px; height: 26px; font-size: 12px;
-  background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+  background: var(--panel2); color: var(--text); border: 1px solid var(--border);
   border-radius: 6px; padding: 0 6px; }
 
 
@@ -1186,58 +1186,65 @@ body.dark .map-weather { color: #a8b5c4; }
 body.dark .map-note { color: #d0b070; }
 
 /* ---------- 高德 key 面板（顶栏「高德 key」按钮打开） ---------- */
+/* ⚠️ 这一整块以前是按"浅色主题"写的一半 + 一堆 `body.dark ...` 覆盖，
+   但这个应用**根本没有浅色主题**（body 上永远不会加 dark 类），
+   于是那些覆盖全是死代码，实际生效的是浅色值 ——
+   表现就是深色弹窗里突然出现一个**浅灰底、深灰字**的只读框，非常突兀。
+   现在直接按深色主题写死，把死规则清掉。 */
 .amap-state {
-  margin-top: 10px; font-size: 12.5px; color: #6b7684;
+  margin-top: 10px; font-size: 12.5px; color: var(--muted);
 }
+.amap-state.ok { color: #57c98a; font-weight: 600; }
+.amap-state.bad { color: #ff8a7a; font-weight: 600; }
 .amap-input {
   width: 100%; box-sizing: border-box; margin-top: 8px;
-  padding: 9px 10px; border: 1px solid var(--line); border-radius: 7px;
-  background: var(--panel); color: var(--text);
+  padding: 9px 10px; border: 1px solid var(--border); border-radius: 7px;
+  background: var(--panel2); color: var(--text);
   font-size: 13px; font-family: Consolas, Menlo, monospace; letter-spacing: .3px;
 }
 .amap-input:focus { outline: none; border-color: var(--accent); }
 .amap-msg { margin-top: 9px; font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; }
-.amap-msg.ok { color: #1e7f45; }
-.amap-msg.bad { color: #c0392b; }
+.amap-msg.ok { color: #57c98a; }
+.amap-msg.bad { color: #ff8a7a; }
 /* 只填一个字段的场景：不留那一行多余的编号/留白 */
 .ask-layer.ask-free-mode .ask-q { font-size: 12.5px; color: #6b7684; margin-bottom: 6px; }
 
-/* 「高德 key」按钮的三种状态：可用=亮绿 / 异常=暗+红 / 未配置=普通 */
+/* 「高德 key」入口按钮：**外观与顶栏其它 .pill 同族**，只在"状态"上做区分 ——
+   亮=可用 / 红边=异常 / 和其它开关一样的暗=未配置·已断开·离线。
+   ⚠️ 原来它自带绿色边框 + 深绿底 + 发光，夹在一排灰蓝药丸里像贴上去的，太突兀；
+   改成复用 `.pill.on` 那套配色（蓝边 + #1c2947 底）就融进去了。 */
 .pill-btn.on {
   color: var(--text);
-  border-color: var(--green);
-  background: #14291d;
-  box-shadow: 0 0 7px rgba(63, 185, 80, .35);
+  border-color: var(--accent);
+  background: #1c2947;
 }
-.pill-btn.on::after { content: "●"; color: var(--green); margin-left: 5px; font-size: 10px; }
+.pill-btn.on::after { content: "●"; color: var(--green); margin-left: 5px; font-size: 9px; }
 .pill-btn.bad {
   color: #ffb4a8;
-  border-color: #7a3b32;
-  background: #2a1a17;
-  opacity: .92;
+  border-color: #6d3a33;
+  background: var(--panel2);
 }
-.pill-btn.bad::after { content: "!"; color: #ff7b6b; margin-left: 5px; font-weight: 700; }
-.pill-btn { opacity: .72; }                 /* 默认（未配置）是暗的 */
-.pill-btn.on, .pill-btn.bad { opacity: 1; }
-/* 面板里的状态行 */
-.amap-state.ok { color: #1e7f45; font-weight: 600; }
-.amap-state.bad { color: #c0392b; font-weight: 600; }
-body.dark .amap-state.ok { color: #57c98a; }
-body.dark .amap-state.bad { color: #ff8a7a; }
+.pill-btn.bad::after { content: "!"; color: #ff7b6b; margin-left: 5px; font-weight: 700; font-size: 11px; }
+/* ⚠️ `button.pill-btn:hover` 的优先级比 `.pill-btn.bad` 高，会把异常的红边冲成蓝色，
+   这里补回来，免得"有故障"的按钮一悬停就看着正常了。 */
+button.pill-btn.bad:hover { border-color: #8a463c; }
+/* 面板里的状态行 -- 配色见上面 `.amap-state` 那段（深色主题专用值） */
 
 /* ---------- 高德 key 面板：只读展示 + 「更改 API」 ---------- */
 .amap-keyrow { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
-.amap-keyrow .amap-input { flex: 1; margin-top: 0; }
-/* 只读的 key 框：视觉上要让人看出"这里改不了" */
-.amap-input[readonly] { background: #f4f6f8; color: #4a5563; cursor: default; }
-body.dark .amap-input[readonly] { background: #1a2029; color: #b9c4d0; }
-.amap-change { white-space: nowrap; }
+.amap-keyrow .amap-input { flex: 1 1 auto; width: auto; min-width: 0; margin-top: 0; }
+/* 只读的 key 框：比可编辑的再暗一档，让人一眼看出"这里改不了" */
+.amap-input[readonly] { background: #12151b; color: #b9c4d0; cursor: default; }
+/* ⚠️ 这一行必须显式压掉 `.btn { width: 100% }`：否则放进 flex 行里，
+   按钮的基准宽度就是"整行"（实测 612px），把只读的 key 输入框挤成 22px —— 
+   打开面板只能看到一个近乎空的框和一条撑满的按钮。 */
+.amap-change { white-space: nowrap; flex: 0 0 auto; width: auto; }
 .amap-edit { margin-top: 10px; }
-.amap-edit-hint { font-size: 12.5px; color: #8a6d3b; line-height: 1.55; margin-bottom: 7px; }
+.amap-edit-hint { font-size: 12.5px; color: #d9a441; line-height: 1.55; margin-bottom: 7px; }
 .amap-newinput {
   width: 100%; box-sizing: border-box; padding: 9px 10px;
   border: 1px solid var(--accent); border-radius: 7px;
-  background: var(--panel); color: var(--text);
+  background: var(--panel2); color: var(--text);
   font-size: 13px; font-family: Consolas, Menlo, monospace; letter-spacing: .3px;
 }
-.amap-newinput:focus { outline: none; box-shadow: 0 0 0 2px rgba(46, 117, 182, .25); }
+.amap-newinput:focus { outline: none; box-shadow: 0 0 0 2px rgba(79, 139, 249, .25); }
