@@ -279,6 +279,22 @@ def weather_at(lat: float, lon: float) -> dict:
         return {}
 
 
+def _rel_day(ds: str) -> str:
+    """把日期写成「今天 / 明天 / 后天 / N天后」。
+
+    ⚠️ 必须按**真实日期**算，不能按列表位置，也不能靠"等于今天就是今天、否则明天"猜。
+       实测踩过：跨 2 天以上的长途会被错说成「明天」；而 `pick_day` 找不到日期时
+       会退回第一条（今天），这时若还标「明天」，数据和标签就自相矛盾了。
+    """
+    try:
+        d = time.strptime(str(ds or "")[:10], "%Y-%m-%d")
+    except Exception:
+        return ""
+    t = time.strptime(time.strftime("%Y-%m-%d"), "%Y-%m-%d")
+    delta = int((time.mktime(d) - time.mktime(t)) / 86400.0 + 0.5)
+    return {0: "今天", 1: "明天", 2: "后天"}.get(delta) or ("%d天后" % delta if delta > 0 else "")
+
+
 def pick_day(daily: list, when) -> dict:
     """从逐日预报里挑出 `when` 那一天的（按日期字符串匹配；找不到就用第一条）。"""
     rows = daily or []
@@ -707,13 +723,15 @@ def _shape(routes: list, best: int, m: str, a: dict, b: dict,
             now_ts = time.time()
             arrive_ts = now_ts + float(b_rt.get("duration_s") or 0)
             arrive_date = time.strftime("%Y-%m-%d", time.localtime(arrive_ts))
-            today = time.strftime("%Y-%m-%d", time.localtime(now_ts))
+            # ⚠️ 标签按**选中的那条数据自己的日期**算（见 _rel_day 的注释）：
+            #    pick_day 找不到时会退回今天那条，此时若还写"明天"就自相矛盾。
+            _picked = pick_day(wt.get("daily"), arrive_date)
             res["weather"] = {
                 "from": {"name": a.get("name"), "now": wf.get("now") or {},
                          "src": wf.get("src") or ""},
                 "to": {"name": b.get("name"),
-                       "day": pick_day(wt.get("daily"), arrive_date),
-                       "day_label": "今天" if arrive_date == today else "明天",
+                       "day": _picked,
+                       "day_label": _rel_day((_picked or {}).get("date")) or "当天",
                        "src": wt.get("src") or ""},
             }
     return res

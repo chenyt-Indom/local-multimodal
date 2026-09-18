@@ -671,9 +671,13 @@ def live(adcode: str) -> dict:
     """实况天气（气象站观测，约每小时更新）。"""
     d = _get("/weather/weatherInfo", city=str(adcode), extensions="base")
     lives = (d or {}).get("lives") or []
-    if not lives:
+    # ⚠️ **不能直接取 lives[0]**：实测高德对港澳台的区级 adcode（如香港 810100）
+    #    回的是 `"lives": [[]]` —— 一个**空 list**，调 .get() 会直接抛 AttributeError。
+    #    （那种情况上层会把它报成"天气查询失败：'list' object has no attribute 'get'"，
+    #     等于把数据源的空档暴露成程序错误。）这里挑第一个真正的字典。
+    x = next((i for i in lives if isinstance(i, dict)), None)
+    if not x:
         return {}
-    x = lives[0]
     return {"desc": x.get("weather") or "", "temp": _num(x.get("temperature")),
             "humidity": _num(x.get("humidity")),
             # ⚠️ 高德的"风"是**风向 + 风力等级**（"东≤3"），不是 km/h，别当风速用
@@ -686,7 +690,9 @@ def forecast(adcode: str) -> list:
     """逐日预报（今天起 4 天）。白天/夜间天气不一样就写成「晴转多云」。"""
     d = _get("/weather/weatherInfo", city=str(adcode), extensions="all")
     casts = (d or {}).get("forecasts") or []
-    rows = (casts[0].get("casts") if casts else []) or []
+    # 同 live()：逐层挑字典，别假设结构（港澳台这里直接没有 forecasts）。
+    c0 = next((i for i in casts if isinstance(i, dict)), None)
+    rows = [x for x in ((c0.get("casts") if c0 else []) or []) if isinstance(x, dict)]
     out = []
     for x in rows:
         dw, nw = x.get("dayweather") or "", x.get("nightweather") or ""
@@ -742,13 +748,24 @@ def weather(city: str, days: int = 3) -> dict:
         # 高德偶尔给一条**空壳记录**（实测香港：有 city 没气温没天气），
         # 别把它当成"实况"，否则界面上会出现「实况  ℃」这种半截话。
         lv = {}
-    want = max(1, min(int(days or 3), 16))
+    # ⚠️ 下限 3：days 是"从今天起共几天"，模型很容易把它当成"我要哪一天"
+    #    而填 1（用户问"明天"时尤其容易），那样会把明天整条截掉 —— 实测踩过。
+    want = max(3, min(int(days or 3), 16))
     dl = forecast(ad)
     if not dl:
         dl = forecast(_city_adcode(ad))
     dl = dl[:want]
     if not lv and not dl:
-        return {"ok": False, "error": "高德没返回天气数据"}
+        # 港澳台：高德（中国气象局数据）**目前没有覆盖** —— 实测（2026-09-18）
+        #   香港区级 810100 回 `"lives": [[]]`（空 list），810000 的实况是只有
+        #   province/city/adcode 的空壳、`all`（预报）直接 `status=0 UNKNOWN_ERROR`。
+        #   这是数据源的覆盖范围问题，如实说明原因，别含糊成"查不到"。
+        #   （⚠️ 措辞注意：港澳台是**中国的一部分**，只是数据暂未覆盖。）
+        if str(ad).startswith(("81", "82", "71")):
+            return {"ok": False,
+                    "error": ("中国气象局的数据（经高德）**暂未覆盖港澳台地区**，"
+                              "所以查不到「%s」的天气。国内其他城市可以正常查。" % q)}
+        return {"ok": False, "error": "高德没返回「%s」的天气数据" % q}
     cur = {}
     if lv:
         cur = {"desc": lv["desc"], "temp": lv["temp"], "humidity": lv["humidity"],

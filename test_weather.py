@@ -16,6 +16,8 @@
     而且要在**最前面**写明"本次没有这些数据"（否则模型会自己编）
   · 地图卡片：出发地此刻（实况）+ 抵达**那天**的预报，都来自气象局
   · 源码里**一个 open-meteo 的 URL 都不许有**
+  · ⚠️ 用户问「明天/后天」时**绝不能**因为模型把 days 填小了而丢掉那天
+    （实测 bug：模型填 days=1 → 老实现从今天起截断 → 明天整条消失）
 
 跑法（用应用自己的解释器）：
     "%LOCALAPPDATA%\\Programs\\Python\\Python314\\python.exe" test_weather.py
@@ -42,6 +44,7 @@ from backend import web_tools as W      # noqa: E402
 from backend import config as C         # noqa: E402
 from backend import map_tools as mt     # noqa: E402
 from backend import amap as A           # noqa: E402
+from backend import tools as T          # noqa: E402
 
 PASS = 0
 FAIL = []
@@ -106,6 +109,30 @@ def main():
               (r.get("error") or "")[:44])
 
     print()
+    print("【2.5】港澳台：数据源没覆盖，要**说清是覆盖问题**，且不许崩")
+    # 实测（2026-09-18）：香港区级 810100 回 `"lives": [[]]`（空 list，直接取 [0] 会
+    # AttributeError）、810000 的实况是空壳、`all`（预报）直接 status=0 UNKNOWN_ERROR。
+    # 也就是高德**根本不提供**港澳台的天气 —— 要说清是数据覆盖问题，
+    # 而不是笼统的"查不到"，更不能把内部异常抛给用户。
+    for q in ["香港", "澳门", "台北"]:
+        r = W.weather(q, 3)
+        check("「%s」如实说明数据未覆盖" % q,
+              (not r.get("ok")) and ("覆盖" in (r.get("error") or "")),
+              (r.get("error") or "")[:52])
+        check("「%s」没说成「境外」（港澳台是中国的一部分）" % q,
+              "境外" not in (r.get("error") or ""))
+    try:
+        empty = A.live("810100")
+        check("空结构（lives 为 [[]]）不会抛异常", empty == {}, str(empty))
+    except Exception as e:
+        check("空结构（lives 为 [[]]）不会抛异常", False, "抛了 %s" % e)
+    try:
+        A.forecast("810100")
+        check("预报接口返回错误码时也不抛异常", True)
+    except Exception as e:
+        check("预报接口返回错误码时也不抛异常", False, "抛了 %s" % e)
+
+    print()
     print("【3】没配 key → 如实让用户去配，**绝不回退到别的数据源**")
     set_cfg(amap_key="")
     CALLS.clear()
@@ -138,6 +165,11 @@ def main():
           txt.splitlines()[0][:42])
     check("点名了体感温度/降水概率",
           "体感温度" in txt.splitlines()[0] and "降水概率" in txt.splitlines()[0])
+    # 实测踩过：模型问"明天天气"时把**实况的湿度**搬进了"明天的预报"。
+    # 逐日预报里根本没有湿度/风力这两项，搬过去就是编。
+    check("实况那行写明了「只代表此刻、不是某天的预报」",
+          "此刻实况" in txt and "任何一天的预报" in txt,
+          [l.strip()[:44] for l in txt.splitlines() if "此刻实况" in l])
 
     print()
     print("【6】高德只有 4 天：要 6 天也只给 4 天，并且说清楚")
@@ -145,6 +177,41 @@ def main():
     n = len(w.get("daily") or [])
     check("最多给 4 天", n == 4, "%d 天" % n)
     check("说明里讲了只有 4 天", "4 天" in (w.get("note") or ""), (w.get("note") or "")[-30:])
+
+    print()
+    print("【6.5】问「明天」绝不能被 days 参数截掉（2026-09-18 用户实测踩到的 bug）")
+    # 现象：用户问「明天汕头天气」，回答却说"本次返回结果中仅显示今日信息"。
+    # 根因：模型把 days 理解成"我要哪一天"，填了 1；而实现是**从今天起截断**，
+    #       正好把用户要的明天砍掉。数据源本来就返回 4 天，截断纯属自伤。
+    for d in (1, 0, 2):
+        txt = T.dispatch("get_weather", {"city": "汕头", "days": d}, [], {})
+        check("days=%s 时依然给出「明天」" % d, "（明天·" in txt,
+              [l.strip() for l in txt.splitlines() if "2026-" in l][:3])
+    txt = T.dispatch("get_weather", {"city": "汕头"}, [], {})
+    check("表头写明今天是几号（模型据此把 09-19 认成「明天」）", "今天是" in txt,
+          [l.strip() for l in txt.splitlines() if "今天是" in l][:1])
+    check("每条预报都带「今天/明天/后天·周几」",
+          "（今天·" in txt and "（明天·" in txt)
+    check("不会再冒出「没提供明天的预报」这种话", "没提供明天" not in txt)
+
+    from datetime import date as _d, timedelta as _td
+    t0 = _d.today()
+    check("标签按**真实日期**算（今天）", W._day_label(t0.strftime("%Y-%m-%d")).startswith("今天"),
+          W._day_label(t0.strftime("%Y-%m-%d")))
+    check("标签按**真实日期**算（明天）",
+          W._day_label((t0 + _td(days=1)).strftime("%Y-%m-%d")).startswith("明天"))
+    check("第 4 天不叫「第4天」，叫「3天后」",
+          W._day_label((t0 + _td(days=3)).strftime("%Y-%m-%d")).startswith("3天后"),
+          W._day_label((t0 + _td(days=3)).strftime("%Y-%m-%d")))
+    check("日期解析不了也不炸（返回空标签）", W._day_label("") == "")
+    # 地图卡的「抵达那天」是同一类错误的高发区：原来写的是
+    # "等于今天就是今天、否则明天" —— 跨 2 天以上会被错说成"明天"，
+    # 而 pick_day 找不到日期时退回今天那条，标签还会跟数据自相矛盾。
+    check("地图卡「抵达那天」标签按真实日期算",
+          mt._rel_day(t0.strftime("%Y-%m-%d")) == "今天"
+          and mt._rel_day((t0 + _td(days=2)).strftime("%Y-%m-%d")) == "后天"
+          and mt._rel_day((t0 + _td(days=5)).strftime("%Y-%m-%d")) == "5天后")
+    check("地图卡标签解析不了也不炸", mt._rel_day("") == "")
 
     print()
     print("【7】地图卡片：实况 + 抵达**那天**的预报，都来自气象局")

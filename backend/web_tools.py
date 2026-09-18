@@ -9,6 +9,7 @@
 import json
 import urllib.parse
 import urllib.request
+from datetime import date as _date, datetime as _dt
 
 WEB_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -640,7 +641,11 @@ def weather(city: str, days: int = 3) -> dict:
     查不到时 ok=False，`error` 里写清楚为什么（没配 key / 境外 / 高德没有这个地名的数据）。
     ⚠️ **不回退到任何其它源**（用户明确要求）。
     """
-    days = max(1, min(int(days or 3), 16))
+    # ⚠️ 下限是 3，不是 1。实测踩过（2026-09-18）：用户问"明天汕头天气"，
+    #    模型把 days 传成了 1（它理解成"我要 1 天的数据"），而下面是**从今天起**截断，
+    #    结果正好把用户要的明天砍掉，模型只好回"本次没提供明天的预报"。
+    #    数据源一次请求本来就返回 4 天，多留两行**零成本**，所以把下限兜住。
+    days = max(3, min(int(days or 3), 16))
     if not _online():
         # 查天气必须联网。关着「联网」还去发请求，等于偷偷联网 —— 与开关的约定不符。
         return {"ok": False,
@@ -678,6 +683,29 @@ def _fmt_n(v) -> str:
     return ("%d" % f) if abs(f - round(f)) < 0.05 else ("%.1f" % f)
 
 
+_WD_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
+def _day_label(ds: str) -> str:
+    """把日期写成「今天·周五」这样的标签。
+
+    ⚠️ 必须**按真实日期算**，不能按列表下标（原来是 `["今天","明天","后天"][i]`）。
+       下标算法一旦错位就全错 —— 比如某天数据少了一条、或首条不是今天
+       （跨零点、数据源延迟都可能），模型就会**把明天说成今天**。
+       日期算出来的标签永远和真实日历一致。
+    """
+    try:
+        d = _dt.strptime(str(ds or "")[:10], "%Y-%m-%d").date()
+    except Exception:
+        return ""
+    wd = _WD_CN[d.weekday()]
+    delta = (d - _date.today()).days
+    rel = {0: "今天", 1: "明天", 2: "后天"}.get(delta)
+    if rel is None and delta > 0:
+        rel = "%d天后" % delta
+    return (rel + "·" + wd) if rel else wd
+
+
 def format_weather(w: dict) -> str:
     """把天气数据格式化成给模型看的紧凑文本。
 
@@ -691,8 +719,13 @@ def format_weather(w: dict) -> str:
     where = w.get("city") or ""
     if w.get("admin"):
         where += "（%s）" % w["admin"]
+    # ⚠️ 表头必须把**今天是几号**写出来：模型回答「明天/后天」时得先知道今天。
+    #    实测用户问"明天汕头天气"，模型看到逐日里有 2026-09-19 却不敢认它就是"明天"，
+    #    自己脑补出"本次没提供明天的预报"。给了锚点它才能对上号。
     lines = ["【%s 天气】数据源：%s　坐标 %.2f,%.2f"
-             % (where, w.get("source", ""), w.get("lat") or 0, w.get("lon") or 0)]
+             % (where, w.get("source", ""), w.get("lat") or 0, w.get("lon") or 0),
+             "今天是 %s（%s）" % (_date.today().strftime("%Y-%m-%d"),
+                                  _WD_CN[_date.today().weekday()])]
     c = w.get("current") or {}
     if c:
         bits = []
@@ -712,11 +745,16 @@ def format_weather(w: dict) -> str:
         if c.get("report_time"):
             bits.append("观测时间 %s" % c["report_time"])
         if bits:
-            lines.append("当前：" + "，".join(bits))
+            # ⚠️ 标题必须写明"只代表此刻、不是某天的预报"：实测（2026-09-18）模型问
+            #    "明天天气"时，把这里的**湿度 72%** 直接搬进了"明天的预报"里 ——
+            #    湿度/风力这些实况字段高德的逐日预报**没有**，搬过去就是编。
+            lines.append("**此刻实况**（只代表现在这一刻，**不是**任何一天的预报）："
+                         + "，".join(bits))
     lines.append("逐日预报：")
-    for i, d in enumerate(w.get("daily") or []):
-        tag = ["今天", "明天", "后天"][i] if i < 3 else f"第{i+1}天"
-        seg = ["%s（%s）%s" % (d.get("date", ""), tag, d.get("desc", ""))]
+    for d in (w.get("daily") or []):
+        tag = _day_label(d.get("date"))
+        seg = ["%s%s %s" % (d.get("date", ""),
+                            ("（%s）" % tag) if tag else "", d.get("desc", ""))]
         if d.get("low") is not None or d.get("high") is not None:
             seg.append("%s~%s°C" % (_fmt_n(d.get("low")), _fmt_n(d.get("high"))))
         if d.get("rain_pct") is not None:
