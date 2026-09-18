@@ -1224,3 +1224,20 @@ body.dark .map-note { color: #d0b070; }
 .amap-state.bad { color: #c0392b; font-weight: 600; }
 body.dark .amap-state.ok { color: #57c98a; }
 body.dark .amap-state.bad { color: #ff8a7a; }
+
+/* ---------- 高德 key 面板：只读展示 + 「更改 API」 ---------- */
+.amap-keyrow { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+.amap-keyrow .amap-input { flex: 1; margin-top: 0; }
+/* 只读的 key 框：视觉上要让人看出"这里改不了" */
+.amap-input[readonly] { background: #f4f6f8; color: #4a5563; cursor: default; }
+body.dark .amap-input[readonly] { background: #1a2029; color: #b9c4d0; }
+.amap-change { white-space: nowrap; }
+.amap-edit { margin-top: 10px; }
+.amap-edit-hint { font-size: 12.5px; color: #8a6d3b; line-height: 1.55; margin-bottom: 7px; }
+.amap-newinput {
+  width: 100%; box-sizing: border-box; padding: 9px 10px;
+  border: 1px solid var(--accent); border-radius: 7px;
+  background: var(--panel); color: var(--text);
+  font-size: 13px; font-family: Consolas, Menlo, monospace; letter-spacing: .3px;
+}
+.amap-newinput:focus { outline: none; box-shadow: 0 0 0 2px rgba(46, 117, 182, .25); }

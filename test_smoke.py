@@ -176,6 +176,16 @@ def main():
     h2 = A.check_health(force=True, online=True)
     check("配了但不可用时 configured=True 且 ok=False（前端据此变暗）",
           h2["configured"] is True and h2["ok"] is False, h2["key_hint"])
+    # 断开：**key 必须留着**（用户明确要求"断开后不用重新输入"）
+    C.save_config(dict(C.load_config(), amap_key="a" * 32, amap_enabled=False))
+    check("断开后 key 还在（stored_key 非空）", bool(A.stored_key()))
+    check("断开后 key() 返回空 → 全链路自动退回 OSM", A.key() == "")
+    h3 = A.check_health(force=True, online=True)
+    check("断开状态：configured=True 且 enabled=False（前端按钮据此变暗）",
+          h3["configured"] is True and h3["enabled"] is False, h3["message"])
+    C.save_config(dict(C.load_config(), amap_enabled=True))
+    h4 = A.check_health(force=True, online=True)
+    check("重新连接后 enabled 回来", h4["enabled"] is True)
     A.invalidate_health()
 
     # ---------------- ⑤ 跑着的应用（HTTP） ----------------

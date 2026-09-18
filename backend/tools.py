@@ -2781,7 +2781,8 @@ def _amap_broken_prefix() -> str:
         h = _am.check_health(online=True)
     except Exception:
         return ""
-    if not h.get("configured") or h.get("ok"):
+    # 没配 / 用户主动断开 / 正常 → 都不用报警
+    if not h.get("configured") or not h.get("enabled", True) or h.get("ok"):
         return ""
     msg = h.get("message") or "原因未知"
     return ("⚠️⚠️ **先跟用户说这件事**：他的高德 key 现在**用不了**（%s）——"
@@ -2802,7 +2803,8 @@ def _amap_nudge(net: bool) -> str:
         return ""
     try:
         from . import amap as _am
-        if _am.has_key():
+        # ⚠️ 用 has_stored_key：用户**主动断开**时 key 还在，就别再催他填了
+        if _am.has_stored_key():
             return ""
     except Exception:
         return ""
@@ -2833,7 +2835,7 @@ def _ask_amap_key_once(context, net: bool) -> str:
         return ""
     try:
         from . import amap as _am
-        if _am.has_key():
+        if _am.has_stored_key():
             return ""
     except Exception:
         return ""

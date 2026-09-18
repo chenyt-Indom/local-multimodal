@@ -33,13 +33,46 @@ _UA = "local-multimodal-assistant/1.0"
 
 
 # ---------------------------------------------------------------- key
-def key() -> str:
-    """读配置里的高德 key。没配就返回空串 —— 调用方据此**自动回退**到 OpenStreetMap。"""
+def stored_key() -> str:
+    """配置里**存着**的 key（不管有没有断开）。
+
+    和 `key()` 的区别很重要：断开只是"不用它"，key 本身要留着 ——
+    用户明确要求"断开后还要重新输一遍太麻烦"。
+    """
     try:
         from . import config
         return str(config.load_config().get("amap_key") or "").strip()
     except Exception:
         return ""
+
+
+def enabled() -> bool:
+    """高德总开关（界面上的「连接 / 断开」）。断开时 key 仍在，只是不生效。"""
+    try:
+        from . import config
+        return bool(config.load_config().get("amap_enabled", True))
+    except Exception:
+        return True
+
+
+def key() -> str:
+    """**当前实际可用**的 key：配了 + 没断开才返回，否则空串。
+
+    调用方据此自动回退到 OpenStreetMap —— 所以"断开"只要让这里返回空，
+    全链路（找地点 / 路线 / 周边 / 底图）就一起切回 OSM 了。
+    """
+    if not enabled():
+        return ""
+    return stored_key()
+
+
+def has_key() -> bool:
+    return bool(key())
+
+
+def has_stored_key() -> bool:
+    """配了 key 就算（哪怕现在是断开状态）—— 用来判断"要不要请用户填 key"。"""
+    return bool(stored_key())
 
 
 def has_key() -> bool:
@@ -108,26 +141,36 @@ def _key_hint(k: str) -> str:
 
 
 def check_health(force: bool = False, online: bool = True) -> dict:
-    """高德 key 当前可不可用。返回一个**给前端和模型看**的状态字典。
+    """高德当前处于什么状态。返回一个**给前端和模型看**的字典。
 
-    · configured：配置里有没有 key
-    · ok：真调过一次、确认可用
-    · message：给人看的一句话（不可用时说清原因）
+    四种状态（前端按钮就按这个分档）：
+      configured=False              → 没配过 key         → 按钮暗
+      configured=True, enabled=False → 用户主动**断开**   → 按钮暗（key 还在！）
+      enabled=True, ok=False         → 配了但**不可用**   → 按钮暗 + 红标
+      enabled=True, ok=True          → 正常              → 按钮**亮起**
+
+    · message：给人看的一句话（断开/不可用都说清原因）
     · checked_at / age_s：上次检测的时间与距今多少秒
     """
-    k = key()
+    st = stored_key()
     now = time.time()
-    if not k:
+    if not st:
         _HEALTH.update(ok=False, message="还没配高德 key", checked=now, key_hint="")
         return _health_dict(configured=False)
+    if not enabled():
+        # ⚠️ 断开是**用户主动的选择**，不是故障：不检测、也不报红，
+        #    而且要明确告诉他们"key 还留着"（不然会以为又要重输一遍）。
+        _HEALTH.update(ok=False, message="已断开（key 还留着，点「连接」就能恢复）",
+                       checked=now, key_hint=_key_hint(st))
+        return _health_dict(configured=True)
     if not online:
         # 离线模式不联网：保留上次结论，但不刷新（避免把"没网"误判成"key 坏了"）
         return _health_dict(configured=True, skipped="离线模式，暂不检测")
-    hint = _key_hint(k)
+    hint = _key_hint(st)
     same = (_HEALTH["key_hint"] == hint)
     ttl = _HEALTH_TTL_OK if _HEALTH["ok"] else _HEALTH_TTL_BAD
     if force or (not same) or (now - float(_HEALTH["checked"] or 0) > ttl):
-        ok, msg = verify_key(k)
+        ok, msg = verify_key(st)
         _HEALTH.update(ok=bool(ok), message=msg, checked=time.time(), key_hint=hint)
     return _health_dict(configured=True)
 
@@ -135,6 +178,7 @@ def check_health(force: bool = False, online: bool = True) -> dict:
 def _health_dict(configured: bool, skipped: str = "") -> dict:
     age = (time.time() - float(_HEALTH["checked"] or 0)) if _HEALTH["checked"] else None
     return {"configured": bool(configured),
+            "enabled": bool(enabled()),
             "ok": bool(_HEALTH["ok"]),
             "message": _HEALTH["message"] or "",
             "key_hint": _HEALTH["key_hint"] or "",

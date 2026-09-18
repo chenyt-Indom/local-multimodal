@@ -88,6 +88,9 @@ DEFAULT_CONFIG = {
     # ⚠️ 服务平台必须选「**Web 服务**」（选成"Web端(JS API)"是另一套 key，不能用）。
     # ⚠️ 别提交到仓库 —— config.json 已在 .gitignore 里。
     "amap_key": "",
+    # 高德**总开关**：断开时只是不用它（key 本身留着），不要清空 key ——
+    # 用户要求"断开后重新输入太麻烦"，所以断开 ≠ 删 key。
+    "amap_enabled": True,
     # RAG 每轮最多检索文档数
     "rag_top_k": 4,
     # 记忆每轮最多注入条数

@@ -509,6 +509,7 @@
   // ⚠️ 为什么要"持续检测"：key 会因为额度用满 / 控制台重置 / 服务端异常而
   //    不声不响地失效 —— 用户只会觉得"地图怎么突然变难用了"，根本不知道原因。
   let _amapState = null;          // 上一次的状态，用来判断"刚刚变坏了"
+  let _amapSelfAction = false;    // 刚才是用户自己点的连接/断开 —— 那是主动行为，别报警
   async function refreshAmapState() {
     const btn = document.getElementById("amapKeyBtn");
     if (!btn) return null;
@@ -520,23 +521,30 @@
     }
     const prev = _amapState;
     _amapState = s;
-
-    // 三种样子：可用（亮绿）/ 配了但不可用（暗 + 红点）/ 没配（暗）
+    const armed = !!(s.configured && s.enabled);   // 配了且是"连接"状态
+    // 四种样子：
+    //   可用          → 亮起（绿 + ●）
+    //   配了但不可用  → 变暗 + 红「!」
+    //   用户主动断开  → 变暗（key 还留着，不报红）
+    //   没配          → 变暗
     btn.classList.toggle("on", !!s.ok);
-    btn.classList.toggle("bad", !!s.configured && !s.ok);
-    btn.textContent = s.ok ? "高德 key ✓" : (s.configured ? "高德 key !" : "高德 key");
+    btn.classList.toggle("bad", armed && !s.ok);
+    btn.textContent = s.ok ? "高德 key ✓" : (armed ? "高德 key !" : "高德 key");
     btn.title = s.ok
-      ? ("已连接（" + (s.key_hint || "") + "）· 点一下查看或更换")
-      : (s.configured
-          ? ("⚠️ 当前不可用：" + (s.message || "原因未知") + " —— 点一下重新配置")
-          : "还没配高德 key。点一下配置：填了能搜到全国小店、有真实评分和实时路况");
+      ? ("已连接（" + (s.key_hint || "") + "）· 点一下查看、断开或更换 key")
+      : (armed
+          ? ("⚠️ 当前不可用：" + (s.message || "原因未知") + " —— 点一下处理")
+          : (s.configured
+              ? "已断开（key 还留着）· 点一下可以重新连接"
+              : "还没配高德 key。点一下配置：填了能搜到全国小店、有真实评分和实时路况"));
 
-    // ⚠️ 只在"从可用变成不可用"的那一下提醒，不是每次都弹
-    if (prev && prev.ok && !s.ok) {
-      showToast(s.configured
-        ? ("⚠️ 高德 key 现在用不了了：" + (s.message || "原因未知") +
-           "　点顶栏「高德 key」重配一下")
-        : "⚠️ 高德 key 已被清空，地图退回 OpenStreetMap 了", "warn");
+    // ⚠️ 只在"从可用变成不可用"的那一下提醒，不是每次都弹；
+    //    而且**用户自己点断开时不要弹**（那是他要的，不是故障）。
+    const self = _amapSelfAction;
+    _amapSelfAction = false;
+    if (!self && prev && prev.ok && !s.ok && s.enabled) {
+      showToast("⚠️ 高德 key 现在用不了了：" + (s.message || "原因未知") +
+                "　点顶栏「高德 key」处理一下", "warn");
     }
     return s;
   }
@@ -547,110 +555,172 @@
 
   // ⚠️ 地图**不做任何本地缓存**（2026-09-18 起），所以原来那个「地图缓存」按钮没了，
   //    换成这个 —— 它解决的才是真问题（新机器上没 key，地图只能退回 OpenStreetMap）。
+  //
+  // 面板的交互是按用户要求定的：
+  //   · **连接 / 断开** 是个开关：断开**不删 key**（"重新输入太麻烦"），只是不用它；
+  //   · 已经存下的 key **只读显示**，不能直接改；
+  //   · 要换 key 得点「更改 API」：输入新的 → 验证成功才替换旧的 → 失败则原 key 一字不动。
   async function showAmapKey() {
     if (document.querySelector(".amap-layer")) return;
     await refreshAmapState();                 // 先刷新一下，弹出来的状态才是准的
-    const st = _amapState || {};
-    let cur = "";
+    let full = "";
     try {
       const d = await api("/api/config");
-      cur = String(((d || {}).config || {}).amap_key || "");
-    } catch (e) { /* 读不到就当没配 */ }
-
-    let stateLine, stateCls;
-    if (st.ok) {
-      stateLine = "✅ 配置成功，正在使用（" + escapeHtml(st.key_hint || "") + "）";
-      stateCls = "ok";
-    } else if (st.configured === true) {
-      stateLine = "⚠️ 已配置但**当前不可用**：" + escapeHtml(st.message || "原因未知");
-      stateCls = "bad";
-    } else if (st.configured === false) {
-      stateLine = "未配置 —— 地图在用 OpenStreetMap（数据弱一些）";
-      stateCls = "";
-    } else {
-      // ⚠️ 拿不到状态时**必须说实话**。之前这里会掉进"未配置"分支，
-      //    把"读不到"说成"你没配"，用户会以为自己的 key 丢了（实测踩到）。
-      stateLine = "状态读取失败（后端没响应？）—— 下面的「连接并测试」可以直接重试";
-      stateCls = "bad";
-    }
+      full = String(((d || {}).config || {}).amap_key || "");
+    } catch (e) { /* 读不到就按没配处理，下面会说实话 */ }
 
     const layer = document.createElement("div");
     layer.className = "confirm-layer amap-layer";
     layer.innerHTML =
       '<div class="confirm-box">' +
       '<div class="confirm-title">🗺️ 高德地图</div>' +
-      '<div class="amap-state ' + stateCls + '">' + stateLine + '</div>' +
-      '<div class="confirm-reason">' +
+      '<div class="amap-state"></div>' +
+      '<div class="amap-keyrow">' +
+      '<input class="amap-input" type="text" readonly />' +
+      '<button class="btn ghost amap-change" type="button">更改 API</button>' +
+      '</div>' +
+      '<div class="amap-edit" style="display:none">' +
+      '<div class="amap-edit-hint">粘贴**新的** key。验证通过才会替换掉现在这个；' +
+      '验证不通过的话，原来的 key 不动。</div>' +
+      '<input class="amap-newinput" type="text" placeholder="把新的 32 位 key 粘贴在这里" />' +
+      '</div>' +
+      '<div class="confirm-reason amap-tip">' +
       '配了 key 之后，地图能搜到全国的小店、有真实评分、有实时路况和公交换乘，' +
-      '步行骑行也是真实路径。<br>不配也能用，退回 OpenStreetMap —— ' +
-      '能查大城市/道路/机场车站，但小店、评分、路况、公交都没有。<br><br>' +
+      '步行骑行也是真实路径。<br>断开或没配时退回 OpenStreetMap —— ' +
+      '能查大城市/道路/机场车站，但小店、评分、路况、公交都没有。<br>' +
       '申请（1 分钟）：console.amap.com → 手机号注册+实名 → 建应用 → 加 Key → ' +
       '<b>服务平台必须选「Web 服务」</b>（选成「Web 端(JS API)」用不了）。' +
       '</div>' +
-      '<input class="amap-input" type="text" placeholder="把 32 位 key 粘贴在这里"' +
-      (cur ? ' value="' + escapeHtml(cur) + '"' : "") + ' />' +
       '<div class="amap-msg"></div>' +
-      '<div class="confirm-btns">' +
-      '<button class="btn ghost" data-act="close">关闭</button>' +
-      (cur ? '<button class="btn ghost" data-act="clear">断开（改回 OpenStreetMap）</button>' : "") +
-      '<button class="btn primary" data-act="save">' +
-      (cur ? "重新连接并测试" : "连接并测试") + '</button>' +
-      '</div></div>';
+      '<div class="confirm-btns amap-btns"></div>' +
+      '</div>';
     document.body.appendChild(layer);
 
+    const stateEl = layer.querySelector(".amap-state");
     const input = layer.querySelector(".amap-input");
+    const newInput = layer.querySelector(".amap-newinput");
+    const editBox = layer.querySelector(".amap-edit");
+    const keyRow = layer.querySelector(".amap-keyrow");
+    const changeBtn = layer.querySelector(".amap-change");
+    const tipEl = layer.querySelector(".amap-tip");
     const msg = layer.querySelector(".amap-msg");
-    const btns = layer.querySelectorAll("button");
+    const btnsEl = layer.querySelector(".amap-btns");
     const say = (t, kind) => { msg.textContent = t; msg.className = "amap-msg " + (kind || ""); };
-    const busy = (on) => { btns.forEach((b) => { b.disabled = on; }); };
+    let editing = false;
 
-    async function save(key) {
-      busy(true);
-      say(key ? "正在连高德验证…" : "正在断开…", "");
-      try {
-        const r = await api("/api/map/amap_key", {
-          method: "POST", body: JSON.stringify({ key }) });
-        if (r && r.ok) {
-          say(r.message || "连接成功", "ok");
-          showToast(key ? "高德已连接，地图能力升级了" : "已断开高德，地图改回 OpenStreetMap",
-                    key ? "ok" : "warn");
-          await refreshAmapState();           // 按钮立刻跟着变亮/变暗
-          setTimeout(() => layer.remove(), 1600);
+    function render() {
+      const s = _amapState || {};
+      const armed = !!(s.configured && s.enabled);
+      let line, cls;
+      if (s.ok) {
+        line = "✅ 配置成功，正在使用（" + (s.key_hint || "") + "）"; cls = "ok";
+      } else if (armed) {
+        line = "⚠️ 已配置但**当前不可用**：" + (s.message || "原因未知"); cls = "bad";
+      } else if (s.configured) {
+        line = "⏸ 已断开 —— **key 还留着**，点「连接」就能恢复（不用重新输入）"; cls = "";
+      } else if (s.configured === false) {
+        line = "未配置 —— 地图在用 OpenStreetMap（数据弱一些）"; cls = "";
+      } else {
+        line = "状态读取失败（后端没响应？）—— 可以点「更改 API」直接重试"; cls = "bad";
+      }
+      stateEl.textContent = line;
+      stateEl.className = "amap-state " + cls;
+
+      // key 只读展示：有就显示完整 key（本地应用，方便核对）
+      input.value = s.configured ? full : "";
+      input.placeholder = s.configured ? "" : "（还没有配 key）";
+      changeBtn.style.display = editing ? "none" : "";
+      keyRow.style.display = editing ? "none" : "";
+      editBox.style.display = editing ? "" : "none";
+      tipEl.style.display = editing ? "none" : "";
+
+      let html = '<button class="btn ghost" data-act="close">关闭</button>';
+      if (editing) {
+        html += '<button class="btn ghost" data-act="cancel">取消</button>' +
+                '<button class="btn primary" data-act="save">验证并保存</button>';
+      } else {
+        if (s.configured) {
+          html += '<button class="btn ' + (s.enabled ? "ghost" : "primary") +
+                  '" data-act="toggle">' + (s.enabled ? "断开" : "连接") + '</button>';
         } else {
-          say((r && r.message) || "验证失败", "bad");
-          await refreshAmapState();           // 失败也可能是因为 key 本来就不对
+          html += '<button class="btn primary" data-act="change">填一个 key</button>';
+        }
+      }
+      btnsEl.innerHTML = html;
+
+      btnsEl.querySelector('[data-act="close"]').onclick = () => layer.remove();
+      const c = btnsEl.querySelector('[data-act="cancel"]');
+      if (c) c.onclick = () => { editing = false; say(""); render(); };
+      const t = btnsEl.querySelector('[data-act="toggle"]');
+      if (t) t.onclick = () => doToggle();
+      const ch = btnsEl.querySelector('[data-act="change"]');
+      if (ch) ch.onclick = () => { editing = true; say(""); render(); newInput.focus(); };
+      const sv = btnsEl.querySelector('[data-act="save"]');
+      if (sv) sv.onclick = () => doSave();
+      changeBtn.onclick = () => { editing = true; say(""); render(); newInput.focus(); };
+    }
+
+    async function doToggle() {
+      const s = _amapState || {};
+      const turnOn = !s.enabled;
+      btnsEl.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+      say(turnOn ? "正在连接…" : "正在断开…", "");
+      try {
+        const r = await api("/api/map/amap_toggle", {
+          method: "POST", body: JSON.stringify({ enabled: turnOn }) });
+        if (r && r.ok) {
+          _amapSelfAction = true;          // 这是我点的，别弹"key 用不了了"
+          await refreshAmapState();
+          say(r.message || (turnOn ? "已连接" : "已断开"), turnOn ? "ok" : "");
+          showToast(turnOn ? "高德已连接" : "已断开高德（key 还留着）",
+                    turnOn ? "ok" : "warn");
+        } else {
+          say((r && r.message) || "操作失败", "bad");
         }
       } catch (e) {
         say("连不上后端：" + String(e.message || e), "bad");
-      } finally { busy(false); }
+      } finally {
+        btnsEl.querySelectorAll("button").forEach((b) => { b.disabled = false; });
+        render();
+      }
     }
 
-    layer.querySelector('[data-act="close"]').onclick = () => layer.remove();
-    const clr = layer.querySelector('[data-act="clear"]');
-    if (clr) {
-      // ⚠️ 「断开」要**点两次**才生效。之前一点就清空、且毫无提示 ——
-      //    实测用户随手点一下，key 就没了，还以为是自己没配过（真的发生过）。
-      let armed = false;
-      clr.onclick = () => {
-        if (!armed) {
-          armed = true;
-          clr.textContent = "确定要断开？再点一次";
-          say("断开后地图会退回 OpenStreetMap（小店、评分、路况都没有）。" +
-              "想好了就再点一次那个按钮。", "bad");
-          return;
+    async function doSave() {
+      const v = (newInput.value || "").trim();
+      if (!v) { say("还没有填新的 key 呢。", "bad"); newInput.focus(); return; }
+      const old = input.value || "";
+      btnsEl.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+      say("正在连高德验证…（验证通过才会替换）", "");
+      try {
+        const r = await api("/api/map/amap_key", {
+          method: "POST", body: JSON.stringify({ key: v }) });
+        if (r && r.ok) {
+          _amapSelfAction = true;
+          const d = await api("/api/config").catch(() => null);
+          full = String((((d || {}).config || {}).amap_key) || v);
+          editing = false;
+          newInput.value = "";
+          await refreshAmapState();
+          say(r.message || "已改用新的 key", "ok");
+          showToast("高德 key 已更新", "ok");
+        } else {
+          // ⚠️ 失败时旧 key 必须原样不动 —— 把这句话说出来，用户才敢放心重试
+          say(((r && r.message) || "验证失败") +
+              "\n（原来的 key 没有被改动，还是 " + (old ? old.slice(0, 6) + "…" : "原来那个") + "）",
+              "bad");
         }
-        save("");
-      };
+      } catch (e) {
+        say("连不上后端：" + String(e.message || e), "bad");
+      } finally {
+        btnsEl.querySelectorAll("button").forEach((b) => { b.disabled = false; });
+        render();
+      }
     }
-    layer.querySelector('[data-act="save"]').onclick = () => {
-      const v = (input.value || "").trim();
-      if (!v) { say("还没有填 key 呢。", "bad"); input.focus(); return; }
-      save(v);
+
+    newInput.onkeydown = (e) => {
+      if (e.key === "Enter") { const b = btnsEl.querySelector('[data-act="save"]'); if (b) b.click(); }
     };
-    input.onkeydown = (e) => {
-      if (e.key === "Enter") layer.querySelector('[data-act="save"]').click();
-    };
-    input.focus();
+    render();
   }
   window.__showAmapKey = showAmapKey;
   window.__makeMapCard = makeMapCard;      // 导出一下，方便排查"地图没画出来"

@@ -1965,6 +1965,9 @@ def _amap_status_line() -> str:
         return (""
                 "  · 本机**还没配高德 key**：用户一用到地图就先调 connect_amap 请他填。"
                 "别直接说做不到，也别默默用着弱数据不吭声。\n")
+    if not h.get("enabled", True):
+        # 用户**主动断开**的：这是他自己的选择，别去劝、也别报警。
+        return ""
     if h.get("ok"):
         return ""
     return (""
@@ -3770,33 +3773,56 @@ def map_amap_status():
 
 @app.post("/api/map/amap_key")
 def set_amap_key(body: dict):
-    """设置高德 key：**先真调一次高德验证，通过了才保存**。
+    """**更改**高德 key：先真调一次高德验证，**通过了才覆盖旧的**。
 
-    为什么要先验证：用户复制 key 时很容易多带空格、或者复制错平台
-    （「Web端(JS API)」的 key 在服务端接口里是用不了的）。不验证的话，
-    他会以为配好了，结果地图一直悄悄退回 OpenStreetMap，还查不出原因。
-    这里宁可当场报错、把原因说清楚。
+    用户明确要求：apikey 不能直接改，得点「更改 API」走这个入口，
+    而且要"验证成功才能改、同时删掉原来的"。
+    所以这里：验证失败 → **原 key 一字不动**（不能改坏）；验证成功 → 覆盖（旧的即被替换）。
 
-    保存后**立刻生效**（配置每次现读，不用重启）。传空 key 则清除配置、退回 OSM。
+    ⚠️ **不接受空 key**。以前传空会直接清空配置 —— 实测被误点一次就把 key 弄丢了，
+    用户还以为自己没配过。要停用请走 `/api/map/amap_toggle`（断开），key 会留着。
+
+    保存后**立刻生效**（配置每次现读，不用重启），并自动置为「已连接」。
     """
     from . import amap as _am
     from . import config as _cfg
     key = str((body or {}).get("key") or "").strip()
     if not key:
-        cfg = _cfg.load_config()
-        cfg["amap_key"] = ""
-        _cfg.save_config(cfg)
-        _am.invalidate_health()
-        return {"ok": True, "cleared": True,
-                "message": "已清空高德 key，地图改回用 OpenStreetMap。"}
+        return {"ok": False,
+                "message": ("这里只能填一个**新的 key**。要临时不用高德，请用「断开」——"
+                            "断开不会删掉 key，随时点「连接」就能恢复。")}
     ok, msg = _am.verify_key(key)
     if not ok:
-        return {"ok": False, "message": msg}
+        return {"ok": False, "message": msg}          # 失败 → 旧 key 保持原样
     cfg = _cfg.load_config()
-    cfg["amap_key"] = key
+    cfg["amap_key"] = key                             # 覆盖 = 旧的就此删掉
+    cfg["amap_enabled"] = True                        # 换好就直接连上
     _cfg.save_config(cfg)
     _am.invalidate_health()      # 换了 key → 立刻重新检测，别等 15 分钟
-    return {"ok": True, "message": msg}
+    return {"ok": True, "message": "已改用新的 key：" + msg}
+
+
+@app.post("/api/map/amap_toggle")
+def toggle_amap(body: dict):
+    """**连接 / 断开**高德（不动 key）。
+
+    用户要求：断开时 key 要留着（"重新输入太麻烦"），断开后按钮变暗、
+    连接后按钮变亮。所以断开改的是 `amap_enabled`，不是 `amap_key`。
+    """
+    from . import amap as _am
+    from . import config as _cfg
+    on = bool((body or {}).get("enabled"))
+    cfg = _cfg.load_config()
+    if on and not _am.stored_key():
+        return {"ok": False,
+                "message": "还没配过高德 key，先点「更改 API」填一个。"}
+    cfg["amap_enabled"] = on
+    _cfg.save_config(cfg)
+    _am.invalidate_health()
+    return {"ok": True,
+            "message": ("已连接高德。" if on else
+                        "已断开高德，地图改回 OpenStreetMap（**key 还留着**，"
+                        "随时点「连接」就能恢复）。")}
 
 
 @app.get("/api/doclib/download")
