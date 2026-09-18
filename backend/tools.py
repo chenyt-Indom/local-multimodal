@@ -2769,6 +2769,27 @@ def _do_transit(route: dict, ui_events, net: bool) -> str:
             "\n· 上面这些线路、票价、换乘站都是高德返回的**真实数据**，可以照实说。")
 
 
+def _amap_broken_prefix() -> str:
+    """key 配了但**不可用**时，给工具结果**开头**加一句必须转告用户的话。
+
+    ⚠️ 为什么放开头：实测 qwen3-vl:8b 对"结果末尾的附注"基本视而不见，
+    但对开头的强指令会照做。key 坏了是用户**必须知道**的事 ——
+    不然他只看到"地图怎么变难用了"，永远不知道要去重配。
+    """
+    try:
+        from . import amap as _am
+        h = _am.check_health(online=True)
+    except Exception:
+        return ""
+    if not h.get("configured") or h.get("ok"):
+        return ""
+    msg = h.get("message") or "原因未知"
+    return ("⚠️⚠️ **先跟用户说这件事**：他的高德 key 现在**用不了**（%s）——"
+            "这次的结果只能退而用 OpenStreetMap 查，数据会弱一些。"
+            "请**在回答开头用一两句话提醒他**，并让他点界面顶栏的「高德 key」重新配置，"
+            "然后再讲结果。\n\n----------\n\n" % msg)
+
+
 def _amap_nudge(net: bool) -> str:
     """联网但没配高德 key 时，在工具结果末尾塞一句强提醒。
 
@@ -3079,7 +3100,7 @@ def _do_map_plan(arguments=None, ui_events=None, context=None) -> str:
                         "mode": mode_cn} if approx else None)),
         })
 
-    head = ("地图结果（%s；卡片会自动显示给用户，你只要把结论说清楚）：\n"
+    head = (_amap_broken_prefix() + "地图结果（%s；卡片会自动显示给用户，你只要把结论说清楚）：\n"
             "⚠️ 只能基于上面的数据说话。三种出行方式的对比数据都有，"
             "但**我们没有任何公交/地铁线路数据** —— "
             "不许编「坐 X 路公交 / 票价 Y 元 / 每 Z 分钟一班」这种具体线路信息，"
@@ -3130,7 +3151,7 @@ def _do_nearby_places(arguments=None, ui_events=None, context=None) -> str:
 
     items = r.get("items") or []
     rad = r.get("radius")
-    head = ("周边搜索（要找：%s；中心：%s；半径 %d 米）"
+    head = (_amap_broken_prefix() + "周边搜索（要找：%s；中心：%s；半径 %d 米）"
             % (r.get("category"), c["name"], rad))
     if not items:
         return (head + "\n· 这一类在 %d 米内**一个都没查到**。\n"

@@ -1948,6 +1948,32 @@ def _make_ui_channel(loop, live_ui, timeout: float = 900.0):
     return confirm, ask
 
 
+def _amap_status_line() -> str:
+    """把高德 key 的当前状态写成一行提示，让模型能主动跟用户说。
+
+    为什么要进系统提示：key 失效是"不声不响"的 —— 用户只会觉得地图莫名其妙变难用。
+    模型知道了就能顺口提醒一句"你的高德 key 现在用不了（原因），点顶栏重新配一下"。
+    结论来自 amap.check_health()（带缓存），所以这里不会每次都去调网络。
+    """
+    try:
+        from . import amap as _am
+        from . import map_tools as _mt
+        h = _am.check_health(online=_mt.online())
+    except Exception:
+        return ""
+    if not h.get("configured"):
+        return (""
+                "  · 本机**还没配高德 key**：用户一用到地图就先调 connect_amap 请他填。"
+                "别直接说做不到，也别默默用着弱数据不吭声。\n")
+    if h.get("ok"):
+        return ""
+    return (""
+            "  · ⚠️ **高德 key 现在不可用**（%s）。这会让地图悄悄退回弱数据源，"
+            "用户多半还不知道。**在回答里主动提醒他一句**（把上面这个原因说清楚），"
+            "并让他点界面顶栏的「高德 key」按钮重新配置 —— 别把这事憋着不说。\n"
+            % (h.get("message") or "原因未知"))
+
+
 class _SystemPrompt:
     """WorkBuddy 风格系统提示：精简注入分层记忆，给出工具使用引导。"""
 
@@ -2000,6 +2026,7 @@ class _SystemPrompt:
             "  · ⚠️ **地图不做任何本地缓存**：联网查的是实时数据，断网就查不到 ——"
             "离线时只能用内置常用地名表定位、路线只给直线距离，**地图卡片不显示底图**。"
             "所以别承诺离线也能看，也别提已缓存/已下载这类话。\n"
+            + _amap_status_line()
             + (
                 (
                     "- 联网搜索：用户已开启「联网」开关，你有 web_search 工具可主动联网检索。\n"
@@ -3419,6 +3446,46 @@ def ide_status():
 
 
 @app.on_event("startup")
+def _start_amap_watch():
+    """后台**持续**盯着高德 key 还能不能用，坏了就记下来让前端报警。
+
+    为什么要有这个：key 会因为"额度用满 / 被控制台重置 / 服务端异常"而不声不响地失效，
+    而用户看到的只是"地图怎么变难用了"，根本不知道发生了什么。
+    这里每 60 秒看一次（amap.check_health 自己带节流：正常 15 分钟才真调一次，
+    异常时 1 分钟一次以便尽快发现恢复），前端轮询 /api/map/amap_status 拿结论。
+
+    ⚠️ 离线模式不检测 —— 那会把"没网"误判成"key 坏了"。
+    """
+    def _loop():
+        import time as _t
+        from . import amap as _am
+        while True:
+            try:
+                _t.sleep(60)
+                if not _mt_online():
+                    continue
+                h = _am.check_health(online=True)
+                if h.get("configured") and not h.get("ok"):
+                    logger.warning("[amap] key 不可用：%s", h.get("message"))
+            except Exception:
+                pass                      # 看门狗自己绝不能把应用带走
+    try:
+        import threading as _th
+        _th.Thread(target=_loop, name="amap-watch", daemon=True).start()
+        logger.info("已启动高德 key 状态看门狗")
+    except Exception as e:
+        logger.warning("启动高德看门狗失败：%s", e)
+
+
+def _mt_online() -> bool:
+    try:
+        from . import map_tools as _mt
+        return bool(_mt.online())
+    except Exception:
+        return False
+
+
+@app.on_event("startup")
 def _reap_ide_orphans():
     """启动时先回收上次残留的 code-server（见 workspace.reap_orphan_code_server）。"""
     try:
@@ -3680,12 +3747,25 @@ def map_stats():
     """
     from . import amap as _am
     from . import map_tools as _mt
+    h = _am.check_health(online=_mt.online())
     return {"ok": True,
             "online": _mt.online(),
             "tile_source": _mt.tile_source(),
             "tile_source_name": _mt.tile_source_text(),
             "amap_key": _am.has_key(),        # 只报"有没有"，不回显 key 本身
+            "amap": h,                        # key 的可用性状态（前端按钮据此亮/暗）
             "builtin": _mt.builtin_count()}   # 内置常用地名表（不是缓存）
+
+
+@app.get("/api/map/amap_status")
+def map_amap_status():
+    """高德 key 当前可不可用 —— 前端拿它决定按钮「亮起 / 变暗」。
+
+    带缓存（正常 15 分钟、异常 1 分钟复查一次），所以前端可以放心轮询。
+    """
+    from . import amap as _am
+    from . import map_tools as _mt
+    return {"ok": True, **_am.check_health(online=_mt.online())}
 
 
 @app.post("/api/map/amap_key")
@@ -3706,6 +3786,7 @@ def set_amap_key(body: dict):
         cfg = _cfg.load_config()
         cfg["amap_key"] = ""
         _cfg.save_config(cfg)
+        _am.invalidate_health()
         return {"ok": True, "cleared": True,
                 "message": "已清空高德 key，地图改回用 OpenStreetMap。"}
     ok, msg = _am.verify_key(key)
@@ -3714,6 +3795,7 @@ def set_amap_key(body: dict):
     cfg = _cfg.load_config()
     cfg["amap_key"] = key
     _cfg.save_config(cfg)
+    _am.invalidate_health()      # 换了 key → 立刻重新检测，别等 15 分钟
     return {"ok": True, "message": msg}
 
 

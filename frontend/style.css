@@ -1201,3 +1201,26 @@ body.dark .map-note { color: #d0b070; }
 .amap-msg.bad { color: #c0392b; }
 /* 只填一个字段的场景：不留那一行多余的编号/留白 */
 .ask-layer.ask-free-mode .ask-q { font-size: 12.5px; color: #6b7684; margin-bottom: 6px; }
+
+/* 「高德 key」按钮的三种状态：可用=亮绿 / 异常=暗+红 / 未配置=普通 */
+.pill-btn.on {
+  color: var(--text);
+  border-color: var(--green);
+  background: #14291d;
+  box-shadow: 0 0 7px rgba(63, 185, 80, .35);
+}
+.pill-btn.on::after { content: "●"; color: var(--green); margin-left: 5px; font-size: 10px; }
+.pill-btn.bad {
+  color: #ffb4a8;
+  border-color: #7a3b32;
+  background: #2a1a17;
+  opacity: .92;
+}
+.pill-btn.bad::after { content: "!"; color: #ff7b6b; margin-left: 5px; font-weight: 700; }
+.pill-btn { opacity: .72; }                 /* 默认（未配置）是暗的 */
+.pill-btn.on, .pill-btn.bad { opacity: 1; }
+/* 面板里的状态行 */
+.amap-state.ok { color: #1e7f45; font-weight: 600; }
+.amap-state.bad { color: #c0392b; font-weight: 600; }
+body.dark .amap-state.ok { color: #57c98a; }
+body.dark .amap-state.bad { color: #ff8a7a; }

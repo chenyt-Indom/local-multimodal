@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 import urllib.parse
 import urllib.request
 
@@ -89,6 +90,62 @@ def verify_key(k: str) -> tuple:
         return False, ("这个 key 没开通「Web服务」这个服务（%s）。"
                        "去控制台给这个 key 勾上「Web服务」再试。" % info)
     return False, "高德返回了错误：%s（%s）。检查一下 key 是否正确。" % (info or "未知", code)
+
+
+
+# ---------------------------------------------------------------- 健康状态
+# "高德 key 还能不能用"这个结论要**缓存**：它每次都得真调一次网络，
+# 不能在前端轮询、系统提示拼装这些高频路径上直接调。
+# 正常时 15 分钟复查一次；一旦异常改成 1 分钟一次 —— 恢复了要尽快发现，
+# 别让用户对着一个"已失效"的红标继续用。
+_HEALTH_TTL_OK = 15 * 60
+_HEALTH_TTL_BAD = 60
+_HEALTH = {"ok": None, "message": "", "checked": 0.0, "key_hint": ""}
+
+
+def _key_hint(k: str) -> str:
+    return (k[:6] + "…" + k[-4:]) if len(k) >= 12 else ("已配置" if k else "")
+
+
+def check_health(force: bool = False, online: bool = True) -> dict:
+    """高德 key 当前可不可用。返回一个**给前端和模型看**的状态字典。
+
+    · configured：配置里有没有 key
+    · ok：真调过一次、确认可用
+    · message：给人看的一句话（不可用时说清原因）
+    · checked_at / age_s：上次检测的时间与距今多少秒
+    """
+    k = key()
+    now = time.time()
+    if not k:
+        _HEALTH.update(ok=False, message="还没配高德 key", checked=now, key_hint="")
+        return _health_dict(configured=False)
+    if not online:
+        # 离线模式不联网：保留上次结论，但不刷新（避免把"没网"误判成"key 坏了"）
+        return _health_dict(configured=True, skipped="离线模式，暂不检测")
+    hint = _key_hint(k)
+    same = (_HEALTH["key_hint"] == hint)
+    ttl = _HEALTH_TTL_OK if _HEALTH["ok"] else _HEALTH_TTL_BAD
+    if force or (not same) or (now - float(_HEALTH["checked"] or 0) > ttl):
+        ok, msg = verify_key(k)
+        _HEALTH.update(ok=bool(ok), message=msg, checked=time.time(), key_hint=hint)
+    return _health_dict(configured=True)
+
+
+def _health_dict(configured: bool, skipped: str = "") -> dict:
+    age = (time.time() - float(_HEALTH["checked"] or 0)) if _HEALTH["checked"] else None
+    return {"configured": bool(configured),
+            "ok": bool(_HEALTH["ok"]),
+            "message": _HEALTH["message"] or "",
+            "key_hint": _HEALTH["key_hint"] or "",
+            "checked_at": _HEALTH["checked"] or 0.0,
+            "age_s": round(age, 1) if age is not None else None,
+            "skipped": skipped}
+
+
+def invalidate_health() -> None:
+    """key 被改过（填了新的 / 清空了）→ 丢掉旧结论，下次一定重新检测。"""
+    _HEALTH.update(ok=None, message="", checked=0.0, key_hint="")
 
 
 # ---------------------------------------------------------------- 坐标转换

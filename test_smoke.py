@@ -158,6 +158,26 @@ def main():
     check("关掉代码后没有 run_python", "run_python" not in off_names)
     check("地图工具不受这些开关影响", "map_plan" in off_names and "nearby_places" in off_names)
 
+    # ---------------- ⑥ 高德 key 的状态检测 ----------------
+    print()
+    print("【6】高德 key 状态检测")
+    from backend import amap as A
+    from backend import config as C
+    C.save_config(dict(C.load_config(), amap_key=""))
+    h = A.check_health(force=True, online=True)
+    check("没配 key 时 configured=False、ok=False",
+          h["configured"] is False and h["ok"] is False, h["message"])
+    ok, msg = A.verify_key("deadbeefdeadbeefdeadbeefdeadbeef")
+    check("无效 key 会被识破，并给出可读的原因", bool(msg) and len(msg) > 10,
+          msg.split(chr(10))[0][:44])
+    check("长度不对的 key 直接拦下（不浪费一次网络请求）",
+          A.verify_key("abc")[0] is False, A.verify_key("abc")[1][:40])
+    C.save_config(dict(C.load_config(), amap_key="a" * 32))
+    h2 = A.check_health(force=True, online=True)
+    check("配了但不可用时 configured=True 且 ok=False（前端据此变暗）",
+          h2["configured"] is True and h2["ok"] is False, h2["key_hint"])
+    A.invalidate_health()
+
     # ---------------- ⑤ 跑着的应用（HTTP） ----------------
     print()
     print("【5】真实运行的应用（HTTP 接口）")
