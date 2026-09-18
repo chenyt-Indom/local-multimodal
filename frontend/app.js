@@ -2958,21 +2958,35 @@
   }
 
   if (voiceBtn) {
-    voiceBtn.onclick = () => {
-      const ws = voiceConnect();
-      const toggle = () => {
-        if (!voiceOn) {
-          ws.send(JSON.stringify({ action: "start" }));
-          voiceOn = true;
-          voiceUI("listening");
-        } else {
-          ws.send(JSON.stringify({ action: "stop" }));
+    // ⚠️ 点击时**先问后端**再决定是开还是关，而不是信本地的 voiceOn 变量。
+    //    本地状态一旦和后端不同步（页面重载、WS 断线重连、后端自己停了），
+    //    按钮就会**方向反了**：明明没在听，点一下却发的是「停止」——
+    //    用户怎么点都喊不出来，界面还显示"监听中"。查一次 status 就彻底消除这种分叉。
+    voiceBtn.onclick = async () => {
+      voiceBtn.disabled = true;
+      try {
+        const st = await api("/api/voice/status");
+        const running = !!(st && st.running);
+        if (running) {
+          await api("/api/voice/stop", { method: "POST" });
           voiceOn = false;
           voiceUI("idle");
+        } else {
+          voiceConnect();                       // 开之前先把事件通道连上
+          const r = await api("/api/voice/start", { method: "POST" });
+          if (r && r.ok === false) {
+            voiceUI("idle", "⚠ " + (r.error || "启动失败"));
+          } else {
+            voiceOn = true;
+            voiceUI("listening");
+            voiceLoadDevices();
+          }
         }
-      };
-      if (ws.readyState === 1) toggle();
-      else ws.addEventListener("open", toggle, { once: true });
+      } catch (e) {
+        voiceUI("idle", "⚠ " + String(e.message || e));
+      } finally {
+        voiceBtn.disabled = false;
+      }
     };
     voiceUI("idle");
   }
@@ -2994,6 +3008,26 @@
       else ws.addEventListener("open", onOpen, { once: true });
     } catch (e) { /* 语音不可用时保持原样 */ }
   })();
+
+  // 定期和后端**对一次账**：后端可能已经不在监听了（换设备失败、麦克风被别的程序
+  // 独占、别处调了 /api/voice/stop），而界面还写着"监听中" —— 这时候用户怎么喊
+  // 都不会有反应，却完全看不出问题（实测踩过：status 里 running=false、error=null）。
+  // 只修正**界面显示**，不擅自替用户重新打开（开关的主动权在用户手里）。
+  setInterval(async () => {
+    if (!voiceTextEl) return;
+    try {
+      const st = await api("/api/voice/status");
+      const running = !!(st && st.running);
+      if (!running && voiceOn) {
+        voiceOn = false;
+        voiceUI("idle", "⚠ 语音已停止 · 点 🎤 可重新开始");
+      } else if (running && !voiceOn) {
+        voiceOn = true;
+        voiceUI(st.state === "awake" ? "awake" : "listening");
+        if (!voiceDevLoaded) voiceLoadDevices();
+      }
+    } catch (e) { /* 忽略：下次再对账 */ }
+  }, 20000);
 
   // ---------- 初始化 ----------
   // 先恢复会话（含上次的历史消息），再跑其它轮询
