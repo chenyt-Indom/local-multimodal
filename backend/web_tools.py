@@ -658,13 +658,43 @@ def geocode_city(city: str, count: int = 5) -> list:
     return out
 
 
-def weather(city: str, days: int = 3) -> dict:
-    """查某地天气，返回结构化数据。
+def _looks_admin(name: str) -> bool:
+    """这个名字像不像**行政区**（市/区/县/省…），而不是"某家店/某个小区"。
+
+    ⚠️ 兜底地理编码必须卡这一条：实测「纽约」会被解析成北京的住宅小区
+    「纽约豪园」、「东京」被解析成甜品店「布歌东京(…店)」 ——
+    直接拿去查天气，就会一本正经地报出北京的天气。
+    """
+    n = str(name or "").strip()
+    return n.endswith(("省", "市", "区", "县", "州", "盟", "旗",
+                       "特别行政区", "自治区"))
+
+
+def _openmeteo_weather(city: str, days: int = 3) -> dict:
+    """Open-Meteo 那条路（**兜底用**，不再是对外主入口）。
+
+    ⚠️ 它是**全球模式**，国内对降水虚报得厉害（见下面 weather() 的说明），
+    所以只在"没配高德 key / 境外 / 高德查不到"时才走这里。
 
     返回 {ok, city, admin, lat, lon, current:{...}, daily:[{date,high,low,rain,desc}], note}
     """
     days = max(1, min(int(days or 3), 16))
     hits = geocode_city(city)
+    if not hits:
+        # ⚠️ Open-Meteo 自己的地理编码**很弱**：实测「汕头」直接查不到（写"汕头市"才行）。
+        #    这里用**我们自己的地名解析**再兜一次（内置表 / 高德 / Photon），
+        #    否则会出现"明明有这么个城市，它却说没找到"。
+        #    ⚠️ 但**只认行政级别的地名**（见 _looks_admin），不然"纽约豪园"这种
+        #    同名小区/店铺会被当成城市。
+        try:
+            from . import map_tools as _mt
+            places = _mt.search_place(city, 3)
+        except Exception:
+            places = []
+        good = [p for p in (places or []) if _looks_admin(p.get("name"))]
+        if good:
+            hits = [{"name": good[0].get("name") or city, "admin1": "", "admin2": "",
+                     "country": "中国", "lat": good[0]["lat"], "lon": good[0]["lon"]}]
     if not hits:
         return {"ok": False, "error": f"没找到城市「{city}」。可以换个说法，比如「上海市」「广东 深圳」"}
 
@@ -693,25 +723,30 @@ def weather(city: str, days: int = 3) -> dict:
     daily = []
     for i, day in enumerate(dates):
         code = (daily_raw.get("weather_code") or [None] * len(dates))[i]
+        _w = (daily_raw.get("wind_speed_10m_max") or [None] * len(dates))[i]
         daily.append({
             "date": day,
             "high": (daily_raw.get("temperature_2m_max") or [None] * len(dates))[i],
             "low": (daily_raw.get("temperature_2m_min") or [None] * len(dates))[i],
             "rain_mm": (daily_raw.get("precipitation_sum") or [None] * len(dates))[i],
             "rain_pct": (daily_raw.get("precipitation_probability_max") or [None] * len(dates))[i],
-            "wind": (daily_raw.get("wind_speed_10m_max") or [None] * len(dates))[i],
+            # ⚠️ 风**带单位存成字符串**：两个源的单位不一样（这里是 km/h，
+            #    高德那边是风力等级"东≤3"），由数据源自己带单位，格式化时照抄即可。
+            "wind": ("%.1f km/h" % _w) if isinstance(_w, (int, float)) else None,
             "desc": _WEATHER_CODE.get(code, f"天气码{code}" if code is not None else ""),
+            "src": "Open-Meteo",
         })
 
     cur = {}
     if cur_raw:
         code = cur_raw.get("weather_code")
+        _w = cur_raw.get("wind_speed_10m")
         cur = {
             "temp": cur_raw.get("temperature_2m"),
             "feels": cur_raw.get("apparent_temperature"),
             "humidity": cur_raw.get("relative_humidity_2m"),
             "rain_mm": cur_raw.get("precipitation"),
-            "wind": cur_raw.get("wind_speed_10m"),
+            "wind": ("%.1f km/h" % _w) if isinstance(_w, (int, float)) else None,
             "desc": _WEATHER_CODE.get(code, f"天气码{code}" if code is not None else ""),
         }
 
@@ -728,30 +763,170 @@ def weather(city: str, days: int = 3) -> dict:
         "current": cur,
         "daily": daily,
         "source": "Open-Meteo（open-meteo.com）",
-        "note": "数据为气象模型预报值，与中央气象台发布可能略有差异。",
+        "note": "数据为气象模型预报值（全球模式），国内降水容易虚报，仅供参考。",
     }
 
 
+# ---------------------------------------------------------------- 天气：选哪家
+def _amap_ready() -> bool:
+    """联网 + 配了高德 key → 才走高德那条路。"""
+    try:
+        from . import amap as _am
+        from . import map_tools as _mt
+        return bool(_am.key() and _mt.online())
+    except Exception:
+        return False
+
+
+def _online() -> bool:
+    """当前是否允许联网（跟着「联网」开关）。读不到就按"允许"处理，别把功能卡死。"""
+    try:
+        from . import map_tools as _mt
+        return bool(_mt.online())
+    except Exception:
+        return True
+
+
+def _topup_from_openmeteo(w: dict, city: str, days: int) -> dict:
+    """高德只有 4 天；要更多天就用 Open-Meteo 补上，并**逐日标明来源**。"""
+    need = days - len(w.get("daily") or [])
+    if need <= 0:
+        return w
+    try:
+        more = _openmeteo_weather(city, days)
+    except Exception:
+        return w
+    if not more.get("ok"):
+        return w
+    have = {d.get("date") for d in w.get("daily") or []}
+    extra = [d for d in more.get("daily") or [] if d.get("date") not in have][:need]
+    if not extra:
+        return w
+    w["daily"] = (w.get("daily") or []) + extra
+    w["note"] = (w.get("note") or "") + " 其余天数由 Open-Meteo 模式预报补足。"
+    w["source"] = (w.get("source") or "") + " + Open-Meteo（补足天数）"
+    return w
+
+
+def weather(city: str, days: int = 3) -> dict:
+    """查天气 —— **优先中国气象局数据（经高德地图），拿不到才退回 Open-Meteo**。
+
+    为什么换掉 Open-Meteo（2026-09-18 用户反馈"天气不准"后实测，同一时刻的广州）：
+      · 高德（中国气象局）：实况 晴 28℃；逐日预报 晴 / 多云 / 多云
+      · Open-Meteo      ：实况 晴 29.7℃；逐日预报却是「小毛毛雨 / 毛毛雨 / 小毛毛雨」
+    全球模式在华南对降水虚报得很厉害，而实况也不是站点观测值 —— 这才是"不准"的根源。
+    另外 Open-Meteo 的地理编码连「汕头」都查不到（得写"汕头市"），也会让用户觉得不好用。
+
+    高德覆盖不到的地方（境外）或没配 key 时，自动回退，并在 `source` 里如实标明。
+    """
+    days = max(1, min(int(days or 3), 16))
+    if not _online():
+        # 两个源都要联网。关着「联网」还去发请求，等于偷偷联网 —— 与开关的约定不符。
+        return {"ok": False,
+                "error": "离线模式查不了天气（要联网）。打开顶栏的「联网」开关就能查。"}
+    if _amap_ready():
+        try:
+            from . import amap as _am
+            w = _am.weather(city, days)
+        except Exception:
+            w = None
+        if w and w.get("ok"):
+            return _topup_from_openmeteo(w, city, days)
+        if w and w.get("foreign"):
+            # ⚠️ 高德是国内的权威源：它明确说"国内没这个地方"，就别再让兜底源去猜了 ——
+            #    实测**三家都会就近匹配**：「东京」高德→广西平南、Open-Meteo→江苏、
+            #    Photon→浙江；「伦敦」→ 佛山顺德 / 加拿大安大略；「首尔」→ 河北"首尔·甜城"。
+            #    全是错的。如实告诉用户"用英文名"，比塞一个错城市强得多。
+            return {"ok": False,
+                    "error": ("没查到「%s」的天气。如果指的是**国外城市**，请用英文名"
+                              "（Tokyo / London / Seoul）—— 中文名在国内有不少同名小地方，"
+                              "很容易查错。如果是国内地名，请带上所在城市，例如「广东 汕头」。"
+                              % city)}
+    return _openmeteo_weather(city, days)
+
+
+def _fmt_n(v) -> str:
+    """数字美化：28.0 → 28，28.6 → 28.6（缺值返回空串）。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return ""
+    return ("%d" % f) if abs(f - round(f)) < 0.05 else ("%.1f" % f)
+
+
 def format_weather(w: dict) -> str:
-    """把天气数据格式化成给模型看的紧凑文本。"""
+    """把天气数据格式化成给模型看的紧凑文本。
+
+    ⚠️ 两个来源**字段不一样**（高德没有体感/降水概率，Open-Meteo 没有风力等级），
+    所以一律"有什么写什么" —— 缺的字段**绝不能打印出 None**，
+    那会让模型把"没有这个数据"讲成"体感 None 度"。
+    """
     if not w.get("ok"):
         return f"天气查询失败：{w.get('error')}"
-    lines = [f"【{w['city']}{('（' + w['admin'] + '）') if w.get('admin') else ''} 天气】"
-             f"坐标 {w['lat']:.2f},{w['lon']:.2f}　数据源：{w.get('source','')}"]
+    where = w.get("city") or ""
+    if w.get("admin"):
+        where += "（%s）" % w["admin"]
+    lines = ["【%s 天气】数据源：%s　坐标 %.2f,%.2f"
+             % (where, w.get("source", ""), w.get("lat") or 0, w.get("lon") or 0)]
     c = w.get("current") or {}
     if c:
-        lines.append(f"当前：{c.get('desc','')}，气温 {c.get('temp')}°C"
-                     f"（体感 {c.get('feels')}°C），湿度 {c.get('humidity')}%，"
-                     f"降水 {c.get('rain_mm')}mm，风速 {c.get('wind')}km/h")
+        bits = []
+        if c.get("desc"):
+            bits.append(str(c["desc"]))
+        if c.get("temp") is not None:
+            bits.append("气温 %s°C" % _fmt_n(c["temp"]))
+        if c.get("feels") is not None:
+            bits.append("体感 %s°C" % _fmt_n(c["feels"]))
+        if c.get("humidity") is not None:
+            bits.append("湿度 %s%%" % _fmt_n(c["humidity"]))
+        if c.get("rain_mm") is not None:
+            bits.append("降水 %s mm" % _fmt_n(c["rain_mm"]))
+        # ⚠️ 风**照抄数据源自己的单位**（高德给的是"东≤3"这种风力等级，不是 km/h）
+        if c.get("wind"):
+            bits.append("风 %s" % c["wind"])
+        if c.get("report_time"):
+            bits.append("观测时间 %s" % c["report_time"])
+        if bits:
+            lines.append("当前：" + "，".join(bits))
     lines.append("逐日预报：")
     for i, d in enumerate(w.get("daily") or []):
         tag = ["今天", "明天", "后天"][i] if i < 3 else f"第{i+1}天"
-        lines.append(f"  {d['date']}（{tag}）{d['desc']}　"
-                     f"{d['low']}~{d['high']}°C　降水概率 {d['rain_pct']}%"
-                     f"（{d['rain_mm']}mm）　最大风速 {d['wind']}km/h")
+        seg = ["%s（%s）%s" % (d.get("date", ""), tag, d.get("desc", ""))]
+        if d.get("low") is not None or d.get("high") is not None:
+            seg.append("%s~%s°C" % (_fmt_n(d.get("low")), _fmt_n(d.get("high"))))
+        if d.get("rain_pct") is not None:
+            seg.append("降水概率 %s%%" % _fmt_n(d["rain_pct"]))
+        if d.get("rain_mm") is not None:
+            seg.append("降水 %s mm" % _fmt_n(d["rain_mm"]))
+        if d.get("wind"):
+            seg.append("风 %s" % d["wind"])
+        # 混了两个源时逐日标出来，免得"前 4 天一个口径、后几天另一个口径"看着矛盾
+        if d.get("src") and len({x.get("src") for x in (w.get("daily") or [])}) > 1:
+            seg.append("（%s）" % d["src"])
+        lines.append("  " + "　".join(seg))
     if w.get("note"):
         lines.append(f"说明：{w['note']}　回答时请注明数据来源。")
-    return "\n".join(lines)
+
+    # ⚠️⚠️ 缺什么就明说缺什么 —— 而且要**放在最前面**。
+    #    实测（2026-09-18）：高德不给体感温度和降水概率，模型就自己编了
+    #    「体感温度约 29.5°C」「降水概率 0%（无降雨）」，说得跟真的一样。
+    #    弱模型对"结果末尾的附注"基本不看，放在开头才会照做（这条踩过好几次）。
+    missing = []
+    c0 = w.get("current") or {}
+    if c0 and c0.get("feels") is None:
+        missing.append("体感温度")
+    d0 = (w.get("daily") or [{}])[0]
+    if d0.get("rain_pct") is None:
+        missing.append("降水概率")
+    if d0.get("rain_mm") is None:
+        missing.append("降水量")
+    head = ""
+    if missing:
+        head = ("⚠️ 本次**没有**这些数据：%s —— 这个数据源不提供。"
+                "**不许估算、不许编，连 0、未知 这类占位数字都不要写**；"
+                "只能原样写「数据源不提供」。只能用下面真正出现的字段作答。\n\n"
+                % "、".join(dict.fromkeys(missing)))
+    return head + "\n".join(lines)
 
 
 # ---------- 图片搜索（找现成的图，不是生成图）----------

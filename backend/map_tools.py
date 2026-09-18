@@ -266,7 +266,25 @@ def wmo_text(code) -> str:
 
 
 def weather_at(lat: float, lon: float, hours: int = 12) -> dict:
-    """按坐标查当前 + 未来几小时的天气。失败返回 {}（不抛异常，路线照常给）。"""
+    """按坐标查当前 + 未来几小时的天气。失败返回 {}（不抛异常，路线照常给）。
+
+    ⚠️ 两个来源**各管一半**，别混着说：
+      · **「现在」优先用中国气象局实况**（经高德，气象站观测）—— 这是用户最容易
+        跟窗外对一眼的数，必须准；实测 Open-Meteo 的实况是模式值，会有偏差。
+      · **「未来几小时」只能用 Open-Meteo 的逐小时**（高德没有逐小时接口）。
+    所以返回值里带 `now_src`，卡片上要标出来，免得两个数字看着互相矛盾。
+    """
+    out = {}
+    try:
+        from . import amap as _am
+        if _am.key():
+            a = _am.weather_at(lat, lon)
+            if a.get("now"):
+                out["now"] = a["now"]
+                out["now_src"] = a.get("src") or "中国气象局"
+    except Exception:
+        pass
+
     url = ("https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
            "&current=temperature_2m,precipitation,weather_code,wind_speed_10m"
            "&hourly=temperature_2m,precipitation_probability,weather_code"
@@ -275,12 +293,14 @@ def weather_at(lat: float, lon: float, hours: int = 12) -> dict:
     try:
         d = _get_json(url, timeout=15)
     except Exception:
-        return {}
+        return out
     cur = d.get("current") or {}
-    out = {"now": {"temp": cur.get("temperature_2m"),
-                   "desc": wmo_text(cur.get("weather_code")),
-                   "rain_mm": cur.get("precipitation"),
-                   "wind": cur.get("wind_speed_10m")}}
+    if not out.get("now"):
+        out["now"] = {"temp": cur.get("temperature_2m"),
+                      "desc": wmo_text(cur.get("weather_code")),
+                      "rain_mm": cur.get("precipitation"),
+                      "wind": cur.get("wind_speed_10m")}
+        out["now_src"] = "Open-Meteo"
     hr = d.get("hourly") or {}
     times = hr.get("time") or []
     n = len(times)
@@ -291,6 +311,7 @@ def weather_at(lat: float, lon: float, hours: int = 12) -> dict:
                      "rain": (hr.get("precipitation_probability") or [None] * n)[i],
                      "desc": wmo_text((hr.get("weather_code") or [None] * n)[i])})
     out["hours"] = rows
+    out["hours_src"] = "Open-Meteo"
     return out
 
 
@@ -715,9 +736,14 @@ def _shape(routes: list, best: int, m: str, a: dict, b: dict,
         wf, wt = weather_at(a["lat"], a["lon"]), weather_at(b["lat"], b["lon"])
         if wf or wt:
             res["weather"] = {
-                "from": {"name": a.get("name"), "now": wf.get("now") or {}},
+                # ⚠️ 把来源一起带出去：实况来自气象局、抵达时段来自 Open-Meteo 逐小时，
+                #    卡片上要标，不然两个数字看着像自相矛盾。
+                "from": {"name": a.get("name"), "now": wf.get("now") or {},
+                         "now_src": wf.get("now_src") or "",
+                         "hours_src": wf.get("hours_src") or ""},
                 "to": {"name": b.get("name"),
-                       "arrival": pick_hourly(wt, b_rt["duration_s"] / 60.0)},
+                       "arrival": pick_hourly(wt, b_rt["duration_s"] / 60.0),
+                       "hours_src": wt.get("hours_src") or ""},
             }
     return res
 
