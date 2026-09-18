@@ -440,6 +440,10 @@ class VoiceListener:
         self._level_at = 0.0
         self._device = None
         self._device_name = ""
+        # 是不是"用户主动关掉的" —— 看门狗靠它区分：
+        #   · 用户点 🎤 关掉 → 不许自动重开（开关的主动权在用户手里）
+        #   · 线程自己没了   → 自动重开（否则就是"喊半天没反应"）
+        self.manual_stop = False
         self._xruns = 0                  # PortAudio 报告"丢数据"的次数
         self._dropped = 0                # 我们自己的队列满、丢掉的块数
 
@@ -458,6 +462,8 @@ class VoiceListener:
             "wake_words": list(WAKE_WORDS),
             "text": self._text,
             "error": self.error,
+            # 是用户主动关的、还是它自己停的（看门狗据此决定要不要自动重开）
+            "manual_stop": self.manual_stop,
             # —— 排障用：喊不动的时候先看这几个数 ——
             "device": self._device_name,
             "level": round(self._level, 5),          # 当前电平
@@ -545,6 +551,7 @@ class VoiceListener:
                 return {"ok": False, "error": self.error}
 
             self.error = None
+            self.manual_stop = False      # 这次是"要它听"，看门狗的标志复位
             self._stop.clear()
             self._awake = False
             self._text = ""
@@ -569,12 +576,19 @@ class VoiceListener:
             self._thread.start()          # 在锁里 start：第二个调用只会看到 already
         return {"ok": True, "state": "listening"}
 
-    def stop(self) -> dict:
-        """停止监听。"""
+    def stop(self, manual: bool = True) -> dict:
+        """停止监听。
+
+        `manual=True`（默认）= 用户/接口主动关的 → **看门狗不许自动重开**；
+        线程自己退出（`_loop` 走完 finally，不会调这里）时标志保持原样，
+        于是看门狗会把它重新拉起来 —— 见 `needs_restart()`。
+        """
         with self._lock:
             self._stop.set()
             t = self._thread
             self._token = None            # 作废：正在路上的音频回调会被丢弃
+            if manual:
+                self.manual_stop = True
         if t is not None and t.is_alive():
             t.join(timeout=3)
         with self._lock:
@@ -582,6 +596,18 @@ class VoiceListener:
         self.state = "idle"
         self._emit({"type": "state", "state": "idle"})
         return {"ok": True, "state": "idle"}
+
+    def needs_restart(self) -> bool:
+        """该不该由看门狗把它重新拉起来？
+
+        ⚠️ 为什么需要：用户报"喊不出来"时，实测遇到 `running:false, error:null`
+        —— 监听线程已经退出，可是**一点线索都没有**（不是"打开麦克风失败"，
+        也不是"没找到模型"），界面那边只会显示"语音已停止"。这种情况必须能自愈，
+        否则用户就是"怎么喊都没反应"。
+
+        只重建"意外停止"的：**用户自己点 🎤 关掉的不动**（开关的主动权在用户手里）。
+        """
+        return (not self.running) and (not self.manual_stop)
 
     # ---------------- 内部实现 ----------------
     def _emit(self, event: dict) -> None:

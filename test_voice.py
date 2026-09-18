@@ -497,6 +497,29 @@ def main():
                   if e.get("type") == "partial"),
               str([e.get("text") for e in ev11 if e.get("type") == "partial"]))
 
+    # ---------------- ⑫ 看门狗：意外停止要能自愈、用户关的不许自愈 ----------------
+    print("\n⑫ 看门狗判据：自己没了的要重开，用户点关的不许重开")
+    vl12 = V.VoiceListener()
+    check("从没启动过 / 线程自己没了 → 判定为「该重开」",
+          vl12.needs_restart() is True)
+    vl12.manual_stop = True
+    check("用户主动关掉过 → **不许**自动重开（开关主动权在用户手里）",
+          vl12.needs_restart() is False)
+    check("status 里能看出是「用户关的」还是「它自己没的」（排障要用）",
+          "manual_stop" in vl12.status(), str(sorted(vl12.status().keys())[:6]))
+
+    vl12.manual_stop = False
+    vl12._thread = threading.Thread(target=lambda: time.sleep(5), daemon=True)
+    vl12._thread.start()
+    check("正在跑的时候不需要重开", vl12.needs_restart() is False)
+    vl12._thread.join(timeout=0.1)
+
+    vl13 = V.VoiceListener()
+    vl13._thread = None
+    vl13.stop()
+    check("stop() 默认就算「用户主动关」（接口/按钮都走它）",
+          vl13.manual_stop is True and vl13.needs_restart() is False)
+
     print("\n" + "=" * 64)
     print("通过 %d 项，失败 %d 项" % (PASS, FAIL))
     print("=" * 64)

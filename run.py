@@ -113,7 +113,7 @@ def _make_wake_focus(window=None):
 
 
 def _autostart_voice() -> None:
-    """启动时自动打开麦克风监听（可被配置项 voice_auto_start 关掉）。
+    """启动时自动打开麦克风监听，之后**一直看着它**（见 `_voice_watchdog`）。
 
     容器里没有麦克风，这里会失败 —— 失败就静默跳过，界面上点 🎤 会给出提示，
     不能让"没有麦克风的部署"因为自动启动而报错。
@@ -122,6 +122,9 @@ def _autostart_voice() -> None:
         from backend import config as _cfg
         if not _cfg.load_config().get("voice_auto_start", True):
             return
+    except Exception:
+        return
+    try:
         from backend import main as _main
         # 模型要在后台加载，稍等一下再开，避免和 ollama 抢资源
         time.sleep(3)
@@ -129,6 +132,43 @@ def _autostart_voice() -> None:
         print(f"[voice] 自动监听：{r}")
     except Exception as e:
         print(f"[voice] 自动监听失败（可忽略）：{e}")
+        return
+    try:
+        _voice_watchdog(_main)
+    except Exception as e:
+        print(f"[voice] 看门狗退出（可忽略）：{e}")
+
+
+def _voice_watchdog(main_mod) -> None:
+    """盯着监听线程：它要是**自己没了**，就把它拉起来。
+
+    ⚠️ 为什么必须有这个：实测遇到过 `running:false, error:null` —— 监听线程
+    已经退出，但**一点线索都没有**（不是"打开麦克风失败"，也不是"没找到模型"），
+    界面上只会显示「语音已停止」。用户看到的就是"怎么喊都没反应"。
+
+    两条边界：
+      · **用户自己点 🎤 关掉的不重开** —— 由 `VoiceListener.needs_restart()` 判断，
+        开关的主动权始终在用户手里；
+      · 容器里没有麦克风 → 失败后**指数退避**（30s → … → 10 分钟），不会刷日志。
+    """
+    fails = 0
+    while True:
+        time.sleep(30 if fails == 0 else min(600, 30 * (2 ** fails)))
+        try:
+            from backend import config as _cfg
+            if not _cfg.load_config().get("voice_auto_start", True):
+                continue
+            vl = getattr(main_mod, "_voice", None)
+            if vl is None or not vl.needs_restart():
+                continue
+            r = main_mod.voice_start()
+            if r.get("ok"):
+                fails = 0
+                print("[voice] 监听线程不在了，已自动重新开始")
+            else:
+                fails += 1
+        except Exception:
+            fails += 1
 
 
 def main() -> None:
