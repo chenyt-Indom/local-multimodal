@@ -17,6 +17,7 @@ import queue
 import re
 import sys
 import base64
+import codecs
 import io
 import json
 import time
@@ -2435,6 +2436,10 @@ async def chat(req: ChatRequest):
             "**都要先跑一遍再回答**，不要靠心算（心算很容易错，尤其是数字和日期）。\n"
             "- 拿到的输出是真实结果，请依据它作答；如果代码报错，先说明错在哪、"
             "给出修正后的代码并**再跑一次**。\n"
+            "- ⚠️ run_python 只能跑**算完就退出**的代码。"
+            "**计时器 / 服务器 / 游戏 / 图形界面**这类要一直跑的程序，工具只会跑前几秒做冒烟测试；"
+            "那**不是报错、也不说明代码有问题** —— 千万别为了「绕过超时」去改结构"
+            "（加线程、加 signal 都没用），直接把代码交给用户、让用户点卡片上的「▶ 运行」。\n"
             "- 回答里保留代码（用户要的是代码），但结论必须来自真实运行结果。")
     # 创作类任务（作文/方案/报告）与生成文库的用法（同上：代码模型那轮不注入）
     if not code_model_on:
@@ -2615,8 +2620,13 @@ async def chat(req: ChatRequest):
                     "整个过程用户只需要说一次需求，**不要反复确认、不要问他细节** —— "
                     "拿不准的地方就按最合理的做法做下去，并在总结里说明你的选择。\n\n"
                     "【硬性规则】\n"
-                    "1. 想验证代码对不对，就**真的调用 run_python 跑一遍**看真实输出，"
-                    "**绝对不要**凭空猜输出。\n"
+                    "1. 想验证代码对不对，就**真的调用 run_python / workspace_run 跑一遍**"
+                    "看真实输出，**绝对不要**凭空猜输出。\n"
+                    "   ⚠️ 但**计时器 / 服务器 / 游戏 / 图形界面**这类**要一直跑**的程序，"
+                    "在工具里本来就跑不完 —— 工具只会跑前几秒做冒烟测试。"
+                    "那是**正常的、不是报错**，**更不要为了「绕过它」去改代码**"
+                    "（加线程、加 signal 都没用）。这种情况直接收工，"
+                    "告诉用户「点代码卡片上的 ▶ 运行 就能完整跑」。\n"
                     "2. **一次只调用一个工具**；调用时除了那个 ```tool 块"
                     "**不要输出任何其他文字**。\n"
                     "3. **一路调到真的跑通为止**：报错就照真实报错改、再跑，最多来回 4 次。"
@@ -3435,17 +3445,50 @@ async def ws_run_stream(body: dict):
 
     proc = r["proc"]
 
+    return StreamingResponse(
+        _stream_proc_ndjson(proc, rid, r.get("rel") or "", r.get("risky")),
+        media_type="application/x-ndjson")
+
+
+def _stream_proc_ndjson(proc, rid: str = "", rel: str = "", risky=None):
+    """把一个**正在跑的子进程**的 stdout 变成 NDJSON 流（逐行边读边推）。
+
+    ⚠️ 子进程的 stdout 是**阻塞**读的，必须丢到线程里 —— 直接在事件循环里
+    读会把整个后端卡死（是"整个界面都卡住"那个级别，不是慢一点）。
+    """
     async def _gen():
         q: queue.Queue = queue.Queue()
 
         def _pump():
-            # 子进程的 stdout 是阻塞读的，必须丢到线程里，否则会把事件循环卡死
+            """把子进程的输出搬进队列 —— **读到多少推多少**。
+
+            ⚠️ 不能用 readline()：它只认换行，而进度条/倒计时（`print(x, end='\\r')`）
+            **一个换行都不打**，readline 会一直憋到进程结束，于是"实时输出"变成
+            "跑完一次性显示"，长驻程序更是永远看不到东西（番茄钟实测就是这个症状）。
+            所以绕过文本层缓冲，在字节层做「有多少读多少」+ 增量解码。
+            """
+            dec = codecs.getincrementaldecoder("utf-8")("replace")
+            stream = getattr(proc.stdout, "buffer", proc.stdout)   # 二进制层
             try:
-                for line in iter(proc.stdout.readline, ""):
-                    q.put(line)
+                # read1 = "最多读一次底层"，管道里有数据就立刻返回，不会等满
+                read = getattr(stream, "read1", None) or (lambda n: stream.read(1))
+                while True:
+                    chunk = read(65536)
+                    if not chunk:
+                        break
+                    # 兜底：万一拿到的是已解码的文本（不是字节），直接推
+                    text = chunk if isinstance(chunk, str) else dec.decode(chunk)
+                    if text:
+                        q.put(text)
             except Exception:
                 pass
             finally:
+                try:
+                    tail = dec.decode(b"", True)      # 冲掉结尾残留的半截字符
+                    if tail:
+                        q.put(tail)
+                except Exception:
+                    pass
                 try:
                     proc.stdout.close()
                 except Exception:
@@ -3453,8 +3496,8 @@ async def ws_run_stream(body: dict):
                 q.put(None)
 
         threading.Thread(target=_pump, daemon=True).start()
-        yield json.dumps({"t": "start", "rel": r["rel"], "id": rid,
-                          "risky": r.get("risky") or []}, ensure_ascii=False) + "\n"
+        yield json.dumps({"t": "start", "rel": rel, "id": rid,
+                          "risky": risky or []}, ensure_ascii=False) + "\n"
         t0 = time.time()
         while True:
             try:
@@ -3479,7 +3522,7 @@ async def ws_run_stream(body: dict):
                           "seconds": round(time.time() - t0, 2)},
                          ensure_ascii=False) + "\n"
 
-    return StreamingResponse(_gen(), media_type="application/x-ndjson")
+    return _gen()
 
 
 @app.post("/api/ws/run_stop")
@@ -3913,6 +3956,34 @@ def code_run(req: CodeRunRequest):
     r = tools.run_code(req.code, allow_risky=True)
     r.pop("needs_confirm", None)
     return {"ok": True, **r}
+
+
+@app.post("/api/code/run_stream")
+async def code_run_stream(body: dict):
+    """**流式**运行聊天里代码卡片上的那段代码 —— 像终端一样边跑边出字。
+
+    为什么不用上面那个 `/api/code/run`：它是同步的，**跑完才拿得到输出**，
+    而且有硬性时限。实测用户就是在这里被卡住的 —— 模型写了个番茄钟，
+    点「▶ 运行」只等来一句"执行超过 25 秒，已被强制中止"，看起来像程序坏了，
+    其实代码一点问题都没有（番茄钟本来就要跑 2 小时）。
+
+    所以这个入口**不设时限**：要不要停，由用户按「■ 停止」决定
+    （停止走 /api/ws/run_stop，两边共用同一份进程登记表）。
+    """
+    b = body or {}
+    rid = str(b.get("id") or "")
+    workspace.kill_all_runs()             # 一次只跑一个，免得进程越堆越多
+    r = workspace.start_run_code(str(b.get("code") or ""), run_id=rid,
+                                stdin_text=str(b.get("stdin") or ""))
+    if not r.get("ok"):
+        async def _bad():
+            yield json.dumps({"t": "end", "ok": False,
+                              "error": r.get("error")}, ensure_ascii=False) + "\n"
+        return StreamingResponse(_bad(), media_type="application/x-ndjson")
+
+    return StreamingResponse(
+        _stream_proc_ndjson(r["proc"], rid, r.get("rel") or "", r.get("risky")),
+        media_type="application/x-ndjson")
 
 
 @app.post("/api/code/save")

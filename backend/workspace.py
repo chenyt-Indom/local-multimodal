@@ -478,6 +478,9 @@ def norm_upload_name(filename: str) -> str:
 # 而且**一旦超时被强杀，那 25 秒里打印的东西全被丢掉**（实测：番茄钟跑满 25 秒，
 # 界面显示"（没有输出）"）。流式版边跑边推，超时也保留已产出的内容。
 _RUNS = {}          # run_id -> Popen
+# run_id -> 这次运行用的临时目录（代码卡片那条路径才有）。
+# 进程跑完/被停掉时要把它删掉，否则 %TEMP% 会堆满 mm_card_* 目录。
+_RUN_DIRS = {}
 
 
 def start_run(rel: str, proj: str = "", run_id: str = "",
@@ -557,6 +560,70 @@ def start_run(rel: str, proj: str = "", run_id: str = "",
     return {"ok": True, "proc": proc, "rel": safe_rel(rel), "risky": risky}
 
 
+def start_run_code(code: str, run_id: str = "", stdin_text: str = "") -> dict:
+    """运行**一段代码**（还没进项目的那种）—— 聊天里代码卡片的「▶ 运行」用它。
+
+    和 `start_run` 的区别只有一处：那个跑工作区里的 .py **文件**（cwd = 文件所在目录），
+    这个把代码写进一个临时目录再跑（和模型那个沙箱一致：看不到应用数据目录）。
+
+    ⚠️ **同样不设时限**。原因很实在：用户让模型写的番茄钟、计时器、小服务器
+    本来就要一直跑，限时 25 秒只会得到一句"已被强制中止" —— 用户会以为程序坏了。
+    要不要停，交给用户按「■ 停止」。
+    """
+    import subprocess as _sp
+    import tempfile
+    src = str(code or "")
+    if not src.strip():
+        return {"ok": False, "error": "代码是空的"}
+    from . import tools as _tools          # 延迟导入，避免模块级循环依赖
+    risky = _tools.scan_risky(src)
+    # ⚠️ 用 mkdtemp（不是 TemporaryDirectory）：后者要等 with 结束才删，
+    # 而进程是**在 with 之外**继续跑的，会连工作目录一起被删掉。
+    # 临时目录由 _RUN_DIRS 记账，进程收工时一并清理。
+    d = tempfile.mkdtemp(prefix="mm_card_")
+    path = os.path.join(d, "snippet.py")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(src)
+    except Exception as e:
+        shutil.rmtree(d, ignore_errors=True)
+        return {"ok": False, "error": "写临时文件失败：%s" % e}
+
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"          # 不加这个子进程会缓冲，看不到实时输出
+    env.pop("MM_DATA_DIR", None)           # 被跑的代码不该摸到应用数据目录
+    try:
+        proc = _sp.Popen([sys.executable, "-X", "utf8", "-u", "snippet.py"],
+                         cwd=d, env=env,
+                         # stdin 接管道：程序里 input() 时界面能喂进去（同 start_run）
+                         stdin=_sp.PIPE,
+                         stdout=_sp.PIPE, stderr=_sp.STDOUT,
+                         text=True, encoding="utf-8", errors="replace", bufsize=1)
+    except Exception as e:
+        shutil.rmtree(d, ignore_errors=True)
+        return {"ok": False, "error": "启动失败：%s" % e}
+    if run_id:
+        _RUNS[run_id] = proc
+        _RUN_DIRS[run_id] = d
+    else:
+        # 没给 id 也照样登记（用时间戳造一个）—— 这样"停止/收尸"两处逻辑
+        # 不用为它开特例，临时目录也不会没人管。
+        _k = "code-%d" % time.time_ns()
+        _RUNS[_k] = proc
+        _RUN_DIRS[_k] = d
+        run_id = _k
+    if str(stdin_text or ""):
+        try:
+            _t = str(stdin_text).replace("\r\n", "\n")
+            proc.stdin.write(_t if _t.endswith("\n") else _t + "\n")
+            proc.stdin.flush()
+        except Exception:
+            pass
+    return {"ok": True, "proc": proc, "rel": "(代码片段)", "risky": risky}
+
+
 def send_to_vscode_terminal(cmd: str, cwd: str = "", proj: str = "") -> dict:
     """把一条命令送进**内置 VS Code 的集成终端**里执行。
 
@@ -631,6 +698,25 @@ def send_run_input(run_id: str, data: str) -> dict:
         return {"ok": False, "error": "输入送不进去：%s" % e}
 
 
+def _drop_run_dir(run_id: str) -> None:
+    """删掉某次运行留下的临时目录（代码卡片那条路径才有，文件运行没有）。
+
+    ⚠️ **必须等进程真的退出之后再删**：Windows 上删不掉"还活着的进程的当前目录"
+    （共享冲突），而 `ignore_errors=True` 会把这个失败**静静吞掉** ——
+    表现就是 %TEMP% 里 mm_card_* 越堆越多（实测踩过）。
+    这里再补一次重试，给系统一点释放句柄的时间。
+    """
+    d = _RUN_DIRS.pop(run_id, None)
+    if not d:
+        return
+    for _ in range(3):
+        shutil.rmtree(d, ignore_errors=True)
+        if not os.path.isdir(d):
+            return
+        time.sleep(0.25)
+    shutil.rmtree(d, ignore_errors=True)
+
+
 def stop_run(run_id: str = "") -> dict:
     """停掉正在跑的进程；不给 id 就把所有在跑的停掉。"""
     targets = [run_id] if run_id and run_id in _RUNS else list(_RUNS)
@@ -639,24 +725,26 @@ def stop_run(run_id: str = "") -> dict:
     n = 0
     for k in targets:
         proc = _RUNS.pop(k, None)
-        if proc is None:
-            continue
-        try:
-            proc.terminate()
+        # ⚠️ 顺序不能反：先杀进程，再删它的工作目录（见 _drop_run_dir 的说明）
+        if proc is not None:
             try:
-                proc.wait(timeout=4)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=4)
+                except Exception:
+                    proc.kill()
+                n += 1
             except Exception:
-                proc.kill()
-            n += 1
-        except Exception:
-            pass
+                pass
+        _drop_run_dir(k)
     return {"ok": True, "stopped": n}
 
 
 def reap_runs() -> None:
-    """清掉已经结束的进程记录。"""
+    """清掉已经结束的进程记录（连带它们的临时目录）。"""
     for k in [k for k, v in _RUNS.items() if v.poll() is not None]:
         _RUNS.pop(k, None)
+        _drop_run_dir(k)
 
 
 def kill_all_runs() -> None:

@@ -979,7 +979,7 @@
       }
       // 开启"本地算代码"是**有风险的操作**，必须明确说清而不是默默打开
       if (key === "code_exec_enabled" && p.classList.contains("on")) {
-        showToast("已开启：模型写的 Python 会在你电脑上真实执行（有 25 秒超时，会拦截删除/联网类操作）", "warn");
+        showToast("已开启：模型写的 Python 会在你电脑上真实执行（临时目录 + 时限，会拦截删除/联网类操作）", "warn");
       }
       // 开了代码模型但本机没装时，别让用户以为坏了
       if (key === "code_auto_route" && p.classList.contains("on")) {
@@ -2245,23 +2245,78 @@
         }
       };
       const grab = () => (editing && area ? area.value : current);
+
+      // ---- ▶ 运行：**流式**跑，不设时限 ----
+      // 为什么不用 /api/code/run：那个是同步的（跑完才出字）而且有硬性时限 ——
+      // 计时器、服务器、番茄钟这类**本来就要一直跑**的程序，点运行只会等来
+      // 一句"执行超过 25 秒，已被强制中止"，看起来像程序坏了（实测用户就是这么被卡住的）。
+      // 现在：边跑边出字、不设时限、随时能停。
+      //
+      // 进度条/倒计时用的是 `print(x, end='\r')` —— 一个换行都没有。
+      // 所以显示前要把同一行里的 \r 折叠掉，否则一屏都是 "25:00 24:59 24:58…"。
+      const foldCR = (s) => s.split("\n").map((ln) => {
+        if (ln.indexOf("\r") === -1) return ln;
+        const parts = ln.split("\r").filter((x) => x !== "");
+        return parts.length ? parts[parts.length - 1] : "";
+      }).join("\n");
+      let runningId = null;
       runBtn.onclick = async () => {
+        if (runningId) {                 // 再点一次 = 停止
+          const rid = runningId;
+          runningId = null;
+          runBtn.textContent = "停止中…";
+          runBtn.disabled = true;
+          try { await api("/api/ws/run_stop", { method: "POST", body: JSON.stringify({ id: rid }) }); }
+          catch (e) {}
+          runBtn.disabled = false;
+          runBtn.textContent = "▶ 运行";
+          runBtn.title = "";
+          return;
+        }
         const code = grab();
         if (!code.trim()) { showToast("代码是空的", "warn"); return; }
         current = code;
-        runBtn.disabled = true;
-        const old = runBtn.textContent;
-        runBtn.textContent = "运行中…";
-        outEl.innerHTML = '<div class="code-part">正在运行…</div>';
+        const rid = "card-" + Date.now();
+        runningId = rid;
+        runBtn.textContent = "■ 停止";
+        runBtn.title = "点它就能随时停掉正在跑的程序";
+        let raw = "";
+        const paintLive = () => {
+          outEl.innerHTML = `<div class="code-part"><b>运行中…</b><pre>${escapeHtml(foldCR(raw))}</pre></div>`;
+          outEl.scrollTop = outEl.scrollHeight;
+        };
+        outEl.innerHTML = '<div class="code-part">正在启动…</div>';
         try {
-          const r = await api("/api/code/run", { method: "POST", body: JSON.stringify({ code }) });
-          if (r && r.ok) paintOut(r);
-          else outEl.innerHTML = `<div class="code-part err">运行失败：${escapeHtml(String((r && r.detail) || "未知错误"))}</div>`;
+          const resp = await fetch("/api/code/run_stream", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ code, id: rid }) });
+          if (!resp.ok) throw new Error(resp.statusText || ("HTTP " + resp.status));
+          const reader = resp.body.getReader();
+          const dec = new TextDecoder();
+          let buf = "";
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            const lines = buf.split("\n"); buf = lines.pop();
+            for (const line of lines) {
+              if (!line.trim()) continue;
+              let o; try { o = JSON.parse(line); } catch { continue; }
+              if (o.t === "out") { raw += o.data; paintLive(); }
+              else if (o.t === "end") {
+                if (!o.ok) throw new Error(o.error || "启动失败");
+                paintOut({ out: foldCR(raw), rc: o.rc, seconds: o.seconds });
+              }
+            }
+          }
+          if (!raw) outEl.innerHTML = '<div class="code-part empty">（没有输出 —— 代码里要用 print() 打印结果）</div>';
         } catch (e) {
-          outEl.innerHTML = `<div class="code-part err">运行失败：${escapeHtml(String(e.message || e))}</div>`;
+          outEl.innerHTML =
+            `<div class="code-part err">运行失败：${escapeHtml(String(e.message || e))}</div>`;
         } finally {
-          runBtn.disabled = false;
-          runBtn.textContent = old;
+          if (runningId === rid) runningId = null;
+          runBtn.textContent = "▶ 运行";
+          runBtn.title = "";
         }
       };
       // 存到生成文库：代码模型那一轮没有工具，保存只能靠这个按钮。
@@ -2387,7 +2442,7 @@
         '<div class="confirm-title">⚠️ 这次操作需要你确认</div>' +
         `<div class="confirm-reason">${escapeHtml(ui.reason || "模型请求执行一段有风险的代码")}</div>` +
         '<pre class="confirm-code"><code></code></pre>' +
-        '<div class="confirm-tip">批准后会在本机真实执行（临时目录、25 秒超时）。不确定就别点允许。</div>' +
+        '<div class="confirm-tip">批准后会在本机真实执行（临时目录、有运行时限）。不确定就别点允许。</div>' +
         '<div class="confirm-btns"><button class="btn ghost" data-act="deny">拒绝</button>' +
         '<button class="btn primary" data-act="allow">允许执行</button></div></div>';
       layer.querySelector("code").textContent = ui.code || "";

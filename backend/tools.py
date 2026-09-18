@@ -542,7 +542,12 @@ _WS_RUN_SCHEMA = {
         "name": "workspace_run",
         "description": ("【开发工作区】运行工作区里的一个 .py 文件，拿到**真实输出与报错**。"
                         "工作目录就是该文件所在目录，所以脚本里的相对路径是对的。"
-                        "写完文件后**用它验证**，不要凭空猜运行结果。"),
+                        "写完文件后**用它验证**，不要凭空猜运行结果。"
+                        "⚠️ 它只能跑「算完就退出」的程序（默认最多 60 秒）。"
+                        "**计时器 / 服务器 / 游戏 / 图形界面这类要一直跑的程序不要用它跑完整** ——"
+                        "工具只会跑前几秒做冒烟测试，**那不是报错、也不说明代码有问题**，"
+                        "更**不要为了绕过它去改代码**（加线程、加 signal 都没用）。"
+                        "这种程序写好直接交给用户，让用户点代码卡片上的「▶ 运行」（那里不设时限）。"),
         "parameters": {"type": "object",
                        "properties": {
                            "rel": {"type": "string",
@@ -989,6 +994,10 @@ def _run_py_schema() -> dict:
                 "做日期/单位换算、正则匹配测试等 —— 凡是「算出来比想出来更可靠」的场景都用它。\n"
                 "怎么用：把完整可运行的代码放进去，用 print() 输出你要看的结果；\n"
                 "**不要**用 input()（没人能输入），不要写文件以外的东西到磁盘（会在临时目录里执行）。\n"
+                "⚠️ 它**只能跑「算完就退出」的代码**（默认最多 60 秒）。"
+                "**计时器 / 服务器 / 游戏 / 图形界面这类要一直跑的程序不要用它跑完整** —— "
+                "工具只会跑前几秒做冒烟测试，那是**正常的、不是代码报错**；"
+                "这种程序写好交给用户，让用户点代码卡片上的「▶ 运行」（那里不设时限）。\n"
                 "可用库：标准库 + " + libs_txt + "。\n"
                 "拿到输出后**依据真实结果**回答用户，不要把输出原样贴给用户就完事。"
             ),
@@ -2019,7 +2028,86 @@ def _do_remember(arguments, context=None):
 
 
 # ---------- 本地代码执行（"离线计算"）----------
-RUN_TIMEOUT = 25          # 秒。计算题够用，也避免死循环把机器占住
+# 「一次性计算」的兜底上限（秒）。可在 config.json 里用 run_timeout 覆盖（5~600）。
+# ⚠️ 必须封顶：一个死循环就能把智能体挂住。
+RUN_TIMEOUT = 60
+# 「持续运行」型程序（计时器 / 服务器 / 图形界面 …）只给一个**冒烟测试窗口**：
+# 够证明它正常启动、前几秒的输出是对的，又不会让工具白等。
+RUN_PROBE = 8
+
+
+def run_timeout() -> int:
+    """当前生效的一次性计算上限（秒）。读 config，读不到就用默认值。"""
+    try:
+        from . import config as _cfg
+        v = int((_cfg.load_config() or {}).get("run_timeout") or RUN_TIMEOUT)
+    except Exception:
+        v = RUN_TIMEOUT
+    return max(5, min(v, 600))
+
+
+# ⚠️⚠️ **「跑不完」不等于「代码有问题」**（真实踩坑，必须记住）：
+# 用户让模型写了个番茄钟，模型用工具跑它 → 时限到了被强杀 → 工具原话是
+# "执行超过 25 秒，已被强制中止" → 模型**以为自己的代码写错了**，于是加线程、
+# 加 signal.SIGALRM 反复重写（而 signal.alarm 在 Windows 上根本不存在），
+# 三版代码越改越烂 —— 其实用户的原版代码一行都没错，番茄钟本来就该跑 2 小时。
+# 所以：能一眼看出"这程序要一直跑"时，就只做几秒冒烟测试，
+# 而且**必须把结论说成"这不是报错"**，并明确禁止模型去"绕过超时"。
+_PERSIST_PATS = (
+    (("while true", "while 1:", "while 1 :"),
+     "里面有个不会结束的循环（while True）"),
+    (("mainloop()", "mainloop ()", "turtle.done()"),
+     "是图形界面程序（进入事件循环后不会返回）"),
+    (("serve_forever", "http.server", "socketserver", "httpserver(",
+      "uvicorn.run", "app.run(", "run_simple("),
+     "是常驻服务器"),
+    (("pygame.", "cv2.imshow", "cv2.videocapture"),
+     "是窗口 / 摄像头程序"),
+    (("schedule.every", "asyncio.start_server"),
+     "是常驻的调度 / 服务程序"),
+)
+
+
+def looks_persistent(code: str) -> str:
+    """这段代码是不是「要一直跑」的程序？是就返回人话原因，不是返回空串。
+
+    判断**宁漏勿误**：漏判只是照旧按上限跑（和以前一样），
+    误判却会把一次正常的长计算当成常驻程序、几秒就砍掉。
+    """
+    body = "\n".join(ln for ln in (code or "").splitlines()
+                     if not ln.strip().startswith("#"))
+    low = body.lower()
+    for pats, reason in _PERSIST_PATS:
+        if any(p in low for p in pats):
+            return reason
+    # 循环里在 sleep → 计时器 / 轮询（进程不会自己结束）。
+    # 只在有 while 时才这么判：`for i in range(3): sleep(1)` 是有次数的等待，
+    # 会自己结束，误判成常驻就会白砍掉。
+    if "sleep(" in low and "while " in low:
+        return "是计时器 / 轮询程序（循环里在 sleep，进程不会自己结束）"
+    return ""
+
+
+def _timeout_result(out, err, risky, persistent: str, limit: int, t0: float) -> dict:
+    """被时限强杀后的统一结论。
+
+    ⚠️ 对「持续运行」型程序，措辞必须让人**一眼看出不是报错**，
+    并且顺带把"别改代码、别重跑"说死 —— 少了这句，模型就会去加线程、
+    用 Windows 上不存在的 signal.alarm 重写（实测踩过）。
+    """
+    if persistent:
+        note = ("（已运行 %d 秒仍在继续 —— 这是**持续运行**型的程序，"
+                "**不是报错**，代码没有问题。）" % limit)
+    else:
+        note = ("执行超过 %d 秒，已被强制中止（上面是中止前已经打印的内容）。\n"
+                "多半是死循环或卡住了，请检查循环的退出条件。" % limit)
+    err = ((err or "").strip() + "\n" + note).strip()
+    return {"needs_confirm": False, "risky": risky,
+            "out": (out or "").strip(), "err": err, "rc": None,
+            "seconds": round(time.time() - t0, 2),
+            # persistent 只在"被冒烟窗口截断"时才有值，跑完了就一定是空
+            "persistent": persistent,
+            "seconds_limit": limit}
 
 # 需要"先问用户"的操作。**不再一律拦截** ——
 # 用户明确要求：发现危险操作先问一句，批准了就执行，而不是直接拒绝。
@@ -2058,20 +2146,25 @@ def scan_risky(code: str) -> list:
 def run_code(code: str, allow_risky: bool = False) -> dict:
     """执行一段 Python，返回**结构化**结果（工具与前端接口共用）。
 
-    字段：needs_confirm / risky / out / err / rc / seconds
+    字段：needs_confirm / risky / out / err / rc / seconds / persistent
     needs_confirm=True 表示"检测到风险但还没获批准"，**没有执行**。
+    persistent 非空 = 这段代码是"要一直跑"的那种，只做了几秒冒烟测试，
+    **时限到了不是报错**（见 looks_persistent 上面的说明）。
     """
     code = str(code or "").strip()
     if not code:
         return {"needs_confirm": False, "risky": [], "out": "", "err": "代码为空",
-                "rc": -1, "seconds": 0}
+                "rc": -1, "seconds": 0, "persistent": ""}
     risky = scan_risky(code)
     if risky and not allow_risky:
         return {"needs_confirm": True, "risky": risky, "out": "", "err": "",
-                "rc": None, "seconds": 0}
+                "rc": None, "seconds": 0, "persistent": ""}
     import tempfile
     import subprocess as _sp
     t0 = time.time()
+    # 识别"要一直跑"的程序 → 只跑几秒冒烟测试，结论按"不是报错"说
+    persistent = looks_persistent(code)
+    limit = RUN_PROBE if persistent else run_timeout()
     with tempfile.TemporaryDirectory(prefix="mm_run_") as d:
         path = os.path.join(d, "snippet.py")
         try:
@@ -2079,29 +2172,44 @@ def run_code(code: str, allow_risky: bool = False) -> dict:
                 f.write(code)
         except Exception as exc:
             return {"needs_confirm": False, "risky": risky, "out": "", "rc": -1,
-                    "seconds": 0, "err": "无法写入临时文件：%s" % exc}
+                    "seconds": 0, "persistent": "", "err": "无法写入临时文件：%s" % exc}
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["PYTHONUNBUFFERED"] = "1"
         # 不让被执行的代码摸到应用的数据目录
         env.pop("MM_DATA_DIR", None)
         try:
-            p = _sp.run([sys.executable, "-X", "utf8", "snippet.py"],
-                        cwd=d, env=env, capture_output=True, text=True,
-                        encoding="utf-8", errors="replace", timeout=RUN_TIMEOUT)
-            out = (p.stdout or "").strip()
-            err = (p.stderr or "").strip()
-            rc = p.returncode
-        except _sp.TimeoutExpired:
-            return {"needs_confirm": False, "risky": risky, "out": "", "rc": None,
-                    "seconds": round(time.time() - t0, 2),
-                    "err": "执行超过 %d 秒，已被强制中止。" % RUN_TIMEOUT}
+            # ⚠️ 用 Popen 而不是 subprocess.run：**run 的 TimeoutExpired 会把
+            # 已经打印出来的内容一起丢掉**（实测：跑满时限的计时器在界面上
+            # 显示成"（没有输出）"）。Popen 在强杀之后还能把已产出的输出收回来。
+            # stdin 接 DEVNULL：这个后端是 GUI 启动的、没有终端可读，
+            # 不接的话子进程会去继承一个无效句柄。
+            p = _sp.Popen([sys.executable, "-X", "utf8", "-u", "snippet.py"],
+                          cwd=d, env=env, stdin=_sp.DEVNULL,
+                          stdout=_sp.PIPE, stderr=_sp.PIPE,
+                          text=True, encoding="utf-8", errors="replace")
         except Exception as exc:
             return {"needs_confirm": False, "risky": risky, "out": "", "rc": -1,
-                    "seconds": round(time.time() - t0, 2),
+                    "seconds": round(time.time() - t0, 2), "persistent": "",
+                    "err": "无法启动：%s: %s" % (type(exc).__name__, exc)}
+        try:
+            out, err = p.communicate(timeout=limit)
+            rc = p.returncode
+        except _sp.TimeoutExpired:
+            p.kill()
+            try:
+                out, err = p.communicate()      # 收尸并取回已产出的输出
+            except Exception:
+                out, err = "", ""
+            return _timeout_result(out, err, risky, persistent, limit, t0)
+        except Exception as exc:
+            return {"needs_confirm": False, "risky": risky, "out": "", "rc": -1,
+                    "seconds": round(time.time() - t0, 2), "persistent": "",
                     "err": "%s: %s" % (type(exc).__name__, exc)}
-    return {"needs_confirm": False, "risky": risky, "out": out, "err": err,
-            "rc": rc, "seconds": round(time.time() - t0, 2)}
+    return {"needs_confirm": False, "risky": risky, "out": (out or "").strip(),
+            "err": (err or "").strip(), "rc": rc, "persistent": "",
+            "seconds": round(time.time() - t0, 2)}
 
 
 def run_file(path: str, allow_risky: bool = False, args: str = "",
@@ -2128,9 +2236,13 @@ def run_file(path: str, allow_risky: bool = False, args: str = "",
     risky = scan_risky(code)
     if risky and not allow_risky:
         return {"needs_confirm": True, "risky": risky, "out": "", "err": "",
-                "rc": None, "seconds": 0}
+                "rc": None, "seconds": 0, "persistent": ""}
     import subprocess as _sp
     t0 = time.time()
+    # 计时器 / 服务器这类"要一直跑"的程序：只给几秒冒烟测试，
+    # 并把结论说成"不是报错"（理由见 looks_persistent 上面的说明）。
+    persistent = looks_persistent(code)
+    limit = RUN_PROBE if persistent else run_timeout()
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -2147,7 +2259,7 @@ def run_file(path: str, allow_risky: bool = False, args: str = "",
     try:
         # 用 Popen + communicate（而不是 subprocess.run）：超时分支里还能
         # **拿到已经打印出来的内容**。run 的 TimeoutExpired 会把缓冲一起丢掉，
-        # 于是"跑满 25 秒的计时器"在界面上显示成"（没有输出）"—— 实测踩过。
+        # 于是"跑满时限的计时器"在界面上显示成"（没有输出）"—— 实测踩过。
         # 命令行参数：像 argparse 这种工具，**不给参数就什么都不做** ——
         # 模型会以为"跑通了没问题"，其实根本没验到东西。让它可以传参。
         import shlex as _shlex
@@ -2167,14 +2279,14 @@ def run_file(path: str, allow_risky: bool = False, args: str = "",
                        text=True, encoding="utf-8", errors="replace")
     except Exception as exc:
         return {"needs_confirm": False, "risky": risky, "out": "", "rc": -1,
-                "seconds": round(time.time() - t0, 2),
+                "seconds": round(time.time() - t0, 2), "persistent": "",
                 "err": "无法启动：%s: %s" % (type(exc).__name__, exc)}
     try:
         _stdin = str(stdin_text or "").replace("\r\n", "\n")
         # 结尾补一个换行：程序里最后一次 input() 才不会一直等
         if _stdin and not _stdin.endswith("\n"):
             _stdin += "\n"
-        out, err = pr.communicate(input=_stdin, timeout=RUN_TIMEOUT)
+        out, err = pr.communicate(input=_stdin, timeout=limit)
         rc = pr.returncode
     except _sp.TimeoutExpired:
         pr.kill()
@@ -2182,13 +2294,8 @@ def run_file(path: str, allow_risky: bool = False, args: str = "",
             out, err = pr.communicate()          # 收尸并取回已产出的输出
         except Exception:
             out, err = "", ""
-        return {"needs_confirm": False, "risky": risky,
-                "out": (out or "").strip(),
-                "err": ((err or "").strip()
-                        + "\n执行超过 %d 秒，已被强制中止（上面是中止前已经打印的内容）。"
-                        % RUN_TIMEOUT).strip(),
-                "rc": None, "seconds": round(time.time() - t0, 2)}
-    return {"needs_confirm": False, "risky": risky,
+        return _timeout_result(out, err, risky, persistent, limit, t0)
+    return {"needs_confirm": False, "risky": risky, "persistent": "",
             "out": (out or "").strip(), "err": (err or "").strip(),
             "rc": rc, "seconds": round(time.time() - t0, 2)}
 
@@ -3534,6 +3641,30 @@ def _format_py_result(r: dict) -> str:
     lines = ["【代码执行结果】"]
     out = r.get("out") or ""
     err = r.get("err") or ""
+    # ⚠️ 这段必须放在**最前面**（实测：放结尾 qwen3-vl 根本不看）。
+    # 真实踩坑：番茄钟被时限强杀 → 模型以为是自己的代码错了 → 加线程、加
+    # signal.SIGALRM 重写了三版（signal 在 Windows 上根本不存在），
+    # 其实原代码一行都没错。所以这里把"不是报错、别改它、交给用户跑"说死。
+    persistent = str(r.get("persistent") or "")
+    if persistent:
+        # ⚠️ 「有输出」和「一个字都没有」必须分开说：前者说明它启动正常，
+        # 后者是真卡住（死循环）的典型征兆 —— 一律说成"没问题"会放过真 bug。
+        smoke = ("冒烟测试里它已经跑出了下面的输出，说明**启动正常、在正常干活**。"
+                 if out else
+                 "这 %s 秒里它**一个字都没打印**。如果它本来就该有输出"
+                 "（比如倒计时、日志），那**很可能是卡住了（比如死循环）**，"
+                 "要查一下循环的退出条件；如果它本来就不打印，那是正常的。"
+                 % (r.get("seconds_limit") or RUN_PROBE))
+        lines.append(
+            "⏱ **先说结论：这算不上报错，代码大概率没问题。**\n"
+            "这段程序**没能在 %s 秒的冒烟窗口里结束**（%s），工具里等不到它跑完 —— "
+            "这类程序本来就该一直跑，冒烟测试只是为了确认它能正常启动。%s\n"
+            "⛔ **不要为了让它更快结束去改结构**（加线程、加 signal 都不会让它变快），"
+            "也**不要反复重跑**同一个程序。\n"
+            "（唯一的例外：你**确定**它本该几秒内就结束 —— 那才去检查循环的退出条件。）\n"
+            "✅ 把这个程序交给用户：告诉用户「代码已写好，点代码卡片上的 ▶ 运行 就能完整跑」"
+            "—— 那里不设时限，会一直跑、随时能停。"
+            % (r.get("seconds_limit") or RUN_PROBE, persistent, smoke))
     if out:
         if len(out) > 4000:
             out = "（输出过长，只保留最后 4000 字）\n" + out[-4000:]
@@ -3547,7 +3678,11 @@ def _format_py_result(r: dict) -> str:
         lines.append("（退出码 %s，说明代码报错了；请先修正再给出结论）" % r.get("rc"))
     if r.get("risky"):
         lines.append("（这次执行包含用户已批准的操作：%s）" % "、".join(r["risky"]))
-    lines.append("请**依据上面的真实输出**回答用户；如果代码报错，先说清错在哪并给出修正后的代码。")
+    if persistent:
+        lines.append("请如实告诉用户「程序本身没问题，工具里只能跑前几秒；"
+                     "点 ▶ 运行 就能完整跑」，**不要去改它**。")
+    else:
+        lines.append("请**依据上面的真实输出**回答用户；如果代码报错，先说清错在哪并给出修正后的代码。")
     return "\n\n".join(lines)
 
 
