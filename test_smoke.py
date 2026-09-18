@@ -67,8 +67,9 @@ def main():
     check("make_schemas 能出工具清单", len(names) >= 30, "%d 个" % len(names))
     dup = [n for n in set(names) if names.count(n) > 1]
     check("没有重名工具", not dup, str(dup) if dup else "")
-    for must in ("map_plan", "nearby_places", "make_pptx", "make_docx", "make_xlsx",
-                 "edit_office", "library", "remember", "search_memory", "get_time"):
+    for must in ("map_plan", "nearby_places", "connect_amap",      # connect_amap：请用户配高德 key
+                 "make_pptx", "make_docx", "make_xlsx", "edit_office", "library",
+                 "remember", "search_memory", "get_time"):
         check("已注册 %s" % must, must in names)
 
     # ---------------- ② 生成类工具 ----------------

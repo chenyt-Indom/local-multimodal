@@ -237,8 +237,9 @@
 
   // ---------- 地图卡片 ----------
   // 后端把地点 / 路线算好（真实坐标、真实距离用时），前端只负责画。
-  // 瓦片走后端代理 `/api/map/tile/{z}/{x}/{y}.png` → 看过的区域会**缓存到本地**，
-  // 断网也能看；Leaflet 本身也放在本地 vendor 里，不依赖外网 CDN。
+  // 瓦片走后端代理 `/api/map/tile/{z}/{x}/{y}.png`（后端换镜像，并统一转发）。
+  // ⚠️ 地图**不缓存**：后端响应 no-store，离线时瓦片直接 404、卡片不显示底图。
+  // Leaflet 本身放在本地 vendor 里，不依赖外网 CDN。
   let mapSeq = 0;
   function makeMapCard(ui) {
     const wrap = document.createElement("div");
@@ -269,11 +270,6 @@
         `，约 ${escapeHtml(rt.duration || "")}`;
       if ((rt.routes || []).length > 1) {
         html += `<span class="map-alt">共 ${rt.routes.length} 条可选</span>`;
-      }
-      if (rt.cached) {
-        html += `<span class="map-src">本地缓存` +
-          (rt.cache_time ? " " + escapeHtml(rt.cache_time) : "") +
-          (rt.stale ? "（已过期）" : "") + `</span>`;
       }
       // 步行/骑行的距离其实来自驾车路网、时间只是估算 —— 不能不说
       if (rt.estimated) {
@@ -360,13 +356,13 @@
     return wrap;
   }
 
-  // 离线时地图上大片空白 → 给一句明白话，别让用户对着灰底猜"是不是坏了"
+  // 离线时地图上没有底图 → 给一句明白话，别让用户对着灰底猜"是不是坏了"
   function mapOfflineTip(el) {
     if (el.querySelector(".map-offline-tip")) return;
     const d = document.createElement("div");
     d.className = "map-offline-tip";
-    d.innerHTML = "离线模式：这块区域还没缓存到本地。" +
-      "<br>联网时问一次这条路线，之后断网也能看。";
+    d.innerHTML = "离线模式：不显示地图底图。" +
+      "<br>地点、路线这些结论照样给；要看底图把顶栏的「联网」打开。";
     el.appendChild(d);
   }
 
@@ -419,8 +415,8 @@
       return;
     }
     // ---- 底图：联网 + 配了高德 key → 高德；其余（离线 / 没配 key）→ OSM ----
-    // 离线之所以还用 OSM：本地缓存的那些瓦片就是 OSM 的，换源等于把攒下来的
-    // 离线地图全作废。两套各用各的坐标系、各存各的缓存目录，互不干扰。
+    // 离线时其实两张底图都取不到（不缓存），但 tile_source 仍然要定下来 ——
+    // 前端据此决定打点要不要做 WGS-84 → GCJ-02 换算，不能少。
     const useAmap = ui.tile_source === "amap";
     const toTile = useAmap
       ? function (la, lo) { return wgs2gcj(la, lo); }
@@ -432,18 +428,16 @@
     const map = L.map(el, { zoomControl: true, attributionControl: true })
       .setView(toTile(center[0], center[1]), ui.zoom || 12);
 
-    // 瓦片一律走后端（后端走本地缓存）。离线时后端不联网，
-    // 没缓存过的瓦片直接 404，所以这里要接住 tileerror。
+    // 瓦片一律走后端代理（国内直连 OSM 官方瓦片经常超时，后端统一换了镜像）。
+    // ⚠️ 后端**不做任何缓存**、响应带 no-store，所以离线时这里就是 404，
+    //    要靠 tileerror 接住、给用户一句明白话。
     let tileErr = 0;
     const layer = L.tileLayer(
-      // ⚠️ 高德这条带 `?v=1`：之前参数喂反时高德回过一批**空白瓦片**，
-      //    浏览器按 7 天 TTL 缓存住了，光改后端救不回来（页面里还是白的）。
-      //    换掉 URL 就等于把那份坏缓存作废。以后瓦片格式/参数再变，把这个版本号 +1。
-      useAmap ? "/api/map/amap/{z}/{x}/{y}.png?v=1" : "/api/map/tile/{z}/{x}/{y}.png", {
+      useAmap ? "/api/map/amap/{z}/{x}/{y}.png" : "/api/map/tile/{z}/{x}/{y}.png", {
         minZoom: 3, maxZoom: 19,
         attribution: useAmap
           ? "地图数据 © 高德地图（GCJ-02）"
-          : "地图数据 © OpenStreetMap 贡献者（缓存在本地）",
+          : "地图数据 © OpenStreetMap 贡献者",
       });
     layer.on("tileerror", function () {
       tileErr++;
@@ -508,26 +502,79 @@
     window.__mmMaps = (window.__mmMaps || []).concat([map]);
   }
 
-  // 地图缓存情况（点一下看有多少瓦片存在本地）
-  async function showMapCache() {
+  // 高德 key 面板：填了立刻生效，不用重启，也不用去改 config.json
+  // ⚠️ 地图**不做任何本地缓存**（2026-09-18 起），所以原来那个「地图缓存」按钮没了，
+  //    换成这个 —— 它解决的才是真问题（新机器上没 key，地图只能退回 OpenStreetMap）。
+  async function showAmapKey() {
+    if (document.querySelector(".amap-layer")) return;
+    let cur = "";
     try {
-      const d = await api("/api/map/stats");
-      const mb = ((d.bytes || 0) / 1048576).toFixed(1);
-      const ttl = d.ttl_days || {};
-      showToast(
-        (d.online ? "联网模式" : "离线模式") +
-        "｜底图：" + (d.tile_source_name || "OpenStreetMap") +
-        "（离线用本地缓存的 OSM）" +
-        "｜本地地图：瓦片 " + (d.tiles || 0) + " 张（" + mb + " MB）" +
-        (d.tiles_amap ? "，其中高德 " + d.tiles_amap + " 张" : "") +
-        "、地点 " + (d.places || 0) + " 个、路线 " + (d.routes || 0) +
-        " 条；内置常用地名 " + (d.builtin || 0) + " 条。" +
-        (d.newest_ago ? "数据最近更新于 " + d.newest_ago + "。" : "") +
-        " 联网时会自动刷新过期数据（地名 " + (ttl.geo || 30) + " 天 / 路线 " +
-        (ttl.route || 7) + " 天 / 瓦片 " + (ttl.tile || 60) + " 天）", "ok");
-    } catch (e) { showToast("读不到缓存信息：" + e.message, "warn"); }
+      const d = await api("/api/config");
+      cur = String(((d || {}).config || {}).amap_key || "");
+    } catch (e) { /* 读不到就当没配 */ }
+
+    const layer = document.createElement("div");
+    layer.className = "confirm-layer amap-layer";
+    layer.innerHTML =
+      '<div class="confirm-box">' +
+      '<div class="confirm-title">🗺️ 高德地图</div>' +
+      '<div class="confirm-reason">' +
+      '配了 key 之后，地图能搜到全国的小店、有**真实评分**、有实时路况和公交换乘，' +
+      '步行骑行也是真实路径。<br>不配也能用，退回 OpenStreetMap —— ' +
+      '能查大城市/道路/机场车站，但小店、评分、路况、公交都没有。<br><br>' +
+      '申请（1 分钟）：console.amap.com → 手机号注册+实名 → 建应用 → 加 Key → ' +
+      '<b>服务平台必须选「Web 服务」</b>（选成「Web 端(JS API)」用不了）。' +
+      '</div>' +
+      `<div class="amap-state">${cur ? "当前：已连接（" + escapeHtml(cur.slice(0, 6)) + "…）"
+                                    : "当前：未配置，地图在用 OpenStreetMap"}</div>` +
+      '<input class="amap-input" type="text" placeholder="把 32 位 key 粘贴在这里"' +
+      (cur ? ` value="${escapeHtml(cur)}"` : "") + ' />' +
+      '<div class="amap-msg"></div>' +
+      '<div class="confirm-btns">' +
+      '<button class="btn ghost" data-act="close">关闭</button>' +
+      (cur ? '<button class="btn ghost" data-act="clear">断开（改回 OpenStreetMap）</button>' : "") +
+      '<button class="btn primary" data-act="save">连接并测试</button>' +
+      '</div></div>';
+    document.body.appendChild(layer);
+
+    const input = layer.querySelector(".amap-input");
+    const msg = layer.querySelector(".amap-msg");
+    const btns = layer.querySelectorAll("button");
+    const say = (t, kind) => { msg.textContent = t; msg.className = "amap-msg " + (kind || ""); };
+    const busy = (on) => { btns.forEach((b) => { b.disabled = on; }); };
+
+    async function save(key) {
+      busy(true);
+      say("正在连高德验证…", "");
+      try {
+        const r = await api("/api/map/amap_key", {
+          method: "POST", body: JSON.stringify({ key }) });
+        if (r && r.ok) {
+          say(r.message || "连接成功", "ok");
+          showToast("高德已连接，地图能力升级了", "ok");
+          setTimeout(() => layer.remove(), 1600);
+        } else {
+          say((r && r.message) || "验证失败", "bad");
+        }
+      } catch (e) {
+        say("连不上后端：" + String(e.message || e), "bad");
+      } finally { busy(false); }
+    }
+
+    layer.querySelector('[data-act="close"]').onclick = () => layer.remove();
+    const clr = layer.querySelector('[data-act="clear"]');
+    if (clr) clr.onclick = () => save("");
+    layer.querySelector('[data-act="save"]').onclick = () => {
+      const v = (input.value || "").trim();
+      if (!v) { say("还没有填 key 呢。", "bad"); input.focus(); return; }
+      save(v);
+    };
+    input.onkeydown = (e) => {
+      if (e.key === "Enter") layer.querySelector('[data-act="save"]').click();
+    };
+    input.focus();
   }
-  window.__showMapCache = showMapCache;
+  window.__showAmapKey = showAmapKey;
   window.__makeMapCard = makeMapCard;      // 导出一下，方便排查"地图没画出来"
 
   // ---------- 站内下载：桌面壳里改走原生「另存为」 ----------
@@ -676,9 +723,9 @@
   }
 
   // ⚠️ 只给**真正的开关**（带 data-cfg 的）绑开关逻辑。
-  // 原来选的是 ".pill"，结果顶栏那个「地图缓存」按钮（借用了 .pill 的外观）
-  // 也被一起抓进来，`p.onclick = ...` 会**覆盖掉它自己的点击处理**，
-  // 表现就是"按钮点了完全没反应"。加 [data-cfg] 限定就好。
+  // 顶栏的「高德 key」按钮借用了 .pill 的外观，如果这里选 ".pill" 会把它一起抓进来，
+  // `p.onclick = ...` 会**覆盖掉它自己的点击处理**，表现就是"按钮点了完全没反应"。
+  // 加 [data-cfg] 限定就好。顶栏以后再加按钮，记得同样别让它被这条规则吃掉。
   document.querySelectorAll(".pill[data-cfg]").forEach((p) => {
     p.onclick = async () => {
       const key = p.dataset.cfg;
@@ -2141,16 +2188,20 @@
       if (document.querySelector(".ask-layer")) return;
       const qs = ui.questions || [];
       if (!qs.length) return;
+      // title / hint 可以由后端指定 —— 比如"请填高德 key"那种场景，
+      // 用默认那句"想先跟你确认几个细节"就对不上了。
+      const title = ui.title || "💬 想先跟你确认几个细节";
+      const hint = ui.hint || "补充下面的信息，写出来才贴你的要求。不想答的直接留空跳过。";
       const layer = document.createElement("div");
-      layer.className = "confirm-layer ask-layer";
+      layer.className = "confirm-layer ask-layer" + (ui.freeInput ? " ask-free-mode" : "");
       layer.innerHTML =
         '<div class="confirm-box">' +
-        '<div class="confirm-title">💬 想先跟你确认几个细节</div>' +
-        '<div class="confirm-reason">补充下面的信息，写出来才贴你的要求。不想答的直接留空跳过。</div>' +
+        `<div class="confirm-title">${escapeHtml(title)}</div>` +
+        `<div class="confirm-reason">${escapeHtml(hint).replace(/\n/g, "<br>")}</div>` +
         '<div class="ask-list"></div>' +
         '<div class="confirm-btns">' +
-        '<button class="btn ghost" data-act="skip">跳过，按你的理解写</button>' +
-        '<button class="btn primary" data-act="send">提交，继续</button></div></div>';
+        `<button class="btn ghost" data-act="skip">${ui.freeInput ? "不填，跳过" : "跳过，按你的理解写"}</button>` +
+        `<button class="btn primary" data-act="send">${ui.freeInput ? "保存并连接" : "提交，继续"}</button></div></div>`;
       const list = layer.querySelector(".ask-list");
       const items = [];
       qs.forEach((q, i) => {
@@ -2160,7 +2211,7 @@
         const opts = (q.options || []).map((o) =>
           `<label class="ask-opt"><input type="${type}" name="ask${i}" value="${escapeHtml(o)}">` +
           `<span>${escapeHtml(o)}</span></label>`).join("");
-        box.innerHTML = `<div class="ask-q">${i + 1}. ${escapeHtml(q.question)}</div>` +
+        box.innerHTML = `<div class="ask-q">${ui.freeInput ? "" : (i + 1) + ". "}${escapeHtml(q.question)}</div>` +
           (opts ? `<div class="ask-opts">${opts}</div>` : "") +
           `<input class="ask-free" type="text" placeholder="${opts ? "也可以自己写…" : "在这里回答"}" />`;
         list.appendChild(box);

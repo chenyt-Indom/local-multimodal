@@ -1366,11 +1366,12 @@ _TEXT_TOOL_DOCS = {
                 '返回里会带 note，**必须把这话转告用户**，不能让他以为是真步行路线。'
                 '中长途会自动给**多条备选路线**并挑一条推荐，返回里有 routes 和 reason；'
                 '把「为什么推荐这条」照实说出来，只有一条时也别硬凑。'
-                '用户问天气或要把出行讲清楚时给 weather:true；offline=true 会把沿途瓦片下到本地。'
-                '⚠️ 它跟着「联网」开关走：开着联网就上网查（查到会自动存本地，下次离线也有）；'
-                '关着联网＝离线模式，只认本地记录过的地点 + 内置常用地名表。'
+                '用户问天气或要把出行讲清楚时给 weather:true。'
+                '⚠️ 它跟着「联网」开关走，而且**地图不做任何本地缓存**：'
+                '开着联网就实时上网查；关着联网＝离线模式，此时只剩一份内置常用地名表可用，'
+                '路线只能给"直线距离"。'
                 '离线时查不到就**照实说查不到**，绝不许编坐标、编距离；'
-                '离线时没缓存过的路线只会给"直线距离"，必须讲明那是直线、不是实际道路。'
+                '路线只会给"直线距离"，必须讲明那是直线、不是实际道路。'
                 '返回里是**真实**距离与用时，照实说，别自己算。'
                 '⚠️ **只有用 mode=transit 拿到的才能讲公共交通**。没走 transit 就不许编'
                 '「坐 X 路公交、票价 Y 元、每 Z 分钟一班」这种具体线路（实测模型真的会编）；'
@@ -1424,6 +1425,13 @@ _TEXT_TOOL_DOCS = {
                    '"w":6,"h":0.5,"size":16}, {"op":"set_theme","theme":"green"}]}。'
                    '**编号要用 inspect 给的那些，别猜。**',
     "get_time": '获取当前日期与时间。参数 {}',
+    "connect_amap": '【连接高德地图】请用户把他的高德 key 填进来，填完当场验证、立刻生效。'
+                    '**用户要用地图、而本机还没配高德 key 时，先调它** ——'
+                    '别直接说做不到，也别默默用着弱底图不吭声。'
+                    '填了能搜到全国小店、有真实评分/实时路况/公交换乘；'
+                    '不填就退回 OpenStreetMap（大城市和道路能查，小店评分都没有）。'
+                    '参数 {"reason": "为什么现在需要（一句话，会给用户看）"}，可省略。'
+                    '⚠️ 用户说「不用」就按没 key 继续，别反复问。',
 }
 _TEXT_TOOL_NAMES = set(_TEXT_TOOL_DOCS)
 # 正文里出现这些，就说明模型开始写"文本协议工具调用"了 —— 用来做流式时的边界判断
@@ -1985,6 +1993,13 @@ class _SystemPrompt:
             "**不要凭印象挑几个地标丢给 map_plan** —— 那是编的，实测会把「商场」"
             "标成地铁站、甚至标到外省去；\n"
             "  · 在地图上标出几个**用户点名要到**的具体地点，才用 map_plan 的 places。\n"
+            "  · ⚠️ **本机没配高德 key 时**（地图会退回 OpenStreetMap：中国的店铺几乎查不到，"
+            "也没有评分/路况/公交）：用户一用到地图，就**先调 connect_amap 请他填一个** ——"
+            "别直接说做不到，也别默默用着弱数据不吭声。用户说「不用」就按没有 key 继续，"
+            "并在回答里如实说明用的是什么数据、缺了什么，别再反复追问。\n"
+            "  · ⚠️ **地图不做任何本地缓存**：联网查的是实时数据，断网就查不到 ——"
+            "离线时只能用内置常用地名表定位、路线只给直线距离，**地图卡片不显示底图**。"
+            "所以别承诺离线也能看，也别提已缓存/已下载这类话。\n"
             + (
                 (
                     "- 联网搜索：用户已开启「联网」开关，你有 web_search 工具可主动联网检索。\n"
@@ -2013,12 +2028,13 @@ class _SystemPrompt:
                     "- 本机当前处于**离线模式**（用户未开启「联网」开关），无法访问互联网。"
                     "若用户需要最新信息，请提示其打开界面顶部的「联网」开关，"
                     "不要编造实时数据。\n"
-                    "  · **地图同样受限**：map_plan 只能用本地以前记录过的地点/路线，"
-                    "外加一份内置的常用地名表。查得到就照实报坐标；"
-                    "查不到就直接说「离线模式下查不到，打开联网就能查」，**不许编坐标**。\n"
-                    "  · 离线时没缓存过的路线算不出真实道路，工具只会返回**直线距离**。"
+                    "  · **地图同样受限**：现在地图**不做任何本地缓存**，离线时只有一份"
+                    "内置的常用地名表可用（城市/机场/车站/高校/景点这类常见地名认得）。"
+                    "查得到就照实报坐标；查不到就直说「离线模式下查不到，打开联网就能查」，"
+                    "**不许编坐标**。「附近有什么」这类查询在离线时**完全查不了**，如实说。\n"
+                    "  · 离线时算不出真实道路，工具只会返回**直线距离**。"
                     "这种情况必须跟用户讲明「这是直线距离、不是实际道路」，"
-                    "**绝不能说成「驾车 X 公里」**；可以建议他联网查一次（之后会自动缓存，断网也能重放）。\n"
+                    "**绝不能说成「驾车 X 公里」**；可以建议他打开「联网」开关再查。\n"
                 )
             )
             + "调用工具后，根据工具返回结果继续作答。能直接完成的就动手，不要只建议。\n"
@@ -3614,36 +3630,39 @@ def library_backup():
 # ---------------------------------------------------------------- 地图
 @app.get("/api/map/tile/{z}/{x}/{y}.png")
 def map_tile(z: int, x: int, y: int):
-    """OpenStreetMap 瓦片（WGS-84 坐标系，走本地缓存）。
+    """OpenStreetMap 瓦片（WGS-84 坐标系）。
 
-    ⚠️ 必须由后端代理：一是国内直连 OSM 官方瓦片经常超时（实测），
-       二是这样才能把看过的区域**缓存到本地**。
+    ⚠️ 由后端代理：国内直连 OSM 官方瓦片经常超时（实测），后端统一换了镜像。
+    ⚠️ **不做任何缓存**（2026-09-18 起地图不再本地持久化）——响应带 no-store，
+       浏览器那边也不留。离线时这里直接 404，前端据此提示"离线不显示底图"。
     """
     from . import map_tools as _mt
     data, _cached = _mt.get_tile(z, x, y, src="osm")
     if not data:
-        raise HTTPException(status_code=404, detail="这张瓦片取不到")
+        raise HTTPException(status_code=404,
+                            detail="这张瓦片取不到（离线或源站不可用）",
+                            headers={"Cache-Control": "no-store"})
     return Response(content=data, media_type="image/png",
-                    headers={"Cache-Control": "public, max-age=604800"})
+                    headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/map/amap/{z}/{x}/{y}.png")
 def map_tile_amap(z: int, x: int, y: int):
-    """高德底图瓦片（GCJ-02 坐标系，单独一套缓存）。
+    """高德底图瓦片（GCJ-02 坐标系）。
 
     ⚠️ **不能和 OSM 共用路径**：同一个 z/x/y 在两套底图下不是同一块地
     （坐标系数值差 50~500 米）。前端按卡片上的 tile_source 选端点，
        打点也会同步做 WGS-84 → GCJ-02 的换算。
+    ⚠️ 同样不缓存：no-store。
     """
     from . import map_tools as _mt
     data, _cached = _mt.get_tile(z, x, y, src="amap")
     if not data:
-        # ⚠️ 404 也要带 no-store：空白瓦片请求失败后，浏览器**试探性缓存 404**
-        #    的话，这块地会一直白着，用户以为地图坏了。
-        raise HTTPException(status_code=404, detail="这张高德瓦片取不到",
+        raise HTTPException(status_code=404,
+                            detail="这张高德瓦片取不到（离线或源站不可用）",
                             headers={"Cache-Control": "no-store"})
     return Response(content=data, media_type="image/png",
-                    headers={"Cache-Control": "public, max-age=604800"})
+                    headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/map/search")
@@ -3655,9 +3674,47 @@ def map_search(q: str, limit: int = 5):
 
 @app.get("/api/map/stats")
 def map_stats():
-    """本地地图缓存情况（张数 / 占用）。"""
+    """地图当前状态（模式 / 底图 / 有没有配高德 key）。
+
+    ⚠️ 这里**不再报告缓存** —— 地图不做本地持久化了，没有缓存可报。
+    """
+    from . import amap as _am
     from . import map_tools as _mt
-    return {"ok": True, **_mt.cache_stats()}
+    return {"ok": True,
+            "online": _mt.online(),
+            "tile_source": _mt.tile_source(),
+            "tile_source_name": _mt.tile_source_text(),
+            "amap_key": _am.has_key(),        # 只报"有没有"，不回显 key 本身
+            "builtin": _mt.builtin_count()}   # 内置常用地名表（不是缓存）
+
+
+@app.post("/api/map/amap_key")
+def set_amap_key(body: dict):
+    """设置高德 key：**先真调一次高德验证，通过了才保存**。
+
+    为什么要先验证：用户复制 key 时很容易多带空格、或者复制错平台
+    （「Web端(JS API)」的 key 在服务端接口里是用不了的）。不验证的话，
+    他会以为配好了，结果地图一直悄悄退回 OpenStreetMap，还查不出原因。
+    这里宁可当场报错、把原因说清楚。
+
+    保存后**立刻生效**（配置每次现读，不用重启）。传空 key 则清除配置、退回 OSM。
+    """
+    from . import amap as _am
+    from . import config as _cfg
+    key = str((body or {}).get("key") or "").strip()
+    if not key:
+        cfg = _cfg.load_config()
+        cfg["amap_key"] = ""
+        _cfg.save_config(cfg)
+        return {"ok": True, "cleared": True,
+                "message": "已清空高德 key，地图改回用 OpenStreetMap。"}
+    ok, msg = _am.verify_key(key)
+    if not ok:
+        return {"ok": False, "message": msg}
+    cfg = _cfg.load_config()
+    cfg["amap_key"] = key
+    _cfg.save_config(cfg)
+    return {"ok": True, "message": msg}
 
 
 @app.get("/api/doclib/download")

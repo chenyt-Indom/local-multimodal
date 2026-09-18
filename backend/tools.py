@@ -197,7 +197,6 @@ _MAP_PLAN_SCHEMA = {
             "· 中长途会自动给**多条备选路线**并挑一条推荐，返回里带 routes 与 reason。"
             "把「为什么推荐这条」照实说出来（那是真实差距，别自己加戏）；只有一条可行路线时也别硬凑。\n"
             "· 用户问天气、或要把出行情况讲清楚时给 weather:true。\n"
-            "· 用户说「离线也能看 / 下载地图」时给 offline:true —— 会把沿途瓦片下载到本地缓存。\n"
             "· **用户说了在哪个城市时，一定把 city 填上**（比如「广州市内有什么商场」"
             "→ city:\"广州\"）。不填的后果实测很离谱：往地图上标「天河城」会被解析到"
             "「江西省南昌市进贤县天河城」—— 那儿真有个同名村子。\n"
@@ -221,8 +220,6 @@ _MAP_PLAN_SCHEMA = {
                           "description": "{from: 起点地名（或 lat,lon）, to: 终点, "
                                          "mode: driving/foot/bike}"},
                 "zoom": {"type": "integer", "description": "地图缩放级别 3~18，默认自动"},
-                "offline": {"type": "boolean",
-                            "description": "true＝把沿途瓦片下载到本地，之后离线也能看"},
                 "weather": {"type": "boolean",
                             "description": "true＝同时查出发地此刻与预计抵达时段的天气"},
             },
@@ -904,6 +901,7 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
     # 开关关着，模型连工具都看不到，自然就不会去翻资料。
     schemas.append(_LIBRARY_SCHEMA)
     schemas.append(_ASK_USER_SCHEMA)
+    schemas.append(_CONNECT_AMAP_SCHEMA)
     # 开发工作区：人机协同开发用（多文件项目，相对路径，后端拼绝对路径）
     schemas.append(_WS_LIST_SCHEMA)
     schemas.append(_WS_READ_SCHEMA)
@@ -1059,6 +1057,34 @@ _LIBRARY_SCHEMA = {
                         "description": "export_docx 时是否插入目录页"},
             },
             "required": ["action"],
+        },
+    },
+}
+
+
+# ---------- 请用户配置高德 key ----------
+_CONNECT_AMAP_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "connect_amap",
+        "description": (
+            "【连接高德地图】请用户把他的高德开放平台 key 填进来，填完**立刻生效**。\n"
+            "什么时候用：**用户要用地图，而本机还没配高德 key**（联网开着，但地图只能退回"
+            "OpenStreetMap —— 中国的店铺几乎查不到、也没有评分/路况/公交）。\n"
+            "这时**先调这个工具请他填**，不要直接说做不到，也不要默默用着弱底图不吭声。\n"
+            "话术要点（用户不知道为什么要填）：填了之后能搜到全国的小店、有**真实评分**、"
+            "有**实时路况**、有**公交换乘**、步行骑行是真实路径；不填也能用，只是数据很弱。\n"
+            "用户填完这个工具会**当场验证** key 是否可用，并把结果告诉你；"
+            "如果验证失败，按它给的原因再请他重填一次。\n"
+            "⚠️ 用户明确说「不用 / 就这样吧」时，就按没有 key 继续做事，别再反复问。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string",
+                           "description": "为什么现在需要它（一句话，会显示给用户看），可选"},
+            },
+            "required": [],
         },
     },
 }
@@ -1258,9 +1284,9 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
     if name == "make_xlsx":
         return _do_make_xlsx(arguments, ui_events)
     if name == "map_plan":
-        return _do_map_plan(arguments, ui_events)
+        return _do_map_plan(arguments, ui_events, context)
     if name == "nearby_places":
-        return _do_nearby_places(arguments, ui_events)
+        return _do_nearby_places(arguments, ui_events, context)
     if name == "edit_office":
         return _do_edit_office(arguments, ui_events)
     if name == "web_read":
@@ -1299,6 +1325,8 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
         return _do_library(arguments, ui_events)
     if name == "ask_user":
         return _do_ask_user(arguments, context)
+    if name == "connect_amap":
+        return _do_connect_amap(arguments, context)
     if name == "get_time":
         return time.strftime("%Y-%m-%d %H:%M:%S (%A)")
     if name == "web_search":
@@ -2683,14 +2711,6 @@ def _do_make_xlsx(arguments=None, ui_events=None) -> str:
                urllib.parse.quote(base), base, tip))
 
 
-def _cache_time_text(ts) -> str:
-    """把缓存时间戳写成「09月17日 21:30」，让用户知道这份数据有多新。"""
-    try:
-        return time.strftime("%m月%d日 %H:%M", time.localtime(float(ts)))
-    except (TypeError, ValueError, OSError):
-        return ""
-
-
 def _do_transit(route: dict, ui_events, net: bool) -> str:
     """公交换乘结果 → 文本 + 地图卡片。
 
@@ -2704,7 +2724,8 @@ def _do_transit(route: dict, ui_events, net: bool) -> str:
     r = _mt.plan_transit(frm, to, allow_net=net)
     if not r.get("ok"):
         return ("公交换乘没查成：%s\n"
-                "⚠️ 如实告诉用户原因，**不要编造公交线路号和票价**。" % r.get("error"))
+                "⚠️ 如实告诉用户原因，**不要编造公交线路号和票价**。"
+                % r.get("error")) + _amap_nudge(net)
 
     plans = r.get("plans") or []
     lines = ["· **%s → %s** 公交换乘方案（共 %d 个）："
@@ -2748,11 +2769,104 @@ def _do_transit(route: dict, ui_events, net: bool) -> str:
             "\n· 上面这些线路、票价、换乘站都是高德返回的**真实数据**，可以照实说。")
 
 
-def _do_map_plan(arguments=None, ui_events=None) -> str:
+def _amap_nudge(net: bool) -> str:
+    """联网但没配高德 key 时，在工具结果末尾塞一句强提醒。
+
+    ⚠️ 为什么非得塞在这里、而不是只写在系统提示里：实测光在系统提示里写
+    "先请用户填 key"，模型会**直接跳过**、拿 OSM 的弱数据就把活干完了
+    （它觉得答案已经齐了）。而工具返回的文本是它紧接着要读的东西，
+    写在这儿才真的会被照做。
+    """
+    if not net:
+        return ""
+    try:
+        from . import amap as _am
+        if _am.has_key():
+            return ""
+    except Exception:
+        return ""
+    L = chr(10)
+    return (L + L + "⚠️ **本机还没配高德 key**，上面的数据来自 OpenStreetMap："
+            "中国的店铺覆盖很稀、也没有评分（所以可能只有零星几条）。" + L +
+            "请**先调用 connect_amap 请用户填一个 key**（他填完可以立刻重查，不用重启）；" + L +
+            "回答里也提一句「现在用的是弱数据源，填个 key 能查到更多、还有评分」。" + L +
+            "用户要是说不用，就按现状把结果给他，别再反复追问。")
+
+
+# 每个进程只主动问一次 key。用户跳过之后就不再打扰 ——
+# 反复弹同一个框比不弹更烦人。
+_AMAP_ASKED = {"done": False}
+
+
+def _ask_amap_key_once(context, net: bool) -> str:
+    """联网、没配 key、而且还没问过 → 弹一次输入框请用户填，填完当场验证生效。
+
+    返回一句"这次发生了什么"的说明（没发生就返回空串），会拼进工具结果里。
+
+    ⚠️ 为什么由**工具**来问、而不是让模型自己调 connect_amap：实测把"先请用户填 key"
+    写进系统提示、甚至塞进工具结果，qwen3-vl:8b 都会**直接无视**，
+    拿 OpenStreetMap 的弱数据把活干完就算完。而这句问话必须真的弹出来，
+    所以改成工具在干活前自己弹 —— ask 通道本来就是阻塞式的，正好能用。
+    """
+    if not net or _AMAP_ASKED["done"]:
+        return ""
+    try:
+        from . import amap as _am
+        if _am.has_key():
+            return ""
+    except Exception:
+        return ""
+    ask = (context or {}).get("ask")
+    if not callable(ask):
+        return ""
+    _AMAP_ASKED["done"] = True          # 先置位：即使用户跳过，也不再问第二次
+    try:
+        answers = ask({
+            "title": "🗺️ 填一个高德 key，地图能力会好很多",
+            "hint": ("本机还没配高德 key，现在只能查到 OpenStreetMap 的数据 —— "
+                     "中国的店铺覆盖很稀、也没有评分，所以结果可能只有零星几条。" + chr(10) +
+                     "填了之后：全国的小店都能搜到，还有真实评分、实时路况、公交换乘，"
+                     "步行骑行也是真实路径。不填也能用，就是数据弱。" + chr(10) + chr(10) +
+                     "申请（1 分钟）：console.amap.com → 手机号注册+实名 → 建应用 → 加 Key → "
+                     "服务平台必须选「Web 服务」。不想填就直接关掉这个框。"),
+            "questions": [{"question": "请粘贴高德开放平台的 key（32 位）：",
+                            "header": "高德 key"}],
+            "freeInput": True,
+        })
+    except Exception:
+        return ""
+    ans = ""
+    for a in (answers or []):
+        if isinstance(a, dict):
+            ans = (a.get("answer") or "").strip() or ans
+        else:
+            ans = str(a or "").strip() or ans
+    if not ans:
+        return (chr(10) + "（用户没有填高德 key，本次结果来自 OpenStreetMap —— "
+                "回答里如实说明数据源比较弱即可，别再追问。）")
+    try:
+        from . import config as _cfg
+        ok, msg = _am.verify_key(ans)
+        if not ok:
+            return (chr(10) + chr(10)
+                    + "（用户填的 key 没通过验证：%s" % msg
+                    + chr(10)
+                    + "请把这个原因原样告诉他，让他重新复制一个；"
+                    + "本次结果仍是 OpenStreetMap 的。）")
+        cfg = _cfg.load_config()
+        cfg["amap_key"] = ans
+        _cfg.save_config(cfg)
+    except Exception as e:
+        return (chr(10) + "（保存 key 时出错：%s）" % str(e)[:60])
+    return (chr(10) + chr(10) + "✅ 用户刚填好了高德 key，**已经生效**（%s）。"
+            "下面这些结果已经是用高德查的，直接照实说就行。" % msg)
+
+
+def _do_map_plan(arguments=None, ui_events=None, context=None) -> str:
     """查地点 / 规划路线，并把地图数据推给前端画成卡片。
 
     **两种跑法**（一起跟随前端的「联网」开关）：
-      · 联网 —— 本地没有就上网查，查到顺手存到本地（下次离线也有）；
+      · 联网 —— 实时上网查（**查完不留任何本地数据**）；
       · 离线 —— 只认本地：以前查过的地名/算过的路线 + 内置常用地名表，
                **一个网络请求都不发**。算不出真路线时只给直线距离，并说明白。
     """
@@ -2775,6 +2889,9 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
                 '例如 {"places":["广州塔"],"route":{"from":"广州塔","to":"白云机场"}}')
 
     net = _mt.online()
+    # ⚠️ 干活之前先问一次高德 key（没配、联网、且本进程还没问过时）。
+    #    必须放在这里：key 一旦填上，下面这次查询就直接走高德了。
+    _key_note = _ask_amap_key_once(context, net)
     # 限定城市（模型从"广州市内有什么商场"里看出来就填 广州）。
     # ⚠️ 不填的后果实测很离谱：查「天河城」会被高德按**地址**解析到
     #    "江西省南昌市进贤县天河城"，而广州的正主反而出不来。
@@ -2792,8 +2909,8 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
             continue
         if one.get("kind") == "builtin":
             src = "内置地名表"
-        elif one.get("from_cache"):
-            src = "本地缓存 %s" % (_cache_time_text(one.get("cache_ts")) or "")
+        elif one.get("kind") == "amap_geocode" or one.get("kind") == "poi":
+            src = "联网查到的"
         else:
             src = ""
         markers.append({"name": one["name"], "lat": one["lat"], "lon": one["lon"],
@@ -2829,10 +2946,6 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
             rinfo = r
             routes = r.get("routes") or []
             tail = ""
-            if r.get("from_cache"):
-                tail = "  〔本地缓存 %s%s〕" % (
-                    _cache_time_text(r.get("cache_ts")) or "",
-                    "（已过期，联网时会自动更新）" if r.get("stale") else "")
             if len(routes) > 1:
                 lines.append("· **从 %s 到 %s**（%s）共 %d 条可选路线%s"
                              % (r["from"]["name"], r["to"]["name"], mode_cn,
@@ -2918,17 +3031,6 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
         zoom = 14 if span < 0.02 else 13 if span < 0.06 else 11 if span < 0.3 \
                else 9 if span < 1.2 else 7 if span < 5 else 5
 
-    offline_note = ""
-    if a.get("offline") or a.get("prefetch"):
-        pts = (rinfo or {}).get("points") or [[m["lat"], m["lon"]] for m in markers]
-        st = _mt.prefetch_route(pts, zoom=min(14, zoom + 1), allow_net=net)
-        if st.get("error"):
-            offline_note = "\n· 预下载没做：%s" % st["error"]
-        else:
-            offline_note = ("\n· 已把沿途 %d 张瓦片存到本地（新下载 %d 张，已有 %d 张）——"
-                            "这条路线和这些地点也都记在本地了，断网照样能用。"
-                            % (st["requested"], st["new"], st["cached"]))
-
     if isinstance(ui_events, list):
         ui_events.append({
             "type": "map",
@@ -2947,9 +3049,6 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
                                 "bike": "骑行"}.get(rinfo["mode"], rinfo["mode"]),
                        "from": rinfo["from"]["name"],
                        "to": rinfo["to"]["name"],
-                       "cached": bool(rinfo.get("from_cache")),
-                       "cache_time": _cache_time_text(rinfo.get("cache_ts")),
-                       "stale": bool(rinfo.get("stale")),
                        "estimated": bool(rinfo.get("estimated")),
                        "note": rinfo.get("note") or "",
                        # 多条候选：前端按这个列表画多条线，推荐的那条高亮
@@ -2986,10 +3085,10 @@ def _do_map_plan(arguments=None, ui_events=None) -> str:
             "不许编「坐 X 路公交 / 票价 Y 元 / 每 Z 分钟一班」这种具体线路信息，"
             "最多说一句「这段距离也可以考虑公共交通」。"
             % _mt.mode_text())
-    return head + "\n" + "\n".join(lines) + offline_note
+    return head + "\n" + "\n".join(lines) + _amap_nudge(net) + _key_note
 
 
-def _do_nearby_places(arguments=None, ui_events=None) -> str:
+def _do_nearby_places(arguments=None, ui_events=None, context=None) -> str:
     """查某个地点**周围**的场所，推给前端画成「场所清单 + 地图」。
 
     ⚠️ **刻意不输出任何评分** —— OSM 没有评分/评论数据。
@@ -3015,6 +3114,9 @@ def _do_nearby_places(arguments=None, ui_events=None) -> str:
         limit = 20
 
     net = _mt.online()
+    # ⚠️ 干活之前先问一次高德 key（没配、联网、且本进程还没问过时）。
+    #    必须放在这里：key 一旦填上，下面这次查询就直接走高德了。
+    _key_note = _ask_amap_key_once(context, net)
     c = _mt.geocode_one(place, allow_net=net)
     if not c:
         hint = ("现在是离线模式，本地没有这个地点的记录；打开「联网」开关就能查。"
@@ -3101,7 +3203,7 @@ def _do_nearby_places(arguments=None, ui_events=None) -> str:
             },
         })
 
-    return head + "\n" + "\n".join(lines) + tail
+    return head + "\n" + "\n".join(lines) + tail + _amap_nudge(net) + _key_note
 
 
 def _do_edit_office(arguments=None, ui_events=None) -> str:
@@ -3553,6 +3655,67 @@ def _do_library(arguments, ui_events=None):
         return "未知的 action：%s（可用 list/read/write/append/delete/copy/backup/export_docx）" % action
     except Exception as e:
         return "文库操作失败：%s: %s" % (type(e).__name__, e)
+
+
+# =====================================================================
+#  请用户配置高德 key
+# =====================================================================
+def _do_connect_amap(arguments, context=None):
+    """弹一个输入框请用户填高德 key，填完**当场验证**、通过就存下、立刻生效。
+
+    为什么不直接让用户去改 config.json：那要求他找到文件、改 JSON、再重启应用，
+    对新机器上手来说太重了。这里复用"问用户"那条通道，在界面上填一下就行。
+    """
+    from . import amap as _am
+    from . import config as _cfg
+
+    if _am.has_key():
+        return "已经配好高德 key 了，直接用地图工具查就行，不用再问用户。"
+
+    reason = str((arguments or {}).get("reason") or "").strip()
+    ask = (context or {}).get("ask")
+    if not callable(ask):
+        return ("用户界面没连上，没法请他填 key。请直接告诉用户："
+                "去 https://console.amap.com/dev/key/app 申请一个"
+                "「**Web服务**」类型的 key，然后点界面顶栏的「高德 key」按钮填进去。")
+
+    questions = [{
+        "question": "请粘贴高德开放平台的 key（32 位，服务平台要选「Web 服务」）：",
+        "header": "高德 key",
+    }]
+    answers = ask({
+        "title": "🗺️ 填一个高德 key，地图能力会好很多",
+        "hint": (reason + "\n" if reason else "") +
+                "填了之后：能搜到全国的小店、有真实评分、有实时路况、有公交换乘，"
+                "步行骑行也是真实路径。不填也能用，只是数据很弱（用的是 OpenStreetMap）。\n"
+                "申请：console.amap.com → 实名 → 建应用 → 加 Key → "
+                "**服务平台必须选「Web 服务」**。\n"
+                "不想填就直接关掉这个框，我按没有 key 继续做。",
+        "questions": questions,
+        "freeInput": True,
+    })
+    ans = ""
+    for a in (answers or []):
+        if isinstance(a, dict):
+            ans = (a.get("answer") or "").strip() or ans
+        else:
+            ans = str(a or "").strip() or ans
+    if not ans:
+        return ("用户没有填（可能直接关了弹框）。**按没有高德 key 继续做事** ——"
+                "地图会退回 OpenStreetMap：能查大城市/道路/机场车站，但小店、评分、"
+                "路况、公交都没有。在回答里如实说明这一点，不要再反复追问。")
+
+    ok, msg = _am.verify_key(ans)
+    if not ok:
+        return ("用户填的 key 没通过验证：%s\n"
+                "请把这个原因原样告诉他，并请他重新申请/重新复制一个 ——"
+                "他也可以选择不填，那就按没有 key 继续。" % msg)
+    cfg = _cfg.load_config()
+    cfg["amap_key"] = ans
+    _cfg.save_config(cfg)
+    return ("✅ %s\n"
+            "（key 已经保存并**立刻生效**，不用重启。接下来直接用 map_plan / nearby_places "
+            "查就行；结果里会带真实评分、实时路况和公交换乘。）" % msg)
 
 
 # =====================================================================

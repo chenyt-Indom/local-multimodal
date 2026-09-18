@@ -185,8 +185,8 @@
     <div class="top-bar" id="topBar">
       <label class="pill" data-cfg="memory_enabled"><i class="sw"></i>长期记忆</label>
       <label class="pill" data-cfg="rag_enabled"><i class="sw"></i>知识库</label>
-      <label class="pill" data-cfg="web_enabled" title="开着：搜索/网页/地图都联网查（地图查过的会存到本地）；关掉：全部走本地，地图只能用已缓存的地点、路线和瓦片"><i class="sw"></i>联网</label>
-      <button type="button" class="pill pill-btn" id="mapCacheBtn" title="看看本地攒了多少地图数据 —— 离线模式就靠它" onclick="window.__showMapCache&&window.__showMapCache()">地图缓存</button>
+      <label class="pill" data-cfg="web_enabled" title="开着：搜索/网页/地图都联网查；关掉：全部走本地，地图只能用内置的常用地名表（没有底图、不显示地图缓存）"><i class="sw"></i>联网</label>
+      <button type="button" class="pill pill-btn" id="amapKeyBtn" title="填高德开放平台的 key —— 填了地图能搜到全国的小店、有真实评分和实时路况。不填也能用，只是退回 OpenStreetMap（数据弱一些）" onclick="window.__showAmapKey&&window.__showAmapKey()">高德 key</button>
       <label class="pill" data-cfg="auto_memorize"><i class="sw"></i>自动记忆</label>
       <label class="pill" data-cfg="code_auto_route" title="写代码或写长文时，自动换用专用模型（qwen2.5-coder，非思考型，更稳更快）"><i class="sw"></i>专用模型</label>
       <label class="pill" data-cfg="code_exec_enabled" title="让模型在本机真跑 Python 把结果算出来（默认关闭；开启后模型写的代码会在你电脑上执行）"><i class="sw"></i>本地算代码</label>

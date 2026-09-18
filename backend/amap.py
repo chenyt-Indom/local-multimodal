@@ -45,6 +45,52 @@ def has_key() -> bool:
     return bool(key())
 
 
+def verify_key(k: str) -> tuple:
+    """拿一个 key 真去调一次高德，确认能用。返回 (是否可用, 给用户看的话)。
+
+    ⚠️ 一定要**真调一次**，不能只看格式：用户复制时经常多带空格，
+    或者把「Web端(JS API)」的 key 拿来用 —— 那个平台在服务端接口上是无效的。
+    不验证的话他会以为配好了，实际地图一直静静退回 OpenStreetMap，
+    然后来问"为什么不是高德"，很难查。这里宁可当场报错。
+
+    用**地理编码**做验证：它最便宜、最稳定，而且返回结果能顺便让用户确认
+    "真的通了"（我们直接回一个真实地名给他看）。
+    """
+    k = str(k or "").strip()
+    if not k:
+        return False, "没有拿到 key。"
+    if len(k) != 32:
+        return False, ("这个 key 长度是 %d 位，高德的 key 是 **32 位**。"
+                       "可能复制的时候少了一段或者多了空格。" % len(k))
+    url = (AMAP + "/geocode/geo?" + urllib.parse.urlencode(
+        {"key": k, "address": "汕头大学", "output": "json"}))
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": _UA})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:
+        return False, "连不上高德服务器（%s）。检查一下网络再试。" % str(e)[:60]
+    if str(d.get("status")) == "1":
+        geo = (d.get("geocodes") or [{}])[0]
+        name = geo.get("formatted_address") or geo.get("province") or "某个地点"
+        return True, ("✅ 高德已连接（用这个 key 查到了一个真实地点：%s）。" % name)
+    info = str(d.get("info") or "").strip()
+    code = str(d.get("infocode") or "").strip()
+    if "INVALID_USER_KEY" in info or code == "10001":
+        return False, ("这个 key 高德不认（INVALID_USER_KEY）。常见的两个原因：\n"
+                       "① 复制的时候少了几位、或者带了空格；\n"
+                       "② 建 Key 时**服务平台选错了** —— 必须选「**Web服务**」，"
+                       "选成「Web端(JS API)」或「iOS/Android」的 key 在服务端用不了。\n"
+                       "去 https://console.amap.com/dev/key/app 重新建一个即可。")
+    if "DAILY_QUERY_OVER_LIMIT" in info or code == "10003":
+        return True, ("✅ key 是有效的，但今天的免费额度已经用完了（%s）。"
+                      "明天会自动恢复。" % info)
+    if "SERVICE_NOT_AVAILABLE" in info or code == "10009":
+        return False, ("这个 key 没开通「Web服务」这个服务（%s）。"
+                       "去控制台给这个 key 勾上「Web服务」再试。" % info)
+    return False, "高德返回了错误：%s（%s）。检查一下 key 是否正确。" % (info or "未知", code)
+
+
 # ---------------------------------------------------------------- 坐标转换
 _A = 6378245.0                       # 克拉索夫斯基椭球长半轴
 _EE = 0.00669342162296594323

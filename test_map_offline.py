@@ -1,11 +1,18 @@
 # -*- coding: utf-8 -*-
-"""验证地图的「联网 / 离线」两种模式。
+"""验证地图的「联网 / 离线」两种模式，以及**不做任何本地持久化**这条新规矩。
 
-关键不是"能不能跑通"，而是证明：
-  · 离线模式下 **一个网络请求都没发出去**（用 urlopen 钩子实测，不靠肉眼看代码）
-  · 联网模式查过的地点/路线，切到离线后**能重放**
-  · 离线时算不出真路线，必须给"直线距离"并标明不是实际道路
+背景（2026-09-18 用户明确要求）：地图缓存整个去掉了 —— 不存瓦片、不存地名、
+不存路线，离线也不再从任何本地缓存取数据。所以这个脚本的断言目标变了：
 
+  · 离线模式下 **一个网络请求都不发**（urlopen 钩子实测，不靠肉眼看代码）
+  · 离线时只有内置常用地名表可用；表外的名字**如实返回空**，绝不编坐标
+  · 离线时算不出真路线 → 只给直线距离，并标明"不是实际道路"
+  · 联网查完**磁盘上不新增任何文件**（这是"去掉缓存"最硬的证据）
+  · 断网后查同一条**拿不到** —— 证明真的没有缓存（不是"藏在别处"）
+  · 老的缓存入口（cache_stats / prefetch_route）确实已经不存在了
+
+跑法：用**应用自己的解释器**跑：
+    "%LOCALAPPDATA%\\Programs\\Python\\Python314\\python.exe" test_map_offline.py
 用临时 MM_DATA_DIR，不碰真实数据目录。
 """
 import io
@@ -18,8 +25,12 @@ import urllib.request
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 TMP = tempfile.mkdtemp(prefix="mm_map_test_")
+# ⚠️ 必须拷 config.json：否则走 DEFAULT_CONFIG → web_enabled=False、"没 key"，
+#    会得到一堆假结论（这是这个项目反复踩过的坑）。
+shutil.copy(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
+            os.path.join(TMP, "config.json"))
 os.environ["MM_DATA_DIR"] = TMP
-sys.path.insert(0, r"D:/local-multimodal-src")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from backend import map_tools as mt          # noqa: E402
 
@@ -58,157 +69,133 @@ def online(v):
     mt.online = lambda: v
 
 
-def offline(v):
-    mt.online = lambda: (not v)
+def data_files():
+    """临时数据目录里除了 config.json 之外的所有文件（相对路径）。"""
+    out = []
+    for root, _dirs, files in os.walk(TMP):
+        for f in files:
+            p = os.path.join(root, f)
+            if os.path.relpath(p, TMP) != "config.json":
+                out.append(os.path.relpath(p, TMP))
+    return sorted(out)
 
 
-print("=" * 64)
-print("临时数据目录：%s" % TMP)
-print("=" * 64)
-print()
+def main():
+    print("=" * 64)
+    print("临时数据目录：%s" % TMP)
+    print("=" * 64)
 
-# ================= 1. 离线模式 =================
-print("【1】离线模式：只能靠本地")
-offline(True)
-CALLS.clear()
+    # ------------------------------------------------------------------
+    print()
+    print("【1】离线模式：零请求，只认内置表")
+    online(False)
 
-r = mt.search_place("汕头大学")
-check("搜到「汕头大学」", bool(r), r[0]["name"] + " (%.4f, %.4f)" % (r[0]["lat"], r[0]["lon"]) if r else "")
-check("来源标成内置表", bool(r) and r[0].get("kind") == "builtin")
-no_net("离线搜地名")
+    r = mt.search_place("汕头大学", 1)
+    check("内置表里的地名能查到（离线也能定位）", bool(r),
+          r[0]["name"] if r else "")
+    no_net("离线查内置表地名")
 
-r2 = mt.search_place("广州塔")
-check("搜到「广州塔」", bool(r2), r2[0]["name"] + " (%.4f, %.4f)" % (r2[0]["lat"], r2[0]["lon"]) if r2 else "")
-no_net("离线搜地名 2")
+    r = mt.search_place("广州白云机场", 1)
+    check("带城市的别名能对上（广州白云机场 → 广州白云国际机场）",
+          bool(r) and "机场" in (r[0]["name"] if r else ""),
+          r[0]["name"] if r else "")
+    no_net("离线查别名")
 
-r3 = mt.search_place("这个地名肯定不存在xyzzy")
-check("查不到就返回空（不编造）", r3 == [])
-no_net("离线查不存在的地名")
+    r = mt.search_place("广州猎德大桥", 1)
+    check("表外的名字**如实返回空**，不编、也不拿'广州市'冒充", not r,
+          (r[0]["name"] + "（这是错的）") if r else "返回空 ✅")
+    no_net("离线查表外地名")
 
-# 别名
-r4 = mt.search_place("澄海")
-check("别名「澄海」→ 汕头市澄海区", bool(r4) and "澄海" in r4[0]["name"], r4[0]["name"] if r4 else "")
-no_net("离线用别名")
+    rt = mt.plan_route("汕头大学", "汕头站", "driving")
+    check("离线算不出真路线（ok=False）", rt.get("ok") is False, rt.get("error", ""))
+    check("但给出直线距离（明确标注不是道路）",
+          bool(rt.get("approx")) and rt.get("straight") is not False,
+          "直线 %.1f 公里" % (rt["approx"]["distance_m"] / 1000) if rt.get("approx") else "")
+    check("并且**没有** from_cache 这种『重放』痕迹", not rt.get("from_cache"))
+    no_net("离线规划路线")
 
-# 坐标直给
-r5 = mt.geocode_one("23.354, 116.682")
-check("直接给坐标也能定位", bool(r5) and r5.get("kind") == "coord", r5["name"] if r5 else "")
-no_net("离线解析坐标")
+    nb = mt.nearby(23.4163, 116.6291, "餐厅", radius=1500, limit=3)
+    check("离线查附近场所 → 如实说查不了（不再拿旧数据糊弄）",
+          nb.get("ok") is False and "离线" in str(nb.get("error", "")),
+          str(nb.get("error", ""))[:46])
+    no_net("离线查周边")
 
-# 没缓存过的路线 → 只能给直线距离
-rt = mt.plan_route("汕头大学", "汕头站")
-check("离线算不出真路线", rt.get("ok") is False)
-check("但给出直线距离", bool(rt.get("approx")),
-      "直线 %s，在起点%s方向" % (mt.fmt_distance(rt["approx"]["distance_m"]),
-                                 rt["approx"]["bearing"]) if rt.get("approx") else "")
-check("说明里讲清是离线", "离线" in (rt.get("error") or ""), rt.get("error") or "")
-no_net("离线规划路线")
+    t, _c = mt.get_tile(14, 13500, 7095, src="amap")
+    check("离线取瓦片 → 取不到（离线不显示底图）", t is None)
+    no_net("离线取瓦片")
 
-# 瓦片：没缓存就不给，而且不联网
-d, cached = mt.get_tile(12, 3360, 1743)
-check("离线取没缓存的瓦片 → 返回空", d is None)
-no_net("离线取瓦片")
+    # ------------------------------------------------------------------
+    print()
+    print("【2】联网模式：实时查，能用")
+    online(True)
 
-# 预下载在离线时必须被拒绝
-st = mt.prefetch_route([[23.35, 116.68]], zoom=12)
-check("离线时预下载被拒绝", bool(st.get("error")), st.get("error") or "")
-no_net("离线预下载")
+    r = mt.search_place("汕头大学", 1)
+    check("联网能查到地名", bool(r), r[0]["name"] if r else "")
+    CALLS.clear()
 
-print()
+    rt = mt.plan_route("汕头大学", "汕头站", "driving")
+    check("联网能算出真路线", bool(rt.get("ok")),
+          "%.1f 公里 / %.0f 分钟 / %s 个点"
+          % (rt["distance_m"] / 1000, rt["duration_s"] / 60, len(rt["points"]))
+          if rt.get("ok") else rt.get("error", ""))
+    check("路线确实联网了", bool(CALLS), "%d 次请求" % len(CALLS))
+    CALLS.clear()
 
-# ================= 2. 联网模式 =================
-print("【2】联网模式：上网查 + 自动存本地")
-online(True)
-CALLS.clear()
+    nb = mt.nearby(23.4163, 116.6291, "餐厅", radius=1500, limit=3)
+    check("联网能查附近场所", bool(nb.get("ok")),
+          "%s 个（来源 %s）" % (nb.get("total"), nb.get("source")))
+    CALLS.clear()
 
-r6 = mt.search_place("汕头大学")
-check("联网搜到「汕头大学」", bool(r6),
-      r6[0]["name"] + " (%.4f, %.4f)" % (r6[0]["lat"], r6[0]["lon"]) if r6 else "")
-# ⚠️ 「汕头大学」在内置表里，会**直接走表**（那 231 条人工核过，比 Photon 稳），
-#    压根不发请求 —— 这是设计如此，不是 bug。
-#    想验证"联网真的发出去了 + 写进缓存"，得拿一个**表外**、且 Photon 确实有数据的名字。
-#    （踩过：用「汕头濠江滨海街道」这种，Photon 返回 0 条，结果又掉回内置表兜底，
-#      看着像"缓存没写"，其实是那个词 Photon 压根不认识。）
-r6b = mt.search_place("广州猎德大桥")
-check("表外的地名能联网查到", bool(r6b), r6b[0]["name"] if r6b else "")
-check("确实联网了（Photon）", any("photon" in u for u in CALLS), "请求数 %d" % len(CALLS))
-CALLS.clear()
+    t, cached = mt.get_tile(14, 13500, 7095, src="amap")
+    check("联网能取到底图瓦片", bool(t) and len(t) > 1000, "%d 字节" % len(t or b""))
+    check("瓦片一律标成'不是缓存来的'", cached is False)
+    CALLS.clear()
 
-r7 = mt.search_place("广州天河城")
-check("联网搜到「广州天河城」", bool(r7), r7[0]["name"] if r7 else "")
-CALLS.clear()
+    # ------------------------------------------------------------------
+    print()
+    print("【3】★ 不做任何本地持久化（这次改动的核心）")
 
-rt2 = mt.plan_route("汕头大学", "汕头站", "driving")
-check("联网规划出真路线", rt2.get("ok") is True,
-      "%s，约 %s" % (mt.fmt_distance(rt2.get("distance_m", 0)),
-                     mt.fmt_duration(rt2.get("duration_s", 0))) if rt2.get("ok") else rt2.get("error"))
-check("路线有路径点", len(rt2.get("points") or []) > 1, "%d 个点" % len(rt2.get("points") or []))
-check("确实联网了（OSRM）", any("osrm" in u or "project-osrm" in u for u in CALLS))
-CALLS.clear()
+    left = data_files()
+    check("联网查了一圈，磁盘上**一个文件都没新增**", not left,
+          ("多了：" + str(left[:5])) if left else "干净 ✅")
 
-# 预下载瓦片（走的是当前这套：真实数据目录里已有 106 张，临时目录里是 0）
-st2 = mt.prefetch_route(rt2.get("points") or [[23.35, 116.68]], zoom=12, max_tiles=12)
-check("联网预下载瓦片成功", not st2.get("error"),
-      "请求 %d 张，新下 %d 张" % (st2.get("requested", 0), st2.get("new", 0)))
-CALLS.clear()
+    online(False)
+    r = mt.search_place("汕头大学", 1)
+    check("断网后仍能查到（那是**内置表**，不是缓存）",
+          bool(r) and r[0].get("kind") in ("builtin", "builtin_loose"),
+          r[0].get("kind") if r else "")
+    r = mt.search_place("广州大桥", 1)
+    check("断网后查表外名字拿不到 —— 证明联网那次**真的没存**", not r,
+          r[0]["name"] if r else "返回空 ✅")
+    no_net("离线再查一次")
 
-print()
+    # ------------------------------------------------------------------
+    print()
+    print("【4】老缓存入口确实已经不存在")
+    for name in ("cache_stats", "cache_dir", "prefetch_route", "prefetch_area",
+                 "_load_cache", "cache_put"):
+        check("已移除 map_tools.%s" % name, not hasattr(mt, name))
 
-# ================= 3. 关掉联网后重放 =================
-print("【3】切回离线：刚才查过的必须还能用（这是离线模式的意义）")
-offline(True)
-CALLS.clear()
+    idx = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "frontend", "index.html")
+    try:
+        html = io.open(idx, encoding="utf-8").read()
+        check("顶栏的「地图缓存」按钮已删掉", "mapCacheBtn" not in html)
+        check("换成了「高德 key」入口", "amapKeyBtn" in html)
+    except OSError:
+        check("能读到前端页面", False, idx)
 
-# 用表外那条（联网时走了 Photon 并写了缓存）验证"断网还能重放"
-r8 = mt.search_place("广州猎德大桥")
-check("离线重放联网时查过的地名", bool(r8), r8[0]["name"] if r8 else "")
-check("标记来源＝本地缓存", bool(r8) and r8[0].get("from_cache") is True)
-check("带缓存时间", bool(r8) and r8[0].get("cache_ts"))
-no_net("离线重放地名")
+    print()
+    print("=" * 64)
+    if FAIL:
+        print("失败 %d 项：" % len(FAIL))
+        for f in FAIL:
+            print("   - " + f)
+    else:
+        print("全部通过 ✔")
+    print("=" * 64)
+    return 1 if FAIL else 0
 
-# 内置表里的地名离线当然也能查（走表，同样零请求）
-r8b = mt.search_place("汕头大学")
-check("内置表地名离线也能查", bool(r8b), r8b[0]["name"] if r8b else "")
-no_net("离线查内置表地名")
 
-rt3 = mt.plan_route("汕头大学", "汕头站", "driving")
-check("离线重放出真路线", rt3.get("ok") is True,
-      "%s，约 %s" % (mt.fmt_distance(rt3.get("distance_m", 0)),
-                     mt.fmt_duration(rt3.get("duration_s", 0))) if rt3.get("ok") else rt3.get("error"))
-check("标记为本地缓存", rt3.get("from_cache") is True)
-check("路线点数是真路线（>1）", len(rt3.get("points") or []) > 1,
-      "%d 个点" % len(rt3.get("points") or []))
-no_net("离线重放路线")
-
-# 换一条没查过的 → 必须诚实降级，不能拿缓存冒充
-rt4 = mt.plan_route("汕头大学", "广州塔", "driving")
-check("没缓存过的路线仍然算不出（不冒充）", rt4.get("ok") is False)
-check("退回直线距离参考", bool(rt4.get("approx")))
-no_net("离线规划新路线")
-
-print()
-
-# ================= 4. 缓存统计 =================
-print("【4】本地缓存统计")
-s = mt.cache_stats()
-print("    瓦片 %d 张 / %.2f MB ｜ 地名 %d 个 ｜ 路线 %d 条 ｜ 内置表 %d 条 ｜ 当前 %s"
-      % (s["tiles"], s["bytes"] / 1048576.0, s["places"], s["routes"],
-         s["builtin"], mt.mode_text()))
-# ⚠️ 只要求 >=1：内置表命中的地名**不会**写进缓存（压根没走网络），这是正常的
-check("地名缓存已写入", s["places"] >= 1, "%d 个" % s["places"])
-check("路线缓存已写入", s["routes"] >= 1, "%d 条" % s["routes"])
-check("内置地名表已加载", s["builtin"] > 100, "%d 条" % s["builtin"])
-check("离线模式被正确识别", s["online"] is False)
-
-print()
-print("=" * 64)
-if FAIL:
-    print("失败 %d 项：" % len(FAIL))
-    for f in FAIL:
-        print("   - " + f)
-else:
-    print("全部通过 ✔")
-print("=" * 64)
-
-shutil.rmtree(TMP, ignore_errors=True)
-sys.exit(1 if FAIL else 0)
+if __name__ == "__main__":
+    sys.exit(main())

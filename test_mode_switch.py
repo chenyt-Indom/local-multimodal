@@ -8,8 +8,9 @@
        · 地名搜索能查到、路线能算（真实数据）
        · 高德瓦片端点给真图
   2) 切到离线 → 断言 online=false / tile_source=osm
-       · **关键：新算过的地名/路线要从本地缓存重放出来**（这是离线模式的意义）
-       · 没缓存过的瓦片要 404 且**秒回**（秒回＝根本没去联网试）
+       · **关键：地图不做本地持久化** —— 离线时瓦片必须 404 且**秒回**
+         （秒回＝根本没去联网试），联网时存过的东西断网后也**拿不到**
+       · 离线时只有内置地名表可用；表外的名字要如实返回空
   3) 再来一轮
 
 ⚠️ 不写任何"等几秒应该好了"的模糊断言：每一步都直接看接口返回的字段。
@@ -31,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 #    高德在境外返回空白瓦片，于是断言全挂，白排查一轮。
 from backend import map_tools as _mt      # noqa: E402
 
-# 每轮换一个城市，保证取的是"没缓存过的"瓦片
+# 每轮换一个城市（不为缓存，纯粹是让每轮请求落在不同瓦片上）
 CITIES = [("汕头", 23.4163, 116.6291),
           ("武汉", 30.5928, 114.3055),
           ("西安", 34.3416, 108.9398)]
@@ -120,7 +121,7 @@ def main():
         check("底图=%s" % want_online_src, st.get("tile_source") == want_online_src,
               st.get("tile_source_name"))
 
-        # 高德瓦片：取一张**这个城市 z=14 的瓦片**（每轮换城市＝大概率没缓存过）
+        # 高德瓦片：取这个城市 z=14 的瓦片
         cname, clat, clon = CITIES[(rd - 1) % len(CITIES)]
         z = 14
         x, y = tile_xy(clat, clon, z)
@@ -129,14 +130,17 @@ def main():
               "HTTP %s  %s B  %.2fs" % (code, size, dt))
 
         # 地名（真实数据）
-        q = "汕头市濠江区人民政府"
+        # ⚠️ 特意选一个**内置地名表里没有**的名字 —— 这样"离线拿不到"才有说服力
+        #    （用表里的名字会永远查得到，测不出有没有缓存）
+        q = "广州猎德大桥"
         r = get("/api/map/search?q=%s&limit=1" % urllib.parse.quote(q))
         hit = (r.get("places") or [{}])[0]
         check("联网能查到地名", bool(hit.get("name")), hit.get("name", ""))
 
         st = get("/api/map/stats")
-        check("联网侧有可用数据", True, "缓存里已有 %d 个地名 / %d 条路线"
-              % (st.get("places", 0), st.get("routes", 0)))
+        check("stats 里不再有缓存字段（地图不做本地持久化）",
+              not any(k in st for k in ("tiles", "places", "routes", "bytes")),
+              "字段：%s" % sorted(st.keys()))
 
         # ---------------- 离线 ----------------
         st = set_mode(False)
@@ -144,11 +148,16 @@ def main():
         check("开关切到离线", st.get("online") is False)
         check("底图=OSM", st.get("tile_source") == "osm", st.get("tile_source_name"))
 
-        # 刚才联网查过的地名，离线必须还能查到（走本地缓存）
+        # ⚠️ 联网刚查过的**表外地名**，离线必须拿不到 —— 这就是"没有缓存"的证据。
+        #    （表内名字仍然查得到，那是内置地名表，不是缓存，下一轮会验。）
         r = get("/api/map/search?q=%s&limit=1" % urllib.parse.quote(q))
         hit = (r.get("places") or [{}])[0]
-        check("离线重放联网时查过的地名", bool(hit.get("name")),
-              "%s (from_cache=%s)" % (hit.get("name", "无"), hit.get("from_cache")))
+        check("离线拿不到联网时查过的表外地名（证明真的没缓存）",
+              not hit.get("name"), "返回：%s" % (hit.get("name") or "空 ✅"))
+        r2 = get("/api/map/search?q=%s&limit=1" % urllib.parse.quote("汕头大学"))
+        h2 = (r2.get("places") or [{}])[0]
+        check("离线仍能用**内置地名表**定位（这不是缓存）",
+              bool(h2.get("name")), h2.get("name", "无"))
 
         # 没有缓存的瓦片：必须**秒回**404（秒回＝压根没去联网试）
         code, size, dt = tile_probe("/api/map/amap/19/430000/230000.png")

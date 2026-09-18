@@ -1184,3 +1184,20 @@ body.dark .map-warn { background: #3a2a12; color: #e0b070; }
 body.dark .map-alt { background: #16283d; color: #7fb3e8; }
 body.dark .map-weather { color: #a8b5c4; }
 body.dark .map-note { color: #d0b070; }
+
+/* ---------- 高德 key 面板（顶栏「高德 key」按钮打开） ---------- */
+.amap-state {
+  margin-top: 10px; font-size: 12.5px; color: #6b7684;
+}
+.amap-input {
+  width: 100%; box-sizing: border-box; margin-top: 8px;
+  padding: 9px 10px; border: 1px solid var(--line); border-radius: 7px;
+  background: var(--panel); color: var(--text);
+  font-size: 13px; font-family: Consolas, Menlo, monospace; letter-spacing: .3px;
+}
+.amap-input:focus { outline: none; border-color: var(--accent); }
+.amap-msg { margin-top: 9px; font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; }
+.amap-msg.ok { color: #1e7f45; }
+.amap-msg.bad { color: #c0392b; }
+/* 只填一个字段的场景：不留那一行多余的编号/留白 */
+.ask-layer.ask-free-mode .ask-q { font-size: 12.5px; color: #6b7684; margin-bottom: 6px; }
