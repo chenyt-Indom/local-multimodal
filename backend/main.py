@@ -4915,6 +4915,22 @@ def voice_stop():
     return _voice.stop()
 
 
+@app.get("/api/voice/devices")
+def voice_devices():
+    """能用的麦克风列表 + 当前用的是哪个（界面上的下拉框用它）。
+
+    ⚠️ 必须让用户能换麦克风：本机默认选中的是**摄像头上的麦克风**（底噪 0.007~0.009），
+    识别差、还让静音判定失效（表现为"喊得出来但下次没反应"）。
+    """
+    return _voice.list_devices()
+
+
+@app.post("/api/voice/device")
+def voice_set_device(body: dict):
+    """换麦克风（传设备名或序号，空串 = 回到系统默认）。换完自动重新开始监听。"""
+    return _voice.set_device(str((body or {}).get("device") or ""))
+
+
 # ---------- 前端 ----------
 _NO_CACHE = "no-store, no-cache, must-revalidate, max-age=0"
 

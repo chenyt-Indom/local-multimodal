@@ -359,6 +359,24 @@ body.dragging .drop-overlay,
 }
 .icon-btn.active { border-color: var(--green); color: var(--green); }
 
+/* 电平条：说话时它要跟着跳。**一直不动就说明没采到声音** ——
+   以前"喊不动"只能靠猜（麦克风选错了？系统静音了？），现在一眼能看出来。 */
+.voice-hint .v-level {
+  flex: 0 0 auto; width: 48px; height: 6px; border-radius: 4px;
+  background: rgba(255, 255, 255, .12); overflow: hidden;
+}
+.voice-hint .v-level i {
+  display: block; height: 100%; width: 0;
+  background: var(--muted); transition: width .12s linear, background .2s;
+}
+.voice-hint .v-level.hot i { background: var(--green); }
+.voice-hint .v-dev {
+  flex: 0 0 auto; max-width: 200px; padding: 1px 4px;
+  font-size: 11px; color: inherit; background: transparent;
+  border: 1px solid var(--border); border-radius: 6px;
+}
+.voice-hint .v-dev option { background: var(--panel); color: var(--text); }
+
 /* ---------- 轻提示（toast）---------- */
 .toast-wrap {
   position: fixed; top: 18px; left: 50%; transform: translateX(-50%);

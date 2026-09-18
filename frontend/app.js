@@ -2816,8 +2816,64 @@
   const voiceHintEl = $("#voiceHint");
   const voiceTextEl = $("#voiceText");
   const voiceBtn = $("#voiceBtn");
+  const voiceLevelEl = $("#voiceLevel");
+  const voiceDevEl = $("#voiceDev");
   let voiceWs = null;
   let voiceOn = false;
+  let voiceDevLoaded = false;
+
+  // 电平条：说话时跟着跳。**一直不动就等于"麦克风没采到声音"** ——
+  // 以前"喊不动"只能靠猜（选错设备？系统静音了？），现在一眼能看出来。
+  function voicePaintLevel(rms, th) {
+    if (!voiceLevelEl) return;
+    const bar = voiceLevelEl.querySelector("i");
+    if (!bar) return;
+    const ref = Math.max(0.02, (th || 0.01) * 2);      // 满格 = 说话阈值的 2 倍
+    const pct = Math.max(3, Math.min(100, Math.round((rms || 0) / ref * 100)));
+    bar.style.width = pct + "%";
+    voiceLevelEl.classList.toggle("hot", (rms || 0) >= (th || 0.01));
+  }
+
+  // 麦克风下拉：让用户能换掉"选错的那个"（本机默认就是摄像头上的麦）
+  async function voiceLoadDevices(keepCurrent) {
+    if (!voiceDevEl) return;
+    try {
+      const r = await api("/api/voice/devices");
+      if (!r || !r.devices) return;
+      const cur = r.current || "";
+      const opts = ['<option value="">（系统默认）</option>'];
+      r.devices.forEach((d) => {
+        const label = d.name + (d.hostapi ? " · " + d.hostapi : "");
+        const sel = (!keepCurrent && d.name === cur) ? " selected" : "";
+        opts.push(`<option value="${escapeHtml(d.name)}"${sel}>${escapeHtml(label)}</option>`);
+      });
+      voiceDevEl.innerHTML = opts.join("");
+      if (cur && !Array.from(voiceDevEl.options).some((o) => o.value === cur)) {
+        // 当前用的设备不在列表里（名字变了）→ 加一条并选中，别让下拉框显示成"系统默认"
+        const o = document.createElement("option");
+        o.value = cur; o.textContent = cur + "（当前）"; o.selected = true;
+        voiceDevEl.appendChild(o);
+      }
+      voiceDevLoaded = true;
+    } catch (e) { /* 拿不到就保持空下拉 */ }
+  }
+  if (voiceDevEl) {
+    voiceDevEl.onchange = async () => {
+      const dev = voiceDevEl.value;
+      try {
+        const r = await api("/api/voice/device", {
+          method: "POST", body: JSON.stringify({ device: dev }) });
+        if (r && r.ok === false) showToast(r.error || "换麦克风失败", "warn");
+        else {
+          showToast(dev ? ("已切换到麦克风：" + dev) : "已切回系统默认麦克风", "ok");
+          voiceOn = true;
+          voiceUI("listening");
+        }
+      } catch (e) {
+        showToast("换麦克风失败：" + String(e.message || e), "warn");
+      }
+    };
+  }
 
   function voiceUI(state, text) {
     if (!voiceHintEl || !voiceTextEl) return;
@@ -2845,6 +2901,8 @@
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
       if (msg.type === "state") {
         voiceUI(msg.state);
+        // 提示条一露出来就把麦克风下拉填上（让用户能一眼看到"现在用的是哪只麦"）
+        if (!voiceDevLoaded) voiceLoadDevices();
       } else if (msg.type === "wake") {
         voiceUI("awake");
       } else if (msg.type === "partial") {
@@ -2856,9 +2914,13 @@
         autoGrow();
         voiceUI("listening", "✅ 已识别，自动发送…");
         if (msg.auto && inputEl.value.trim()) setTimeout(() => send(), 120);
+      } else if (msg.type === "level") {
+        // 实时电平（后端每 0.5 秒推一次）
+        voicePaintLevel(msg.rms, msg.speech_th);
       } else if (msg.type === "status") {
         voiceUI(msg.state || "idle");
         if (msg.model_ready === false) voiceTextEl.textContent = "⚠ 未找到语音模型（asr_model 目录）";
+        if (msg.device) voiceLoadDevices();
       } else if (msg.type === "error") {
         voiceUI("idle", "⚠ " + (msg.message || "语音出错"));
         voiceOn = false;
@@ -2908,6 +2970,7 @@
       const onOpen = () => {
         voiceOn = true;
         voiceUI(st.state === "awake" ? "awake" : "listening");
+        voiceLoadDevices();
       };
       if (ws.readyState === 1) onOpen();
       else ws.addEventListener("open", onOpen, { once: true });
