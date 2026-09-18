@@ -610,148 +610,148 @@ def fetch_pages(urls: list, limit: int = 1200, workers: int = 5,
 # ---------- 天气查询（结构化数据，不用搜索引擎）----------
 # 为什么单独做：搜索引擎对"明天上海天气"只会返回「上海天气预报_15天」这类
 # 导航页，拿不到任何真实数值。天气必须走数据 API。
-# 选 Open-Meteo：免密钥、免注册、支持中文城市名、有全球数据。
-
-_WEATHER_CODE = {
-    0: "晴", 1: "晴间多云", 2: "多云", 3: "阴",
-    45: "有雾", 48: "雾凇",
-    51: "小毛毛雨", 53: "毛毛雨", 55: "大毛毛雨",
-    56: "冻毛毛雨", 57: "强冻毛毛雨",
-    61: "小雨", 63: "中雨", 65: "大雨",
-    66: "冻雨", 67: "强冻雨",
-    71: "小雪", 73: "中雪", 75: "大雪", 77: "米雪",
-    80: "阵雨", 81: "强阵雨", 82: "暴雨",
-    85: "小阵雪", 86: "大阵雪",
-    95: "雷阵雨", 96: "雷阵雨伴小冰雹", 99: "雷阵雨伴大冰雹",
-}
-
-
-def _json_get(url: str, timeout: int = 20) -> dict:
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0",
-                                               "Accept-Encoding": "gzip, deflate"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(_read_body(resp).decode("utf-8", errors="ignore"))
+#
+# 数据源：**只用中国气象局**（经高德地图转发）—— 实况是气象站观测值、
+# 预报是气象台产品，和你在国内天气 App 上看到的是同一套。
+#
+# ⚠️ 2026-09-18 用户明确要求：**Open-Meteo 完全不再使用**（连兜底也不要）。
+#    它的问题实测留档，省得以后再纠结一遍：
+#      · 逐日"下不下雨"（10 城 × 3 天对比）：**37% 虚报下雨、0 漏报**
+#        —— 错法方向固定，只会把晴天说成毛毛雨，对出行判断最有害；
+#      · 实况气温差 −2.8 ~ +2.6℃；体感温度湿热时虚高 5℃+（它是按公式自己算的）；
+#      · 中文城市名解析弱：「汕头」不加"市"就查不到，「东京」会匹配到江苏的小地方。
+#    代价（要如实告诉用户，不许模型自己编）：
+#      高德**只给 4 天预报**，而且**没有体感温度、降水概率、降水量**。
+#      format_weather 会在结果**最前面**写明缺哪些字段。
 
 
-def geocode_city(city: str, count: int = 5) -> list:
-    """城市名 → 经纬度（Open-Meteo 地理编码，支持中文）。"""
-    url = ("https://geocoding-api.open-meteo.com/v1/search?name="
-           + urllib.parse.quote(city)
-           + f"&count={count}&language=zh&format=json")
+def _online() -> bool:
+    """当前是否允许联网（跟着「联网」开关）。读不到就按"允许"处理，别把功能卡死。"""
     try:
-        data = _json_get(url)
+        from . import map_tools as _mt
+        return bool(_mt.online())
     except Exception:
-        return []
-    out = []
-    for r in data.get("results", []) or []:
-        try:
-            out.append({
-                "name": r.get("name") or "",
-                "admin1": r.get("admin1") or "",
-                "admin2": r.get("admin2") or "",
-                "country": r.get("country") or "",
-                "lat": float(r["latitude"]),
-                "lon": float(r["longitude"]),
-            })
-        except Exception:
-            continue
-    return out
+        return True
 
 
 def weather(city: str, days: int = 3) -> dict:
-    """查某地天气，返回结构化数据。
+    """查天气 —— **只用中国气象局的数据**（经高德地图）。
 
-    返回 {ok, city, admin, lat, lon, current:{...}, daily:[{date,high,low,rain,desc}], note}
+    查不到时 ok=False，`error` 里写清楚为什么（没配 key / 境外 / 高德没有这个地名的数据）。
+    ⚠️ **不回退到任何其它源**（用户明确要求）。
     """
     days = max(1, min(int(days or 3), 16))
-    hits = geocode_city(city)
-    if not hits:
-        return {"ok": False, "error": f"没找到城市「{city}」。可以换个说法，比如「上海市」「广东 深圳」"}
-
-    # 优先取在国家/省份层级匹配得上的那个（避免"上海"命中云南的小地名）
-    best = hits[0]
-    for h in hits:
-        if h["name"] == city or city in (h["name"] + h["admin1"]):
-            best = h
-            break
-
-    url = ("https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
-           "&current=temperature_2m,relative_humidity_2m,apparent_temperature,"
-           "precipitation,weather_code,wind_speed_10m"
-           "&daily=weather_code,temperature_2m_max,temperature_2m_min,"
-           "precipitation_sum,precipitation_probability_max,wind_speed_10m_max"
-           "&timezone=Asia%%2FShanghai&forecast_days=%d" % (best["lat"], best["lon"], days))
+    if not _online():
+        # 查天气必须联网。关着「联网」还去发请求，等于偷偷联网 —— 与开关的约定不符。
+        return {"ok": False,
+                "error": "离线模式查不了天气（要联网）。打开顶栏的「联网」开关就能查。"}
     try:
-        d = _json_get(url, timeout=25)
+        from . import amap as _am
     except Exception as e:
-        return {"ok": False, "error": f"天气服务请求失败：{e}"}
+        return {"ok": False, "error": "天气模块加载失败：%s" % str(e)[:60]}
+    if not _am.key():
+        # ⚠️ 没 key 时**别硬查**，直接告诉用户去配 —— 界面上有「高德 key」按钮，
+        #    模型也可以调 connect_amap 弹窗请他填（填完立刻生效，不用重启）。
+        return {"ok": False,
+                "error": ("本机还没配高德 key，查不了天气。点界面顶栏的「高德 key」"
+                          "填一个（免费，约 1 分钟）就能查了。")}
+    try:
+        w = _am.weather(city, days)
+    except Exception as e:
+        return {"ok": False, "error": "天气查询失败：%s" % str(e)[:80]}
+    if w and w.get("ok"):
+        return w
+    if w and w.get("foreign"):
+        return {"ok": False,
+                "error": ("天气只覆盖**中国大陆**（数据来自中国气象局），"
+                          "查不了「%s」这类境外地名；国内地名请带上城市，"
+                          "例如「广东 汕头」。" % city)}
+    return w or {"ok": False, "error": "天气查询失败：没拿到数据"}
 
-    cur_raw = d.get("current") or {}
-    daily_raw = d.get("daily") or {}
-    dates = daily_raw.get("time") or []
 
-    daily = []
-    for i, day in enumerate(dates):
-        code = (daily_raw.get("weather_code") or [None] * len(dates))[i]
-        daily.append({
-            "date": day,
-            "high": (daily_raw.get("temperature_2m_max") or [None] * len(dates))[i],
-            "low": (daily_raw.get("temperature_2m_min") or [None] * len(dates))[i],
-            "rain_mm": (daily_raw.get("precipitation_sum") or [None] * len(dates))[i],
-            "rain_pct": (daily_raw.get("precipitation_probability_max") or [None] * len(dates))[i],
-            "wind": (daily_raw.get("wind_speed_10m_max") or [None] * len(dates))[i],
-            "desc": _WEATHER_CODE.get(code, f"天气码{code}" if code is not None else ""),
-        })
-
-    cur = {}
-    if cur_raw:
-        code = cur_raw.get("weather_code")
-        cur = {
-            "temp": cur_raw.get("temperature_2m"),
-            "feels": cur_raw.get("apparent_temperature"),
-            "humidity": cur_raw.get("relative_humidity_2m"),
-            "rain_mm": cur_raw.get("precipitation"),
-            "wind": cur_raw.get("wind_speed_10m"),
-            "desc": _WEATHER_CODE.get(code, f"天气码{code}" if code is not None else ""),
-        }
-
-    # 行政区划去重："上海市 上海市" 这种重复只留一个
-    parts = [p for p in (best.get("admin1"), best.get("admin2")) if p]
-    admin = " ".join(dict.fromkeys(parts))
-
-    return {
-        "ok": True,
-        "city": best["name"],
-        "admin": admin,
-        "country": best["country"],
-        "lat": best["lat"], "lon": best["lon"],
-        "current": cur,
-        "daily": daily,
-        "source": "Open-Meteo（open-meteo.com）",
-        "note": "数据为气象模型预报值，与中央气象台发布可能略有差异。",
-    }
+def _fmt_n(v) -> str:
+    """数字美化：28.0 → 28，28.6 → 28.6（缺值返回空串）。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return ""
+    return ("%d" % f) if abs(f - round(f)) < 0.05 else ("%.1f" % f)
 
 
 def format_weather(w: dict) -> str:
-    """把天气数据格式化成给模型看的紧凑文本。"""
+    """把天气数据格式化成给模型看的紧凑文本。
+
+    ⚠️ 中国气象局（经高德）**没有体感温度、降水概率、降水量**，风的单位还是
+    "风力等级"（"东≤3"）不是 km/h —— 所以一律"有什么写什么"：
+    缺的字段**绝不能打印出 None**（那会让模型讲成"体感 None 度"），
+    而且要在**最前面**告诉模型"这些数据没有"，否则它会自己编（实测编出过「体感 29.5℃」）。
+    """
     if not w.get("ok"):
         return f"天气查询失败：{w.get('error')}"
-    lines = [f"【{w['city']}{('（' + w['admin'] + '）') if w.get('admin') else ''} 天气】"
-             f"坐标 {w['lat']:.2f},{w['lon']:.2f}　数据源：{w.get('source','')}"]
+    where = w.get("city") or ""
+    if w.get("admin"):
+        where += "（%s）" % w["admin"]
+    lines = ["【%s 天气】数据源：%s　坐标 %.2f,%.2f"
+             % (where, w.get("source", ""), w.get("lat") or 0, w.get("lon") or 0)]
     c = w.get("current") or {}
     if c:
-        lines.append(f"当前：{c.get('desc','')}，气温 {c.get('temp')}°C"
-                     f"（体感 {c.get('feels')}°C），湿度 {c.get('humidity')}%，"
-                     f"降水 {c.get('rain_mm')}mm，风速 {c.get('wind')}km/h")
+        bits = []
+        if c.get("desc"):
+            bits.append(str(c["desc"]))
+        if c.get("temp") is not None:
+            bits.append("气温 %s°C" % _fmt_n(c["temp"]))
+        if c.get("feels") is not None:
+            bits.append("体感 %s°C" % _fmt_n(c["feels"]))
+        if c.get("humidity") is not None:
+            bits.append("湿度 %s%%" % _fmt_n(c["humidity"]))
+        if c.get("rain_mm") is not None:
+            bits.append("降水 %s mm" % _fmt_n(c["rain_mm"]))
+        # ⚠️ 风**照抄数据源自己的单位**（高德给的是"东≤3"这种风力等级，不是 km/h）
+        if c.get("wind"):
+            bits.append("风 %s" % c["wind"])
+        if c.get("report_time"):
+            bits.append("观测时间 %s" % c["report_time"])
+        if bits:
+            lines.append("当前：" + "，".join(bits))
     lines.append("逐日预报：")
     for i, d in enumerate(w.get("daily") or []):
         tag = ["今天", "明天", "后天"][i] if i < 3 else f"第{i+1}天"
-        lines.append(f"  {d['date']}（{tag}）{d['desc']}　"
-                     f"{d['low']}~{d['high']}°C　降水概率 {d['rain_pct']}%"
-                     f"（{d['rain_mm']}mm）　最大风速 {d['wind']}km/h")
+        seg = ["%s（%s）%s" % (d.get("date", ""), tag, d.get("desc", ""))]
+        if d.get("low") is not None or d.get("high") is not None:
+            seg.append("%s~%s°C" % (_fmt_n(d.get("low")), _fmt_n(d.get("high"))))
+        if d.get("rain_pct") is not None:
+            seg.append("降水概率 %s%%" % _fmt_n(d["rain_pct"]))
+        if d.get("rain_mm") is not None:
+            seg.append("降水 %s mm" % _fmt_n(d["rain_mm"]))
+        if d.get("wind"):
+            seg.append("风 %s" % d["wind"])
+        # 混了两个源时逐日标出来，免得"前 4 天一个口径、后几天另一个口径"看着矛盾
+        if d.get("src") and len({x.get("src") for x in (w.get("daily") or [])}) > 1:
+            seg.append("（%s）" % d["src"])
+        lines.append("  " + "　".join(seg))
     if w.get("note"):
         lines.append(f"说明：{w['note']}　回答时请注明数据来源。")
-    return "\n".join(lines)
+
+    # ⚠️⚠️ 缺什么就明说缺什么 —— 而且要**放在最前面**。
+    #    实测（2026-09-18）：高德不给体感温度和降水概率，模型就自己编了
+    #    「体感温度约 29.5°C」「降水概率 0%（无降雨）」，说得跟真的一样。
+    #    弱模型对"结果末尾的附注"基本不看，放在开头才会照做（这条踩过好几次）。
+    missing = []
+    c0 = w.get("current") or {}
+    if c0 and c0.get("feels") is None:
+        missing.append("体感温度")
+    d0 = (w.get("daily") or [{}])[0]
+    if d0.get("rain_pct") is None:
+        missing.append("降水概率")
+    if d0.get("rain_mm") is None:
+        missing.append("降水量")
+    head = ""
+    if missing:
+        head = ("⚠️ 本次**没有**这些数据：%s —— 这个数据源不提供。"
+                "**不许估算、不许编，连 0、未知 这类占位数字都不要写**；"
+                "只能原样写「数据源不提供」。只能用下面真正出现的字段作答。\n\n"
+                % "、".join(dict.fromkeys(missing)))
+    return head + "\n".join(lines)
 
 
 # ---------- 图片搜索（找现成的图，不是生成图）----------

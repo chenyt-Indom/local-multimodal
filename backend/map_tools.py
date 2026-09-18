@@ -249,58 +249,46 @@ def _builtin_search(query: str, limit: int = 5) -> list:
 
 
 # ---------------------------------------------------------------- 天气（按坐标）
-# 路线规划带上天气：知道出发/到达时段会不会下雨，比只给一个公里数有用得多。
-# 用 open-meteo（免费、不要 key，和 get_weather 同一个源），这里多要一份**逐小时**数据。
-_WMO = {0: "晴", 1: "晴间多云", 2: "多云", 3: "阴", 45: "有雾", 48: "雾凇",
-        51: "小毛毛雨", 53: "毛毛雨", 55: "大毛毛雨", 61: "小雨", 63: "中雨",
-        65: "大雨", 66: "冻雨", 67: "强冻雨", 71: "小雪", 73: "中雪", 75: "大雪",
-        77: "雪粒", 80: "阵雨", 81: "强阵雨", 82: "暴雨", 85: "阵雪", 86: "强阵雪",
-        95: "雷阵雨", 96: "雷阵雨伴冰雹", 99: "强雷暴伴冰雹"}
+# 路线规划带上天气：知道出发地现在什么天气、到达那天什么天气，比只给一个公里数有用。
+#
+# 数据源：**只用中国气象局**（经高德地图）。⚠️ 高德**没有逐小时接口**，
+# 所以"抵达时"只能退到**当天的逐日预报**（白天天气现象 + 温度区间），
+# 不是"那个小时的确切天气" —— 卡片和给模型的文案里都要说清这一点。
+#
+# ⚠️ 2026-09-18 起 Open-Meteo 完全不用了（用户要求），所以这里**一个请求都不发给它**。
 
 
-def wmo_text(code) -> str:
+def weather_at(lat: float, lon: float) -> dict:
+    """按坐标取「此刻实况 + 逐日预报」。失败返回 {}（不抛异常，路线照常给）。"""
     try:
-        return _WMO.get(int(code), "")
-    except (TypeError, ValueError):
-        return ""
-
-
-def weather_at(lat: float, lon: float, hours: int = 12) -> dict:
-    """按坐标查当前 + 未来几小时的天气。失败返回 {}（不抛异常，路线照常给）。"""
-    url = ("https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
-           "&current=temperature_2m,precipitation,weather_code,wind_speed_10m"
-           "&hourly=temperature_2m,precipitation_probability,weather_code"
-           "&timezone=Asia%%2FShanghai&forecast_days=2"
-           % (lat, lon))
-    try:
-        d = _get_json(url, timeout=15)
+        from . import amap as _am
+        if not _am.key():
+            return {}
+        a = _am.weather_at(lat, lon)      # 实况
+        fc = _am.forecast_of(lat, lon)    # 逐日（按坐标反查 adcode）
+        out = {}
+        if a.get("now"):
+            out["now"] = a["now"]
+        if fc:
+            out["daily"] = fc
+        if out:
+            out["src"] = "中国气象局"
+            out["city"] = a.get("city") or ""
+        return out
     except Exception:
         return {}
-    cur = d.get("current") or {}
-    out = {"now": {"temp": cur.get("temperature_2m"),
-                   "desc": wmo_text(cur.get("weather_code")),
-                   "rain_mm": cur.get("precipitation"),
-                   "wind": cur.get("wind_speed_10m")}}
-    hr = d.get("hourly") or {}
-    times = hr.get("time") or []
-    n = len(times)
-    rows = []
-    for i, t in enumerate(times[:hours]):
-        rows.append({"t": str(t)[11:16],
-                     "temp": (hr.get("temperature_2m") or [None] * n)[i],
-                     "rain": (hr.get("precipitation_probability") or [None] * n)[i],
-                     "desc": wmo_text((hr.get("weather_code") or [None] * n)[i])})
-    out["hours"] = rows
-    return out
 
 
-def pick_hourly(w: dict, offset_minutes: float) -> dict:
-    """从逐小时里挑出"从现在起 offset 分钟之后"那一格的天气。"""
-    rows = (w or {}).get("hours") or []
+def pick_day(daily: list, when) -> dict:
+    """从逐日预报里挑出 `when` 那一天的（按日期字符串匹配；找不到就用第一条）。"""
+    rows = daily or []
     if not rows:
         return {}
-    idx = int(max(0.0, float(offset_minutes or 0)) // 60)
-    return rows[min(idx, len(rows) - 1)]
+    key = when.strftime("%Y-%m-%d") if hasattr(when, "strftime") else str(when or "")
+    for d in rows:
+        if d.get("date") == key:
+            return d
+    return rows[0]
 
 
 # ---------------------------------------------------------------- 直线距离（离线兜底）
@@ -714,10 +702,19 @@ def _shape(routes: list, best: int, m: str, a: dict, b: dict,
     if want_weather and net:
         wf, wt = weather_at(a["lat"], a["lon"]), weather_at(b["lat"], b["lon"])
         if wf or wt:
+            # 抵达"那一天"（不是"那一小时"）—— 高德没有逐小时接口，
+            # 所以这里拿当天/次日的**逐日预报**，文案里也必须这么讲。
+            now_ts = time.time()
+            arrive_ts = now_ts + float(b_rt.get("duration_s") or 0)
+            arrive_date = time.strftime("%Y-%m-%d", time.localtime(arrive_ts))
+            today = time.strftime("%Y-%m-%d", time.localtime(now_ts))
             res["weather"] = {
-                "from": {"name": a.get("name"), "now": wf.get("now") or {}},
+                "from": {"name": a.get("name"), "now": wf.get("now") or {},
+                         "src": wf.get("src") or ""},
                 "to": {"name": b.get("name"),
-                       "arrival": pick_hourly(wt, b_rt["duration_s"] / 60.0)},
+                       "day": pick_day(wt.get("daily"), arrive_date),
+                       "day_label": "今天" if arrive_date == today else "明天",
+                       "src": wt.get("src") or ""},
             }
     return res
 

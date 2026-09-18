@@ -1168,7 +1168,14 @@ _WEATHER_SCHEMA = {
         "description": (
             "查询某地天气（实时 + 未来逐日预报）。"
             "**天气一律用这个，不要用 web_search**（搜索引擎只给天气网站导航页，没有数值）。"
-            "支持中文城市名。"
+            "支持中文城市名，**只覆盖中国大陆**。"
+            "⚠️ 数据源**只有中国气象局**（经高德地图）：实况是气象站观测、预报是气象台产品。"
+            "本机没配高德 key 时**查不了**（返回里会说明，请让用户点顶栏的「高德 key」填一个，"
+            "或调用 connect_amap），**不要改用搜索、也不要凭印象编天气**。"
+            "返回值里有「数据源」和「观测时间」，回答时要如实转述是几点观测的。"
+            "⚠️⚠️ 高德只提供 **4 天**预报，且**没有体感温度、降水概率、降水量** ——"
+            "结果**开头会写明「本次没有这些数据」**，那就**一个数字都不许编**，"
+            "连 0、未知这类占位数字也别写。"
         ),
         "parameters": {
             "type": "object",
@@ -1179,7 +1186,7 @@ _WEATHER_SCHEMA = {
                 },
                 "days": {
                     "type": "integer",
-                    "description": "预报天数，默认 3（含今天），最多 16 天。",
+                    "description": "预报天数，默认 3（含今天）。⚠️ 数据源只给 4 天，填大了也只有 4 天。",
                 },
             },
             "required": ["city"],
@@ -3013,21 +3020,25 @@ def _do_map_plan(arguments=None, ui_events=None, context=None) -> str:
 
             w = r.get("weather") or {}
             fw = (w.get("from") or {}).get("now") or {}
-            aw = (w.get("to") or {}).get("arrival") or {}
-            if fw.get("desc") or aw.get("desc"):
+            tw = (w.get("to") or {}).get("day") or {}
+            day_label = (w.get("to") or {}).get("day_label") or "当天"
+            if fw.get("desc") or tw.get("desc"):
                 parts = []
                 if fw.get("desc"):
                     parts.append("出发地此刻 %s%s"
                                  % (fw["desc"],
                                     "、%.0f℃" % fw["temp"] if fw.get("temp") is not None else ""))
-                if aw.get("desc"):
-                    parts.append("预计抵达时 %s%s（%s 前后）"
-                                 % (aw["desc"],
-                                    "、%.0f℃" % aw["temp"] if aw.get("temp") is not None else "",
-                                    aw.get("t") or ""))
-                if aw.get("rain") is not None:
-                    parts.append("抵达时段降水概率 %s%%" % aw["rain"])
+                if tw.get("desc"):
+                    rng = ""
+                    if tw.get("low") is not None and tw.get("high") is not None:
+                        rng = "、%.0f~%.0f℃" % (tw["low"], tw["high"])
+                    parts.append("抵达那天（%s）%s%s" % (day_label, tw["desc"], rng))
                 lines.append("    **天气**：%s" % "；".join(parts))
+                # ⚠️ 必须说清"抵达"给的是**当天**的预报，不是那个小时 ——
+                #    高德没有逐小时接口，含糊过去模型就会编出"抵达时几点几分下雨"。
+                lines.append("    （数据来自**中国气象局**：此刻是气象站实况，"
+                             "抵达给的是**当天**的逐日预报，不是那一小时的确切天气；"
+                             "转述时别把「当天」说成「到达时那一刻」）")
         else:
             approx = r.get("approx")
             lines.append("· **从 %s 到 %s**：%s"
@@ -3084,7 +3095,12 @@ def _do_map_plan(arguments=None, ui_events=None, context=None) -> str:
                        "weather": ({"from_name": ((rinfo.get("weather") or {}).get("from") or {}).get("name") or "",
                                     "from_now": ((rinfo.get("weather") or {}).get("from") or {}).get("now") or {},
                                     "to_name": ((rinfo.get("weather") or {}).get("to") or {}).get("name") or "",
-                                    "to_arrival": ((rinfo.get("weather") or {}).get("to") or {}).get("arrival") or {}}
+                                    # ⚠️ 给的是**抵达那天的逐日预报**（不是那一小时）——
+                                    #    高德没有逐小时接口，卡片上必须这么写。
+                                    "to_day": ((rinfo.get("weather") or {}).get("to") or {}).get("day") or {},
+                                    "to_day_label": ((rinfo.get("weather") or {}).get("to") or {}).get("day_label") or "",
+                                    # 两个数都是**中国气象局**的（实况 + 逐日预报）
+                                    "src": ((rinfo.get("weather") or {}).get("from") or {}).get("src") or ""}
                                    if rinfo.get("weather") else None),
                        "modes": [{"mode": _mt._MODE_CN.get(k, k),
                                   "distance": _mt.fmt_distance(v["distance_m"]),

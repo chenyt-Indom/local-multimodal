@@ -287,18 +287,26 @@
     // 天气（只有请求里带 weather:true 才有）
     const wt = (rt && rt.weather) || null;
     if (wt) {
-      const fn = wt.from_now || {}, ta = wt.to_arrival || {};
+      const fn = wt.from_now || {}, td = wt.to_day || {};
       const bits = [];
       if (fn.desc) {
-        bits.push("出发地 " + escapeHtml(fn.desc) +
+        bits.push("出发地此刻 " + escapeHtml(fn.desc) +
           (fn.temp != null ? " " + Math.round(fn.temp) + "℃" : ""));
       }
-      if (ta.desc) {
-        bits.push("抵达时 " + escapeHtml(ta.desc) +
-          (ta.temp != null ? " " + Math.round(ta.temp) + "℃" : "") +
-          (ta.rain != null ? " 降水" + ta.rain + "%" : ""));
+      if (td.desc) {
+        // ⚠️ 写「抵达那天」而不是「抵达时」：高德没有逐小时接口，
+        //    给的是**当天的逐日预报**。写成"抵达时"就等于骗人。
+        bits.push("抵达那天（" + escapeHtml(wt.to_day_label || "当天") + "）" +
+          escapeHtml(td.desc) +
+          (td.low != null && td.high != null
+            ? " " + Math.round(td.low) + "~" + Math.round(td.high) + "℃" : ""));
       }
-      if (bits.length) html += `<div class="map-weather">${bits.join("　·　")}</div>`;
+      if (bits.length) {
+        const src = wt.src || "";
+        html += `<div class="map-weather">${bits.join("　·　")}` +
+          (src ? `<span class="map-src">（数据源 ${escapeHtml(src)}）</span>` : "") +
+          `</div>`;
+      }
     }
     if (rt && rt.note) {
       html += `<div class="map-note">${escapeHtml(rt.note)}</div>`;
