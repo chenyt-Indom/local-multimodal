@@ -708,7 +708,24 @@ body.dragging .drop-overlay,
 .code-part.err pre { color: #f08a84; }
 .code-part.empty { color: var(--muted); }
 .code-time { padding: 0 12px 8px; font-size: 11px; color: var(--muted); }
+/* 运行中给程序喂标准输入 —— 程序里有 input() 时全靠它。
+   原来那个输入框是跟着「开发台」一起没的，于是带 input() 的程序点了运行只会干等
+   （用户没处输入，看着像卡死）。 */
+.code-stdin {
+  display: flex; gap: 6px; align-items: center;
+  padding: 8px 12px; border-top: 1px dashed var(--border); background: var(--panel2);
+}
+.code-stdin input {
+  flex: 1 1 auto; min-width: 0; padding: 6px 10px;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: #0b0e13; color: #d9e2f1;
+  font-family: Consolas, "Cascadia Mono", Menlo, monospace; font-size: 12.5px;
+}
+.code-stdin input:focus { outline: none; border-color: var(--accent); }
+.code-stdin .btn { flex: 0 0 auto; width: auto; margin: 0; }
+.code-stdin-hint { padding: 6px 12px 8px; font-size: 11px; color: var(--muted); }
 .md-text { white-space: pre-wrap; }
+.md-text.muted { color: var(--muted); font-style: italic; }
 
 /* ---------- 危险操作确认弹窗 ---------- */
 .confirm-layer {

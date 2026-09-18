@@ -1333,6 +1333,10 @@ def _needs_task_model(text: str, prev_code: bool = False) -> bool:
 # 做法：把文本里解析出来的调用**伪装成原生 tool_calls**，
 # 直接复用下面那套「执行 / 前端事件 / 危险操作先问用户」的逻辑，零重复实现。
 _TEXT_TOOL_RE = re.compile(r"```(?:tool|tool_call|json)?[ \t]*\r?\n(.*?)```", re.S)
+# ⚠️ **只认这两个是"工具调用专用围栏"**，可以无条件从正文里删掉。
+#    `json` 不能算进来：模型写 .json 文件、贴接口返回时也用它，
+#    误删就是把用户要的内容吃掉了（见 _split_text_tool_calls 的说明）。
+_TOOL_FENCE_RE = re.compile(r"```(?:tool|tool_call)[ \t]*\r?\n(.*?)```", re.S)
 
 # 代码轮可用工具的**文本协议说明**（键名同时充当白名单）
 _TEXT_TOOL_DOCS = {
@@ -1549,42 +1553,110 @@ def _as_tool_call_obj(obj):
     return {"name": name, "arguments": args}
 
 
+def _loads_lenient(s: str):
+    """宽松解析一段"可能是 JSON"的文本 —— 失败时**补上缺的右括号**再试一次。
+
+    ⚠️ 为什么需要：模型经常把工具调用的 JSON **写残缺**。实测抓到的原文是
+    `{"name": "workspace_write", "arguments": {"rel": "timer.py", "text": "…"}` ——
+    代码、引号、内层 `}` 全对，**就是漏了最外层的那个 `}`**。
+    这种残缺以前会让整个工具调用**静默失效**（解析失败 → 不执行 → 那块 JSON
+    还留在正文里显示成一张"代码卡片"，用户点运行得到 `SyntaxError`）。
+
+    补括号是**只加不减**的操作，不会改坏原有内容；
+    但**字符串没闭合就放弃**（那是被截断了，硬补会把半截代码当成完整代码写盘）。
+    """
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    stack, in_str, esc = [], False, False
+    for ch in s:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+    if in_str or not stack:
+        return None                      # 截断在半截字符串里 / 本来就没缺括号
+    try:
+        return json.loads(s + "".join("}" if c == "{" else "]" for c in reversed(stack)))
+    except Exception:
+        return None
+
+
 def _split_text_tool_calls(text: str):
     """从代码模型的正文里拆出**所有**「文本协议工具调用」。
 
-    返回 (calls, 清理后的正文)。清理后的正文里，**所有** ```tool 块都被删掉了 ——
+    返回 (calls, 清理后的正文)。清理后的正文里，**所有**工具块都被删掉了 ——
     ⚠️ 只删第一个是不够的：实测模型一轮里会连着输出两个块（比如先 write 再 run），
     第二个会被原样留在正文里显示成一坨 JSON 给用户看，而且还会被静默丢掉不执行。
     """
     raw = text or ""
-    if not raw or '"name"' not in raw:
+    if not raw:
+        return [], raw
+    # ⚠️ 快路径要同时看**两个**标记，不能只看 `"name"`：
+    #    模型经常只吐一对**空的** ```tool 当分隔符（整段正文里一个 "name" 都没有），
+    #    那种也必须删掉 —— 否则前端会给它渲染出一张空的「代码卡片」，
+    #    用户看到的就是"莫名其妙好几张一样的卡片"。
+    has_fence = ("```tool" in raw) or ("```tool_call" in raw)
+    if not has_fence and '"name"' not in raw:
         return [], raw
 
     calls, cleaned = [], raw
     # ① 代码围栏里的（模型最常这么写）
-    for m in list(_TEXT_TOOL_RE.finditer(raw)):
-        try:
-            obj = json.loads(m.group(1).strip())
-        except Exception:
-            continue
-        call = _as_tool_call_obj(obj)
-        if call:
-            calls.append(call)
+    #
+    # ⚠️⚠️ 显式工具围栏（```tool / ```tool_call）**一律从正文里删掉**，
+    #    不管里面的 JSON 能不能解析、甚至是不是空的 —— 这条不能省：
+    #    模型把 JSON 写残缺是常事（最常见就是漏掉最外层 `}`），
+    #    而以前是"解析失败就 continue"，于是那个块**原样留在正文里**，
+    #    前端把每个围栏块都渲染成一张「代码卡片」→ 用户看到好几张一模一样的卡片，
+    #    点「▶ 运行」还会把那段 JSON 当成 Python 去跑，得到
+    #    `SyntaxError: '{' was never closed`（实测用户就是这么被卡住的）。
+    #    模型还爱吐一对**空的** ```tool 当分隔符，也一样删干净。
+    if has_fence:
+        for m in list(_TOOL_FENCE_RE.finditer(raw)):
             cleaned = cleaned.replace(m.group(0), "")
+            body = m.group(1).strip()
+            if not body:
+                continue                  # 空的分隔块：删掉就行，没什么可执行的
+            obj = _loads_lenient(body)
+            call = _as_tool_call_obj(obj) if obj is not None else None
+            if call:
+                calls.append(call)
+            else:
+                # 解析不出来 = 这个调用**没有执行**。别静默 —— 记下来好排查
+                # （否则现象是"我明明调了工具，怎么没反应"，日志里一个字都没有）。
+                logger.warning("[text-tool] 工具块解析失败、已跳过：%s", body[:160])
     if calls:
         return calls, cleaned.strip()
 
     # ② 退一步：正文里裸的 JSON（平衡括号扫描，只在疑似时做，避免大段 HTML 拖慢）
-    if '"arguments"' in raw or '"parameters"' in raw:
-        for start in (i for i, c in enumerate(raw) if c == "{"):
+    #    ⚠️ 这条路**必须保持严格**：正文里本来就可能有正常的 JSON 数据
+    #    （模型写 .json 文件、贴接口返回），误删就是把用户要的内容吃了。
+    if '"arguments"' in cleaned or '"parameters"' in cleaned:
+        for start in (i for i, c in enumerate(cleaned) if c == "{"):
             depth = 0
-            for i in range(start, len(raw)):
-                if raw[i] == "{":
+            for i in range(start, len(cleaned)):
+                if cleaned[i] == "{":
                     depth += 1
-                elif raw[i] == "}":
+                elif cleaned[i] == "}":
                     depth -= 1
                     if depth == 0:
-                        seg = raw[start:i + 1]
+                        seg = cleaned[start:i + 1]
+                        call = None
                         try:
                             call = _as_tool_call_obj(json.loads(seg))
                         except Exception:
@@ -1920,6 +1992,21 @@ def _save_code_to_doclib(code: str, language: str = "", filename: str = "",
         return ""
 
 
+def _looks_like_tool_block(lang: str, body: str) -> bool:
+    """这个"代码块"其实是一次**内部工具调用**吗（不是给用户看的代码）？
+
+    真实踩坑：代码模型把工具调用写成一个 ```tool 块塞在正文里，而它写的 JSON
+    **漏了最外层的 `}`**，于是清理逻辑没能识别、块留在了正文里。后果有两层：
+      · 前端把每个围栏块都渲染成一张「可运行」的代码卡片（用户看到好几张一样的）；
+      · `_autosave_answer` 还可能把它当成"最大的那个代码块"存成 .py 源码文件。
+    ⇒ 凡是"工具围栏"或"长得就是工具调用 JSON"的块，一律当内部调用处理。
+    """
+    if str(lang or "").strip().lower() in ("tool", "tool_call", "tool-call"):
+        return True
+    obj = _loads_lenient(body)
+    return obj is not None and _as_tool_call_obj(obj) is not None
+
+
 def _autosave_answer(text: str, user_text: str = "") -> str:
     """把模型写好的正文自动存进生成文库，返回相对路径（失败返回空串）。
 
@@ -1930,8 +2017,15 @@ def _autosave_answer(text: str, user_text: str = "") -> str:
     - 其他（作文 / 报告 / 方案）→ 仍然存成 .md，用首行当标题。
     """
     try:
-        blocks = _FENCE_RE.findall(text or "")
-        plain = _FENCE_RE.sub("", text or "").strip()
+        # 存进文库的必须是"给用户看的内容"：先把内部工具调用（```tool 那坨 JSON）摘干净，
+        # 否则 .md/.py 里会躺着一串 `{"name": "workspace_write", …}`（实测踩过）。
+        text = _split_text_tool_calls(text or "")[1]
+        # ⚠️ 再滤掉"其实是工具调用"的块：代码模型把调用写成 ```tool 块，
+        #    万一漏进正文，这里会把它当成"最大的那个代码块"存成 .py ——
+        #    生成文库里的源码就成了那坨 JSON。
+        blocks = [b for b in _FENCE_RE.findall(text)
+                  if not _looks_like_tool_block(b[0], b[1])]
+        plain = _FENCE_RE.sub("", text).strip()
         # ⚠️ 不要要求"有且只有一个代码块" —— 实测模型的回答常是
         # 「一段说明 + 主代码块 + 一小段用法/输出示例」，那样就变成 2 个块，
         # 会被判成"不是代码回答"而存成 .md（踩过）。取**最大的那块**即可。
@@ -2648,7 +2742,15 @@ async def chat(req: ChatRequest):
                     "8. **拿不准的新用法**（某个库的新版本、报错含义）就先 web_search 查，"
                     "别凭印象编 API。\n"
                     "9. 全部做完后，把**完整代码**（放在 ``` 代码块里、标注语言）"
-                    "和**真实运行结果**一起给我。\n")
+                    "和**真实运行结果**一起给我。\n"
+                    "10. ⚠️ **工具调用只能写在 ```tool 块里、一次写完整的一条**，"
+                    "而且**别在正文里重复贴同一份代码**（用户会看到一堆一模一样的卡片）。\n"
+                    "    调用里的 JSON 必须**括号配对**：写 workspace_write 时"
+                    "记得把最外层那个 `}` 也写上。\n"
+                    "11. ⚠️ 程序里有 `input()` / `sys.stdin` 时：工具运行时**没人在旁边打字**，"
+                    "直接跑只会拿到 EOF 报错（**那不代表代码写错了**）。"
+                    "要验证就把输入按行放进 `stdin` 参数；"
+                    "不然写清楚「这个程序需要你在运行后输入」，让用户点 ▶ 运行 自己输。\n")
             else:
                 full_sys += (
                     "本轮**一个工具都没有**（工具清单已被移除），所以：\n"

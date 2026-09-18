@@ -993,7 +993,10 @@ def _run_py_schema() -> dict:
                 "什么时候用：需要精确计算、处理数据、验证自己写的算法对不对、"
                 "做日期/单位换算、正则匹配测试等 —— 凡是「算出来比想出来更可靠」的场景都用它。\n"
                 "怎么用：把完整可运行的代码放进去，用 print() 输出你要看的结果；\n"
-                "**不要**用 input()（没人能输入），不要写文件以外的东西到磁盘（会在临时目录里执行）。\n"
+                "不要写文件以外的东西到磁盘（会在临时目录里执行）。\n"
+                "⚠️ 代码里**有 `input()` 又没给 `stdin`** → 程序会读到 EOF 直接报错，"
+                "**那不代表你的代码写错了**：要么用 stdin 把输入按行喂进去，"
+                "要么改成从命令行参数/常量取输入。\n"
                 "⚠️ 它**只能跑「算完就退出」的代码**（默认最多 60 秒）。"
                 "**计时器 / 服务器 / 游戏 / 图形界面这类要一直跑的程序不要用它跑完整** —— "
                 "工具只会跑前几秒做冒烟测试，那是**正常的、不是代码报错**；"
@@ -1006,6 +1009,10 @@ def _run_py_schema() -> dict:
                 "properties": {
                     "code": {"type": "string",
                              "description": "完整可运行的 Python 代码，用 print() 打印要看的中间结果"},
+                    "stdin": {"type": "string",
+                              "description": "可选：预先喂给程序的标准输入，**一行对应一次 input()**。"
+                                             "代码里用了 input() 就必须给，否则会读到 EOF 而报错"
+                                             "（那不代表代码写错了）。"},
                 },
                 "required": ["code"],
             },
@@ -2143,13 +2150,20 @@ def scan_risky(code: str) -> list:
     return hits
 
 
-def run_code(code: str, allow_risky: bool = False) -> dict:
+def run_code(code: str, allow_risky: bool = False, stdin_text: str = "") -> dict:
     """执行一段 Python，返回**结构化**结果（工具与前端接口共用）。
 
     字段：needs_confirm / risky / out / err / rc / seconds / persistent
     needs_confirm=True 表示"检测到风险但还没获批准"，**没有执行**。
     persistent 非空 = 这段代码是"要一直跑"的那种，只做了几秒冒烟测试，
     **时限到了不是报错**（见 looks_persistent 上面的说明）。
+
+    stdin_text：**预先喂给程序的标准输入**（一行对应一次 input()）。
+        ⚠️ 这个口子必须有：程序里有 `input()` 时没人喂就会立刻拿到 EOF ——
+        实测模型写了个计时器，一问"请输入秒数"就直接
+        `ValueError: invalid literal for int() with base 10: ''`，
+        然后它误以为自己的代码写错了。
+        不喂（空串）时管道会立刻关闭 → 照旧是 EOF，不会把智能体挂住。
     """
     code = str(code or "").strip()
     if not code:
@@ -2183,10 +2197,10 @@ def run_code(code: str, allow_risky: bool = False) -> dict:
             # ⚠️ 用 Popen 而不是 subprocess.run：**run 的 TimeoutExpired 会把
             # 已经打印出来的内容一起丢掉**（实测：跑满时限的计时器在界面上
             # 显示成"（没有输出）"）。Popen 在强杀之后还能把已产出的输出收回来。
-            # stdin 接 DEVNULL：这个后端是 GUI 启动的、没有终端可读，
-            # 不接的话子进程会去继承一个无效句柄。
+            # stdin 接管道（不是 DEVNULL）：程序里 input() 时要能喂进去；
+            # 空输入时 communicate 会关掉它 → 仍是 EOF。
             p = _sp.Popen([sys.executable, "-X", "utf8", "-u", "snippet.py"],
-                          cwd=d, env=env, stdin=_sp.DEVNULL,
+                          cwd=d, env=env, stdin=_sp.PIPE,
                           stdout=_sp.PIPE, stderr=_sp.PIPE,
                           text=True, encoding="utf-8", errors="replace")
         except Exception as exc:
@@ -2194,7 +2208,11 @@ def run_code(code: str, allow_risky: bool = False) -> dict:
                     "seconds": round(time.time() - t0, 2), "persistent": "",
                     "err": "无法启动：%s: %s" % (type(exc).__name__, exc)}
         try:
-            out, err = p.communicate(timeout=limit)
+            _stdin = str(stdin_text or "").replace("\r\n", "\n")
+            # 结尾补一个换行：程序里最后一次 input() 才不会一直等
+            if _stdin and not _stdin.endswith("\n"):
+                _stdin += "\n"
+            out, err = p.communicate(input=_stdin, timeout=limit)
             rc = p.returncode
         except _sp.TimeoutExpired:
             p.kill()
@@ -2366,7 +2384,6 @@ def _do_workspace_run(arguments, ui_events=None) -> str:
     r = run_file(p, allow_risky=False, args=str((arguments or {}).get("args") or ""),
                  stdin_text=str((arguments or {}).get("stdin") or ""))
     if r.get("needs_confirm"):
-        ask = (arguments or {}).get("__confirm__")
         risk = "、".join(r.get("risky") or [])
         return ("这段代码里有需要用户确认的操作（%s），**没有执行**。"
                 "请换成不涉及这些操作的写法，或先跟用户说明再试。" % risk)
@@ -2378,7 +2395,13 @@ def _do_workspace_run(arguments, ui_events=None) -> str:
                           "rc": r.get("rc"), "seconds": r.get("seconds"),
                           "risky": r.get("risky") or []})
     head = "【运行 %s】\n" % rel
-    return head + _format_py_result(r)
+    text = head + _format_py_result(r)
+    # 同上：有 input() 又没喂 stdin → 说清"不是代码错了"
+    if "input(" in _read_text_safe(p) and not str((arguments or {}).get("stdin") or ""):
+        text += ("\n\n⚠️ 这个程序里有 `input()`，而这次**没喂 stdin** —— "
+                 "它读到的是 EOF（不是代码写错了）。要验证就重跑一次并带上 `stdin`"
+                 "（一行对应一次输入），或者让用户点代码卡片上的 ▶ 运行、在输入框里自己输。")
+    return text
 
 
 # ---------------------------------------------------------------- 项目管理
@@ -3695,8 +3718,14 @@ def _do_run_python(arguments, ui_events=None, context=None):
     ⚠️ 检测到危险操作时**不是直接拒绝，而是先问用户**（用户明确要求）：
     批准了就执行，拒绝才放弃。没有确认通道时（例如脚本里直接调用）默认**不执行**。
     """
-    code = str((arguments or {}).get("code") or "").strip()
-    r = run_code(code, allow_risky=False)
+    a = arguments or {}
+    code = str(a.get("code") or "").strip()
+    # `stdin`：把程序里 input() 要读的内容**预先喂进去**（一行一次）。
+    # ⚠️ 没有这个口子的话，凡是带 input() 的程序一跑就是
+    # `EOFError` / `ValueError: invalid literal for int(): ''`，
+    # 模型会误以为自己的代码写错了（实测就是这么绕了好几轮的）。
+    _stdin = str(a.get("stdin") or "")
+    r = run_code(code, allow_risky=False, stdin_text=_stdin)
     if r.get("needs_confirm"):
         ask = (context or {}).get("confirm")
         risk = "、".join(r.get("risky") or [])
@@ -3712,14 +3741,22 @@ def _do_run_python(arguments, ui_events=None, context=None):
                     "先把你要做什么、为什么这么做说清楚，等用户同意再试。\n"
                     "⚠️ **绝对不要编造执行结果或用模拟数据冒充真实输出** ——"
                     "那会让用户以为结果是真的。如实说明「被拒绝了」即可。" % risk)
-        r = run_code(code, allow_risky=True)
+        r = run_code(code, allow_risky=True, stdin_text=_stdin)
     # 把这次执行的代码与结果推给前端 → 界面渲染成"可直接编辑重跑"的代码卡片
     if isinstance(ui_events, list):
-        ui_events.append({"type": "code", "code": code,
+        ui_events.append({"type": "code", "code": code, "stdin": _stdin,
                           "out": r.get("out") or "", "err": r.get("err") or "",
                           "rc": r.get("rc"), "seconds": r.get("seconds"),
                           "risky": r.get("risky") or []})
-    return _format_py_result(r)
+    text = _format_py_result(r)
+    # 程序里有 input() 而这次没喂输入（或喂了还报 EOF）→ 把原因说清楚，
+    # 免得模型又去"修"一份本来没错的代码。
+    if "input(" in code and (not _stdin or r.get("rc") not in (0, None)):
+        text += ("\n\n⚠️ 这段代码里有 `input()`。工具运行的时候**没人在旁边打字**，"
+                 "所以要么把要输入的内容按行放进 **stdin** 参数再跑一次，"
+                 "要么就告诉用户「点代码卡片上的 ▶ 运行，运行当中可以随时输入」"
+                 "（那边的输入框就是给交互程序用的）。**不要**因此断定代码写错了。")
+    return text
 
 
 # =====================================================================

@@ -2193,7 +2193,11 @@
         `<button class="btn sm ghost code-run">▶ 运行</button>` +
         `<button class="btn sm ghost code-save">💾 存到文库</button>` +
         `<button class="btn sm ghost code-copy">📋 复制</button></span></div>` +
-        `<pre class="code-body"><code></code></pre><div class="code-out"></div>`;
+        `<pre class="code-body"><code></code></pre><div class="code-out"></div>` +
+        // 运行中才显示：给程序喂标准输入（程序里有 input() 时全靠它）
+        `<div class="code-stdin" hidden><input class="code-stdin-in" spellcheck="false" ` +
+        `placeholder="程序在等输入的话，在这里打字后回车（一行一次）">` +
+        `<button class="btn sm ghost code-stdin-send">发送</button></div>`;
       const codeEl = card.querySelector(".code-body code");
       const wsBtn = card.querySelector(".code-ws");
       const editBtn = card.querySelector(".code-edit");
@@ -2201,6 +2205,9 @@
       const saveBtn = card.querySelector(".code-save");
       const copyBtn = card.querySelector(".code-copy");
       const outEl = card.querySelector(".code-out");
+      const stdinRow = card.querySelector(".code-stdin");
+      const stdinIn = card.querySelector(".code-stdin-in");
+      const stdinSend = card.querySelector(".code-stdin-send");
       let current = ui.code || "";
       codeEl.textContent = current;
 
@@ -2260,6 +2267,25 @@
         return parts.length ? parts[parts.length - 1] : "";
       }).join("\n");
       let runningId = null;
+      // 往正在跑的程序里送一行标准输入（程序里有 input() 时靠它）
+      const sendStdin = async () => {
+        if (!runningId) { showToast("现在没有正在跑的程序", "warn"); return; }
+        const v = stdinIn.value;
+        stdinIn.value = "";
+        const rid = runningId;
+        try {
+          const r = await api("/api/ws/run_input",
+            { method: "POST", body: JSON.stringify({ id: rid, data: v }) });
+          if (r && r.ok === false) showToast(r.error || "输入送不进去", "warn");
+        } catch (e) {
+          showToast("输入送不进去：" + String(e.message || e), "warn");
+        }
+      };
+      stdinSend.onclick = sendStdin;
+      stdinIn.onkeydown = (e) => {
+        // 回车就发；程序里一次 input() 读一行，所以这里不要自动补内容
+        if (e.key === "Enter") { e.preventDefault(); sendStdin(); }
+      };
       runBtn.onclick = async () => {
         if (runningId) {                 // 再点一次 = 停止
           const rid = runningId;
@@ -2271,15 +2297,23 @@
           runBtn.disabled = false;
           runBtn.textContent = "▶ 运行";
           runBtn.title = "";
+          stdinRow.hidden = true;
           return;
         }
         const code = grab();
         if (!code.trim()) { showToast("代码是空的", "warn"); return; }
+        // 兜底：万一漏进来的是「内部工具调用」那坨 JSON（不是代码），别拿去跑 ——
+        // 那只会得到 `SyntaxError: '{' was never closed`，把人吓一跳。
+        if (looksLikeToolCall(ui.lang || "", code)) {
+          showToast("这段不是代码，是一次内部工具调用（已折叠），不用运行它", "warn");
+          return;
+        }
         current = code;
         const rid = "card-" + Date.now();
         runningId = rid;
         runBtn.textContent = "■ 停止";
         runBtn.title = "点它就能随时停掉正在跑的程序";
+        stdinRow.hidden = false;         // 运行中显示输入框：带 input() 的程序靠它
         let raw = "";
         const paintLive = () => {
           outEl.innerHTML = `<div class="code-part"><b>运行中…</b><pre>${escapeHtml(foldCR(raw))}</pre></div>`;
@@ -2317,6 +2351,7 @@
           if (runningId === rid) runningId = null;
           runBtn.textContent = "▶ 运行";
           runBtn.title = "";
+          stdinRow.hidden = true;
         }
       };
       // 存到生成文库：代码模型那一轮没有工具，保存只能靠这个按钮。
@@ -2405,13 +2440,31 @@
 
     // 回答里的**站内下载链接**渲染成可点按钮（实现在文件上方 addMsg 附近，
     // 那里是顶层函数声明，历史恢复和实时回答两条路径都能用）。
+    // ⚠️ 回答里的"代码块"未必都是代码。
+    // 代码模型那一轮用的是**文本协议**：它会把工具调用写成一个 ```tool 块塞在正文里
+    // （`{"name": "workspace_write", "arguments": {...}}`），后端会把它们摘掉；
+    // 万一漏了一个（实测：模型把 JSON 的最后一个 `}` 漏了 → 后端解析失败 → 块留在正文里），
+    // 这里就是最后一道闸 —— 否则那段 JSON 会变成一张"可编辑可运行"的代码卡片，
+    // 用户点「▶ 运行」得到 `SyntaxError: '{' was never closed`，
+    // 而且会看到好几张一模一样的卡片，完全不知道发生了什么。
+    const looksLikeToolCall = (lang, body) => {
+      if (/^(tool|tool_call|tool-call)$/i.test(String(lang || "").trim())) return true;
+      const s = String(body || "").trim();
+      return /^\{\s*"(name|tool|function)"\s*:/.test(s)
+        && /"(arguments|parameters|args|input)"\s*:/.test(s);
+    };
+
     const renderAnswerWithCode = (bubble, text, userText) => {
       const parts = [];
       const re = /```([a-zA-Z0-9_+#.-]*)[ \t]*\n([\s\S]*?)```/g;
       let last = 0, m;
       while ((m = re.exec(text)) !== null) {
         if (m.index > last) parts.push({ t: "text", v: text.slice(last, m.index) });
-        parts.push({ t: "code", lang: m[1] || "", v: m[2].replace(/\n$/, "") });
+        if (looksLikeToolCall(m[1], m[2])) {
+          parts.push({ t: "raw" });          // 内部工具调用：不渲染成代码卡片
+        } else {
+          parts.push({ t: "code", lang: m[1] || "", v: m[2].replace(/\n$/, "") });
+        }
         last = m.index + m[0].length;
       }
       if (last < text.length) parts.push({ t: "text", v: text.slice(last) });
@@ -2423,6 +2476,11 @@
           const d = document.createElement("div");
           d.className = "md-text";
           d.textContent = p.v;
+          bubble.appendChild(d);
+        } else if (p.t === "raw") {
+          const d = document.createElement("div");
+          d.className = "md-text muted";
+          d.textContent = "（这里原本是一次内部工具调用，已折叠）";
           bubble.appendChild(d);
         } else {
           bubble.appendChild(makeCodeCard(
