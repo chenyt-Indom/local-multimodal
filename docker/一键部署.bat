@@ -11,13 +11,11 @@ echo.
 
 REM ============ 1. 环境检查 ============
 docker version >nul 2>&1
-if errorlevel 1 (
-    echo [错误] 未检测到可用的 Docker 引擎。
-    echo        请先安装并启动 Docker Desktop：https://www.docker.com/products/docker-desktop/
-    echo.
-    pause
-    exit /b 1
-)
+if not errorlevel 1 goto :docker_ready
+call :no_docker
+exit /b 1
+
+:docker_ready
 set "DC=docker compose"
 docker compose version >nul 2>&1
 if errorlevel 1 (
@@ -26,6 +24,20 @@ if errorlevel 1 (
     set "DC=docker-compose"
 )
 echo [1/6] Docker 引擎正常
+REM 磁盘空间：镜像 7GB + 模型 19GB，解包和运行还要留余量，建议 40GB
+set "FREEGB=0"
+for /f %%s in ('powershell -NoProfile -Command "try{[math]::Round((Get-PSDrive (Split-Path -Qualifier $env:CD)).Free/1GB,0)}catch{0}"') do set "FREEGB=%%s"
+if %FREEGB% GEQ 40 goto :disk_ok
+if %FREEGB% GEQ 25 (
+    echo        [注意] 磁盘只剩 %FREEGB% GB，勉强够用，建议再清理一些。
+) else (
+    echo        [警告] 磁盘只剩 %FREEGB% GB，很可能不够！
+    echo               本包需要约 30 GB（镜像 7GB + 模型 19GB + 运行时余量）。
+    echo               建议先清理磁盘，或换一台空间足够的机器。
+    choice /c YN /n /m "        确定要继续吗？[Y/N] "
+    if errorlevel 2 exit /b 1
+)
+:disk_ok
 
 REM ============ 2. 显卡自动适配 ============
 set "FILES=-f compose.yml"
@@ -35,7 +47,10 @@ if defined HASGPU (
     set "FILES=!FILES! -f compose.gpu.yml"
     echo [2/6] 检测到 NVIDIA 显卡，已启用 GPU 加速
 ) else (
-    echo [2/6] 未检测到 NVIDIA 显卡，使用 CPU 模式（功能完整，速度稍慢）
+    echo [2/6] 未检测到 NVIDIA 显卡，使用 CPU 模式
+    echo        [重要] CPU 模式下实测：14B 代码模型约 0.4 字/秒，一句话要等好几分钟；
+    echo               8B 模型也很慢。功能是全的，但体验会明显受限。
+    echo               建议换一台有 NVIDIA 独显的机器运行。
 )
 
 REM ---- 应用镜像二选一 ----
@@ -198,3 +213,34 @@ docker pull %1/ollama/ollama:latest
 if errorlevel 1 exit /b 1
 docker tag %1/ollama/ollama:latest local-multimodal-ollama:latest
 exit /b 0
+
+REM ============================================================
+REM  子过程：没装 Docker 时的引导
+REM  包里有安装程序就直接引导安装，装卸完再跑一次本脚本即可。
+REM ============================================================
+:no_docker
+echo [1/6] 这台机器还没有可用的 Docker 引擎。
+echo.
+if not exist "installers\DockerDesktopInstaller.exe" goto :nd_nopkg
+echo   好消息：安装包里自带了 Docker Desktop 安装程序——
+echo     %~dp0installers\DockerDesktopInstaller.exe
+echo.
+echo   请先安装它（安装时保持默认选项，务必勾选使用 WSL2 后端），
+echo   装完启动 Docker Desktop，等左下角变绿，然后**再双击一次本脚本**继续部署。
+echo.
+choice /c YN /n /m "   现在打开安装程序吗？[Y/N] "
+if errorlevel 2 goto :nd_end
+start "" "%~dp0installers\DockerDesktopInstaller.exe"
+echo.
+echo   已打开安装程序。装好 Docker Desktop 之后，请再运行一次本脚本。
+goto :nd_end
+
+:nd_nopkg
+echo   请先安装并启动 Docker Desktop：
+echo     https://www.docker.com/products/docker-desktop/
+echo   装好之后**再双击一次本脚本**继续部署。
+
+:nd_end
+echo.
+pause
+exit /b 1
