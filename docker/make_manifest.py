@@ -42,6 +42,7 @@ REQUIRED_FILES = [
     "完全卸载.bat",
     "open-folder-agent.ps1",
     "使用说明.md",
+    "从镜像仓库部署.md",
     "校验安装包.bat",
     "校验安装包.ps1",
     "data/config.json",
