@@ -4,6 +4,10 @@ setlocal enabledelayedexpansion
 pushd "%~dp0"
 title 本地多模态助手 · 一键部署
 
+REM 镜像仓库（在线部署模式用；离线包模式用不到它）
+REM   ?? 换账号/仓库时改这里
+set "REG=ccr.ccs.tencentyun.com/bendiai"
+
 echo ============================================================
 echo            本地多模态助手 · 一键部署
 echo ============================================================
@@ -102,8 +106,14 @@ if errorlevel 1 (
         docker load -i "!APP_TAR!"
         if errorlevel 1 ( echo [错误] 镜像导入失败。 & pause & exit /b 1 )
     ) else (
-        echo [4/6] 未找到离线镜像，改为从源码构建（需联网）...
-        set "NEED_BUILD=1"
+        REM 本地既没有镜像、也没有离线 tar —— 先试着从镜像仓库拉（比从源码构建快得多，
+        REM 也不用装编译环境）。拉不到才退回源码构建。
+        echo [4/6] 本地没有离线镜像，正在从镜像仓库拉取...
+        call :try_registry
+        if errorlevel 1 (
+            echo        镜像仓库不可用，改为从源码构建（需联网，较慢）...
+            set "NEED_BUILD=1"
+        )
     )
 ) else (
     echo [4/6] 应用镜像已存在：!APP_IMG!
@@ -125,6 +135,19 @@ if /i "%MODE%"=="bundled" (
 if defined NEED_BUILD (
     %DC% !FILES! !PROFILE! build
     if errorlevel 1 ( echo [错误] 构建失败。 & pause & exit /b 1 )
+)
+
+REM ============ 4.5 准备模型 ============
+REM 离线包模式：模型随包带来（models/ 目录），这里什么都不用做。
+REM 在线模式：  模型在 multimodal-models 镜像里，**必须提取出来** ——
+REM             compose 挂载的是 ./models/ollama，不提取的话容器里是空的，
+REM             表现为「模型列表空、问什么都报找不到模型」。
+call :ensure_models
+if errorlevel 1 (
+    echo.
+    echo [错误] 模型没准备好，启动起来也是空的。
+    echo        可以手动重试：docker pull %REG%/multimodal-models:latest
+    pause & exit /b 1
 )
 
 REM ============ 5. 启动服务 ============
@@ -184,14 +207,70 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath 
 exit /b 0
 
 REM ============================================================
+REM  子过程：从镜像仓库拉应用镜像
+REM  拉下来后**打成本地同名 tag** —— compose 里写的是
+REM  local-multimodal-app:latest / :gpu，改 tag 就不用动 compose。
+REM ============================================================
+:try_registry
+if /i "!APP_IMG!"=="local-multimodal-app:gpu" (set "RIMG=multimodal-app:gpu") else (set "RIMG=multimodal-app:latest")
+echo       拉取 %REG%/!RIMG! ...
+docker pull %REG%/!RIMG!
+if errorlevel 1 (
+    REM GPU 版没传上去 / 拉不动时，退回 CPU 版（功能完全一样，只是绘图慢）
+    if /i "!RIMG!"=="multimodal-app:gpu" (
+        echo       GPU 版拉取失败，退回 CPU 版（功能一样，绘图慢一些）...
+        set "RIMG=multimodal-app:latest"
+        set "APP_IMG=local-multimodal-app:latest"
+        docker pull %REG%/!RIMG!
+        if errorlevel 1 exit /b 1
+    ) else (
+        exit /b 1
+    )
+)
+docker tag %REG%/!RIMG! !APP_IMG!
+REM 顺手也拉一份 CPU 版：界面上的「切换设备」要用到，换机器时也不用再拉
+docker pull %REG%/multimodal-app:latest >nul 2>&1 && docker tag %REG%/multimodal-app:latest local-multimodal-app:latest
+exit /b 0
+
+REM ============================================================
+REM  子过程：确保模型就位（在线部署的关键一步）
+REM  离线包模式：models/ 目录里本来就有，直接返回。
+REM  在线模式：  模型在 multimodal-models 镜像里，提取到本地 models/ 目录 ——
+REM             compose 挂载的是 ./models/ollama，不提取容器里就是空的。
+REM ============================================================
+:ensure_models
+if exist "models\ollama\manifests" exit /b 0
+if exist "models\sd-turbo\model_index.json" exit /b 0
+echo       本地还没有模型，正在从镜像仓库提取（约 18GB，第一次会久一点）...
+docker pull %REG%/multimodal-models:latest
+if errorlevel 1 exit /b 1
+docker rm -f mm-models-tmp >nul 2>&1
+docker create --name mm-models-tmp %REG%/multimodal-models:latest >nul 2>&1
+if errorlevel 1 exit /b 1
+docker cp mm-models-tmp:/models/. "models\"
+set "CPERR=%errorlevel%"
+docker rm -f mm-models-tmp >nul 2>&1
+if not "%CPERR%"=="0" exit /b 1
+echo       模型提取完成
+exit /b 0
+
+REM ============================================================
 REM  子过程：确保 local-multimodal-ollama 镜像就绪
 REM  顺序：离线包 tar → 国内镜像源 → 官方源
 REM ============================================================
 :ensure_ollama
-if not exist "images\local-multimodal-ollama.tar" goto :eo_pull
+if not exist "images\local-multimodal-ollama.tar" goto :eo_registry
 echo       正在导入离线 Ollama 镜像...
 docker load -i "images\local-multimodal-ollama.tar"
+if errorlevel 1 goto :eo_registry
+exit /b 0
+
+:eo_registry
+REM 镜像仓库里有现成的（就是从这个包推上去的），比走 Docker Hub 快得多也不容易失败
+echo       正在从镜像仓库拉取 Ollama 运行时（约 9GB，请耐心等待）...
+docker pull %REG%/multimodal-ollama:latest
 if errorlevel 1 goto :eo_pull
+docker tag %REG%/multimodal-ollama:latest local-multimodal-ollama:latest
 exit /b 0
 
 :eo_pull
