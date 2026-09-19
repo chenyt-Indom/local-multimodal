@@ -86,6 +86,8 @@ def main() -> int:
     check("repeat_penalty 在安全区间（>1.0 且 ≤1.3，太高会让模型结巴）",
           1.0 < float(cfg.get("repeat_penalty") or 0) <= 1.3,
           "repeat_penalty=%s" % cfg.get("repeat_penalty"))
+    check("config 里有 top_p 默认值（界面「🎛 采样」第二条滑条）",
+          0.5 < float(cfg.get("top_p") or 0) <= 1.0, "top_p=%s" % cfg.get("top_p"))
 
     cli = OC.OllamaClient()
     captured = {}
@@ -111,12 +113,25 @@ def main() -> int:
           str(opts.get("repeat_penalty")))
     check("repeat_last_n 传进去了", opts.get("repeat_last_n") == cfg.get("repeat_last_n"),
           str(opts.get("repeat_last_n")))
+    check("top_p 传进去了（顶栏「🎛 采样」第二条滑条就是它）",
+          opts.get("top_p") == cfg.get("top_p"), str(opts.get("top_p")))
     check("原有的 temperature / num_ctx / num_predict 没被改坏",
           opts.get("temperature") == cfg.get("temperature")
           and opts.get("num_ctx") == cfg.get("num_ctx")
           and opts.get("num_predict") == cfg.get("max_tokens"),
           "temp=%s ctx=%s predict=%s" % (opts.get("temperature"),
                                          opts.get("num_ctx"), opts.get("num_predict")))
+
+    # 界面上拖滑条 = 改 config。这里验证"改了 config，下一次请求就跟着变" ——
+    # 后端每个 /api/chat 都重新 load_config，所以**拖完立刻生效，不用重启**。
+    captured.clear()
+    cli.chat([{"role": "user", "content": "hi"}], model="qwen3-vl:8b", stream=False,
+             params=dict(cfg, temperature=1.35, top_p=0.62))
+    opts1b = (captured.get("json") or {}).get("options") or {}
+    check("**改了 config，请求体立刻跟着变**（拖动即生效，不用重启）",
+          abs(float(opts1b.get("temperature") or 0) - 1.35) < 1e-6
+          and abs(float(opts1b.get("top_p") or 0) - 0.62) < 1e-6,
+          "temp=%s top_p=%s" % (opts1b.get("temperature"), opts1b.get("top_p")))
 
     # 没给值时**不能**塞 None 进去（会覆盖掉 Ollama 自己的默认）
     captured.clear()

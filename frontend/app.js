@@ -795,6 +795,149 @@
     };
     render();
   }
+  // ---------- 采样参数（温度 / top-p）：拖动即生效 ----------
+  // 为什么做成"滑条 + 建议值"而不是输入框：
+  //   这两个参数**没有唯一正确答案**，用户需要的是"手感"（拖一下马上看效果）
+  //   和一个锚点（建议值）。所以每条滑条旁边都标着建议值，点一下就能跳回去。
+  //
+  // ⚠️ 生效时机：后端每次 /api/chat 都会重新读 config（`cfg = config.load_config()`），
+  //    所以**拖完立刻生效、不用重启** —— 这句话必须在界面上说明白，
+  //    否则用户会以为"改了没反应"（这类误会以前在 num_ctx 上踩过）。
+  const SAMPLE_META = {
+    temperature: {
+      name: "温度 temperature", min: 0, max: 2, step: 0.05, best: 0.6,
+      less: "更严谨", more: "更发散",
+      hint: "越高越发散：话更活、也更容易跑偏和胡编；越低越稳、越可复现。" +
+            "思考型模型（Qwen3 这类）官方推荐 0.6 —— 写代码、要结论稳定时用 0.2~0.4，" +
+            "头脑风暴可以 1.0~1.3；超过 1.5 基本就开始胡说八道了。",
+    },
+    top_p: {
+      name: "采样范围 top-p", min: 0.1, max: 1, step: 0.01, best: 0.95,
+      less: "更死板", more: "更野",
+      hint: "只在「概率加起来到 top-p 的那一批词」里挑下一个词。0.95 既排掉长尾的胡话、" +
+            "又保留一点灵活度；调到 1.0 连很离谱的词也会被选上（更野）；" +
+            "低于 0.5 会变得死板，而且容易开始重复（能挑的词太少，来回绕）。",
+    },
+  };
+
+  async function showSampling() {
+    if (document.querySelector(".sample-layer")) return;      // 防重复弹层
+    let cfg = {};
+    try { cfg = ((await api("/api/config")) || {}).config || {}; } catch (e) { /* 读不到就用默认 */ }
+    const cur = {};
+    Object.keys(SAMPLE_META).forEach((k) => {
+      const t = SAMPLE_META[k];
+      const v = Number(cfg[k]);
+      cur[k] = Number.isFinite(v) ? Math.min(t.max, Math.max(t.min, v)) : t.best;
+    });
+
+    const rowHtml = Object.keys(SAMPLE_META).map((k) => {
+      const t = SAMPLE_META[k];
+      // 建议刻度**按真实比例定位**（不是简单居中）——
+      // 温度建议 0.6 落在 30% 处、top-p 建议 0.95 落在 94% 处，
+      // 摆到真实位置上，"我现在偏左还是偏右"才一眼可见。
+      const pct = ((t.best - t.min) / (t.max - t.min) * 100).toFixed(1);
+      return '<div class="sample-row" data-key="' + k + '">' +
+        '<div class="sample-head">' +
+        '<span class="sample-name">' + t.name + '</span>' +
+        '<span class="sample-right">' +
+        '<b class="sample-val" data-key="' + k + '">' + cur[k].toFixed(2) + '</b>' +
+        '<button type="button" class="sample-best" data-key="' + k + '" ' +
+        'title="点一下跳回建议值">建议 ' + t.best + '</button>' +
+        '</span></div>' +
+        '<input class="sample-range" type="range" data-key="' + k + '" ' +
+        'min="' + t.min + '" max="' + t.max + '" step="' + t.step + '" value="' + cur[k] + '" />' +
+        '<div class="sample-scale"><span>' + t.less + ' ' + t.min + '</span>' +
+        '<span class="sample-tick" style="left:' + pct + '%">▲ 建议 ' + t.best + '</span>' +
+        '<span>' + t.max + ' ' + t.more + '</span></div>' +
+        '<div class="sample-hint">' + t.hint + '</div>' +
+        '</div>';
+    }).join("");
+
+    const layer = document.createElement("div");
+    layer.className = "confirm-layer sample-layer";
+    layer.innerHTML =
+      '<div class="confirm-box sample-box">' +
+      '<div class="confirm-title">🎛 采样参数</div>' +
+      '<div class="sample-sub">拖动滑条 → <b>立刻生效，不用重启</b>（下一次提问就用新值）。' +
+      '旁边标着<b>建议值</b>，点它可以直接跳回去。</div>' +
+      rowHtml +
+      '<div class="sample-msg"></div>' +
+      '<div class="confirm-btns">' +
+      '<button class="btn ghost sample-reset" type="button">恢复建议值</button>' +
+      '<button class="btn primary sample-close" type="button">完成</button>' +
+      '</div></div>';
+    document.body.appendChild(layer);
+
+    const msgEl = layer.querySelector(".sample-msg");
+    const valEl = (k) => layer.querySelector('.sample-val[data-key="' + k + '"]');
+    const rangeEl = (k) => layer.querySelector('.sample-range[data-key="' + k + '"]');
+
+    // 数值离建议值远的时候标黄 —— 让"我是不是调歪了"一眼可见
+    function paint(k) {
+      const t = SAMPLE_META[k];
+      const v = Number(rangeEl(k).value);
+      valEl(k).textContent = v.toFixed(2);
+      const far = Math.abs(v - t.best) > (t.max - t.min) * 0.18;
+      valEl(k).classList.toggle("off", far);
+    }
+
+    // 拖动期间不刷请求：等停手 350ms 再存一次（否则一拖就是几十个 POST）
+    const pending = {};
+    let timer = null;
+    async function flush() {
+      const body = {};
+      Object.keys(pending).forEach((k) => { body[k] = pending[k]; delete pending[k]; });
+      if (!Object.keys(body).length) return;
+      try {
+        await api("/api/config", { method: "POST", body: JSON.stringify(body) });
+        msgEl.textContent = "✅ 已保存：" + Object.entries(body)
+          .map(([k, v]) => (SAMPLE_META[k] ? SAMPLE_META[k].name.split(" ")[0] : k) +
+               " " + Number(v).toFixed(2)).join(" · ") + " —— 立即生效";
+        msgEl.className = "sample-msg ok";
+      } catch (e) {
+        msgEl.textContent = "⚠ 保存失败：" + String(e.message || e);
+        msgEl.className = "sample-msg err";
+      }
+    }
+    function queue(k, v) {
+      pending[k] = v;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(flush, 350);
+    }
+    function setVal(k, v, save) {
+      rangeEl(k).value = v;
+      paint(k);
+      if (save) queue(k, v);
+    }
+
+    Object.keys(SAMPLE_META).forEach((k) => {
+      paint(k);
+      rangeEl(k).addEventListener("input", () => {
+        paint(k);
+        queue(k, Number(rangeEl(k).value));
+      });
+      layer.querySelector('.sample-best[data-key="' + k + '"]')
+        .addEventListener("click", () => setVal(k, SAMPLE_META[k].best, true));
+    });
+    layer.querySelector(".sample-reset").addEventListener("click", () => {
+      Object.keys(SAMPLE_META).forEach((k) => setVal(k, SAMPLE_META[k].best, false));
+      queue("temperature", SAMPLE_META.temperature.best);
+      pending.top_p = SAMPLE_META.top_p.best;
+      if (timer) clearTimeout(timer);
+      flush();
+    });
+
+    function close() { layer.remove(); }
+    layer.querySelector(".sample-close").addEventListener("click", async () => {
+      if (timer) clearTimeout(timer);
+      await flush();                     // 关之前把没存完的补上，别丢改动
+      close();
+    });
+    layer.addEventListener("click", (e) => { if (e.target === layer) close(); });
+  }
+  window.__showSampling = showSampling;
+
   window.__showAmapKey = showAmapKey;
   window.__makeMapCard = makeMapCard;      // 导出一下，方便排查"地图没画出来"
 

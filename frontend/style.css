@@ -772,6 +772,65 @@ body.dragging .drop-overlay,
 .confirm-btns { margin-top: 14px; display: flex; gap: 10px; justify-content: flex-end; }
 .confirm-btns .btn { width: auto; margin: 0; padding: 8px 16px; }
 
+/* ---------- 采样参数面板（温度 / top-p）---------- */
+.sample-box { width: min(560px, 92vw); }
+.sample-sub { margin-top: 6px; font-size: 12.5px; color: var(--muted); line-height: 1.6; }
+.sample-sub b { color: #f0b429; }
+.sample-row {
+  margin-top: 16px; padding: 12px 14px 10px;
+  background: var(--panel2); border: 1px solid var(--border); border-radius: 12px;
+}
+.sample-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.sample-name { font-size: 13.5px; color: var(--text); }
+.sample-right { display: flex; align-items: center; gap: 10px; }
+.sample-val {
+  font-family: Consolas, "Cascadia Mono", Menlo, monospace;
+  font-size: 19px; font-weight: 600; color: #6ee7b7;   /* 贴近建议值 = 绿 */
+  min-width: 52px; text-align: right;
+}
+.sample-val.off { color: #f0b429; }                    /* 调歪了 = 黄 */
+.sample-best {
+  padding: 3px 9px; font-size: 11.5px; cursor: pointer;
+  color: var(--muted); background: transparent;
+  border: 1px dashed var(--border); border-radius: 999px;
+  transition: color .15s, border-color .15s;
+}
+.sample-best:hover { color: #f0b429; border-color: #f0b429; }
+.sample-range {
+  -webkit-appearance: none; appearance: none;
+  display: block; width: 100%; height: 20px; margin: 8px 0 0;
+  background: transparent; cursor: pointer;
+}
+.sample-range::-webkit-slider-runnable-track {
+  height: 6px; border-radius: 3px;
+  /* 左"严谨" → 右"发散"，用颜色本身暗示方向 */
+  background: linear-gradient(90deg, #3b82f6 0%, #22c55e 45%, #f0b429 78%, #ef4444 100%);
+}
+.sample-range::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 18px; height: 18px; margin-top: -6px; border-radius: 50%;
+  background: #f8fafc; border: 3px solid #111827;
+  box-shadow: 0 0 0 3px rgba(248,250,252,.18), 0 2px 6px rgba(0,0,0,.45);
+  transition: transform .12s ease;
+}
+.sample-range:hover::-webkit-slider-thumb { transform: scale(1.1); }
+.sample-range:active::-webkit-slider-thumb { transform: scale(1.22); }
+.sample-range:focus { outline: none; }
+.sample-scale {
+  position: relative; height: 15px; margin-top: 3px;
+  display: flex; justify-content: space-between; align-items: flex-start;
+  font-size: 11px; color: var(--muted);
+}
+/* 建议刻度按真实比例定位（left 由 JS 按 (best-min)/(max-min) 算出来） */
+.sample-tick {
+  position: absolute; top: 0; transform: translateX(-50%);
+  color: #f0b429; opacity: .85; white-space: nowrap; font-size: 10.5px;
+}
+.sample-hint { margin-top: 8px; font-size: 12px; color: var(--muted); line-height: 1.65; }
+.sample-msg { margin-top: 12px; font-size: 12.5px; min-height: 18px; }
+.sample-msg.ok { color: #6ee7b7; }
+.sample-msg.err { color: #f87171; }
+
 /* ---------- 问答框（模型追问细节）---------- */
 .ask-list { margin-top: 12px; display: flex; flex-direction: column; gap: 14px; max-height: 52vh; overflow: auto; }
 .ask-item {
