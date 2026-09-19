@@ -1338,6 +1338,32 @@ _TEXT_TOOL_RE = re.compile(r"```(?:tool|tool_call|json)?[ \t]*\r?\n(.*?)```", re
 #    误删就是把用户要的内容吃掉了（见 _split_text_tool_calls 的说明）。
 _TOOL_FENCE_RE = re.compile(r"```(?:tool|tool_call)[ \t]*\r?\n(.*?)```", re.S)
 
+# ---------- 思考打转（复读）的检测 ----------
+# ⚠️ 为什么要它：思考型模型偶尔会陷进**段落级复读** —— 同一句话换个连接词
+#    反复写（「可能的题目：… 或者：… 可能需要换一个例子：… 例如：…」），
+#    同一句出现三四遍。它不报错、不超时，只是把输出预算全烧在绕圈上，
+#    用户看到的就是"思考过程里全是重复内容"（2026-09-19 反馈）。
+#    采样参数（`repeat_last_n` / `repeat_penalty`）能大幅减少它，但压不干净 ——
+#    真发生时至少要让用户看到实话、并在日志里留下证据。
+_LOOP_PIECE_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]{6,}")
+
+
+def find_looping_piece(text: str, threshold: int = 3) -> str:
+    """在 text 里找"重复了 threshold 次以上的片段"并返回它；没有就返回 ""。
+
+    只看长度 ≥6 的连续中英文片段：短词（"的"、"然后"、"所以"）重复是**正常语言**，
+    拿它们做判据会疯狂误报。段落级复读的重复片段通常有 10~60 个字，跑不掉。
+    """
+    if not text:
+        return ""
+    count = {}
+    for piece in _LOOP_PIECE_RE.findall(text):
+        n = count.get(piece, 0) + 1
+        count[piece] = n
+        if n >= threshold:
+            return piece
+    return ""
+
 # 代码轮可用工具的**文本协议说明**（键名同时充当白名单）
 _TEXT_TOOL_DOCS = {
     "run_python": '真正运行一段 Python 代码，拿到真实输出与报错。'
@@ -2812,6 +2838,8 @@ async def chat(req: ChatRequest):
 
             round_msg = {"content": "", "thinking": None, "model": model}
             code_emitted = 0        # 代码轮已经推给前端的正文长度（见 _safe_emit_len）
+            # 思考打转（复读）检测的游标：上次检测到多少字 / 这轮提示过没有
+            loop_checked, loop_warned = 0, False
             # 边生成边落盘的进度（见 _partial_ws_write）：文件 / 已落盘字数 / 上次时刻
             _ws_rel, _ws_len, _ws_t = "", 0, 0.0
             # 【完整性兜底】流式落盘只是"给编辑器看的预览"，**不是正式写入**。
@@ -2842,6 +2870,21 @@ async def chat(req: ChatRequest):
                     final_thinking += m["thinking"]
                     # 实时透出思考增量（即使在折叠状态下也要持续刷新进度）
                     yield json.dumps({"message": {"thinking": m["thinking"]}}) + "\n"
+                    # —— 思考打转（复读）检测 ——
+                    # 每多出 240 字查一次"有没有哪段话重复了 3 遍以上"。
+                    # 采样参数能大幅减少打转，但压不干净；真发生时至少要让
+                    # 用户看到实话、让我们在日志里留痕（否则只是"AI 看起来傻了"）。
+                    if not loop_warned and len(final_thinking) - loop_checked >= 240:
+                        loop_checked = len(final_thinking)
+                        _piece = find_looping_piece(final_thinking)
+                        if _piece:
+                            loop_warned = True
+                            logger.warning("[think-loop] 思考打转：同一段重复出现 —— %r",
+                                           _piece[:48])
+                            yield json.dumps({"note": (
+                                "模型在思考里绕圈了（同一段话重复了好几遍），"
+                                "这次回答可能不太靠谱 —— 直接回一句「别重复，换个思路」"
+                                "再问一次通常就好。")}) + "\n"
                 if m.get("content"):
                     round_msg["content"] += m["content"]
                     if code_model_on:
@@ -2947,12 +2990,24 @@ async def chat(req: ChatRequest):
                 # （思考把配额用尽，正文一个字都没来得及写）。
                 # 这不是模型坏了，纯粹是配额给少了——加倍重试一次。
                 truncated = (done_reason == "length")
-                if truncated and retries_done < _MAX_EMPTY_RETRIES:
+                # 只有「本轮一个字正文都没写出来」才值得重试。
+                # 已经有正文还重试的话：模型是从头重写，而前端已经渲染过一份，
+                # 两轮内容会**拼在一起**（正文叠正文，最难看出是重复的那种）。
+                has_body = bool(round_msg["content"].strip())
+                if truncated and not has_body and retries_done < _MAX_EMPTY_RETRIES:
                     retries_done += 1
                     boosted = max(int(gen_params.get("max_tokens") or 2048) * 2, 4096)
                     nxt = min(boosted, MAX_TOKENS_CEILING)
                     if nxt > int(gen_params.get("max_tokens") or 0):
                         gen_params["max_tokens"] = nxt
+                        # ★ 上一轮的思考必须作废，并通知前端把面板清空。
+                        #   重试是从头重新生成，思考会**重新来一遍**；不重置的话
+                        #   新一轮的思考就直接接在旧思考后面 —— 界面上看起来就是
+                        #   "同一个思路说了两遍"（2026-09-19 用户反馈的"思考重复"）。
+                        #   final_thinking 是整轮结束后发给前端的完整思考，
+                        #   这里的失败尝试一个字都不该留在里面。
+                        final_thinking = ""
+                        yield json.dumps({"message": {"thinking_reset": True}}) + "\n"
                         # 措辞别用"配额不足" —— 用户看到会以为是自己额度用完了，
                         # 其实是模型把输出空间花在"思考"上了（2026-09-15 用户反馈）
                         yield json.dumps({"note": (

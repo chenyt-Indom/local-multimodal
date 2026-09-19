@@ -80,6 +80,17 @@ class OllamaClient:
                 "num_ctx": fixed_ctx,
                 "num_predict": params.get("max_tokens"),
             }
+            # 采样参数：**只在显式给了值时才传**。
+            # ⚠️ 传 None 会覆盖掉 Ollama 自己的默认值（反而更糟），所以逐个判空。
+            # 这两个是压「思考打转」（同一段话换个连接词反复写）的关键：
+            #   · repeat_last_n —— Ollama 默认只有 64 个 token（≈40 汉字），
+            #     而打转是**段落级**的（重复段本身就 30~60 字），64 的窗口盖不住；
+            #   · repeat_penalty —— 抬到 1.15 让"再写一遍"的代价变大。
+            for _k in ("repeat_penalty", "repeat_last_n",
+                       "presence_penalty", "frequency_penalty", "top_p", "top_k"):
+                _v = params.get(_k)
+                if _v not in (None, "", 0):
+                    payload["options"][_k] = _v
         if tools:
             payload["tools"] = tools
         # 把图片附加到最后一条 user 消息
