@@ -93,8 +93,12 @@ def _why_no_cuda(torch) -> str:
     ver = (getattr(torch, "__version__", "") or "")
     if "+cpu" in ver:
         return (f"当前环境装的是 CPU 版 torch（{ver}），它根本没有编译进 CUDA 支持，"
-                "任何情况下都用不了显卡。Docker 部署要两件事同时做：\n"
-                "① 用 CUDA 版重建镜像（--build-arg TORCH_INDEX=…/cu124）；\n"
+                "任何情况下都用不了显卡。\n"
+                "· 用「一键部署.bat」部署的：用最新版脚本重跑一次即可 —— 它会自动挑 CUDA 版镜像"
+                "（旧版脚本在有 N 卡的机器上会错拿 CPU 版）。\n"
+                "· 手动部署要两件事同时做："
+                "① 换用 CUDA 版镜像（--build-arg TORCH_INDEX=…/cu130；"
+                "RTX 50 系必须 cu128 以上，cu124 不行）；"
                 "② 用 GPU 编排启动，让容器能拿到显卡"
                 "（docker compose -f compose.yml -f compose.gpu.yml up -d）。\n"
                 "详见使用说明「显卡会自动适配」一节。")

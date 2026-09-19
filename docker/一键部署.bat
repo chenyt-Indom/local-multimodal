@@ -29,8 +29,11 @@ if errorlevel 1 (
 )
 echo [1/6] Docker 引擎正常
 REM 磁盘空间：镜像 7GB + 模型 19GB，解包和运行还要留余量，建议 40GB
+REM ?? 必须是 `%CD%` 而不是 `$env:CD` —— `CD` 是 cmd 的**内部命令**、不是环境变量，
+REM    在 PowerShell 里读 `$env:CD` 永远是空 → Split-Path 抛错 → catch 返回 0
+REM    → 界面上永远显示「磁盘只剩 0 GB」（2026-09-19 实测踩到，任何机器都会误报）。
 set "FREEGB=0"
-for /f %%s in ('powershell -NoProfile -Command "try{[math]::Round((Get-PSDrive (Split-Path -Qualifier $env:CD)).Free/1GB,0)}catch{0}"') do set "FREEGB=%%s"
+for /f %%s in ('powershell -NoProfile -Command "try{[math]::Round((Get-PSDrive ((Split-Path -Qualifier '%CD%').TrimEnd(':'))).Free/1GB,0)}catch{0}"') do set "FREEGB=%%s"
 if %FREEGB% GEQ 40 goto :disk_ok
 if %FREEGB% GEQ 25 (
     echo        [注意] 磁盘只剩 %FREEGB% GB，勉强够用，建议再清理一些。
@@ -60,16 +63,18 @@ if defined HASGPU (
 REM ---- 应用镜像二选一 ----
 REM 两者功能完全相同，区别只在 torch：CUDA 版体积大，但绘图（文生图）能用显卡。
 REM 对话/看图走的是 Ollama，与这里选哪个镜像无关。
+REM ???? 有 N 卡就默认选 CUDA 版，**不要**再去判断本地有没有离线 tar。
+REM    2026-09-19 实测踩到：原来写成「本地有 images\...-gpu.tar 才选 GPU 版」，
+REM    结果**在线部署（从镜像仓库拉）永远拿到 CPU 版** —— 用户明明有 5070 Ti，
+REM    脚本还打印了「已启用 GPU 加速」，可绘图（文生图）实际跑在 CPU 上，
+REM    慢十几倍，而且从界面上很难看出问题在哪。
+REM    仓库里本来就有 multimodal-app:gpu，拉不到才退回 CPU（见 :try_registry 的兜底）。
 set "APP_IMG=local-multimodal-app:latest"
 set "APP_TAR=images\local-multimodal-app.tar"
 if defined HASGPU (
-    if exist "images\local-multimodal-app-gpu.tar" (
-        set "APP_IMG=local-multimodal-app:gpu"
-        set "APP_TAR=images\local-multimodal-app-gpu.tar"
-        echo        应用镜像：CUDA 版（绘图走显卡）
-    ) else (
-        echo        应用镜像：CPU 版（没找到 GPU 镜像，绘图较慢）
-    )
+    set "APP_IMG=local-multimodal-app:gpu"
+    set "APP_TAR=images\local-multimodal-app-gpu.tar"
+    echo        应用镜像：CUDA 版（绘图走显卡）
 ) else (
     echo        应用镜像：CPU 版
 )
@@ -95,7 +100,6 @@ if /i "%MODE%"=="direct" (
     set "MM_URL_SET=http://ollama:11434"
     set "MM_IMG_SET=local-multimodal-ollama:latest"
 )
-call :write_env
 
 REM ============ 4. 准备镜像 ============
 set "NEED_BUILD="
@@ -112,6 +116,10 @@ if errorlevel 1 (
         call :try_registry
         if errorlevel 1 (
             echo        镜像仓库不可用，改为从源码构建（需联网，较慢）...
+            REM 源码构建出来的只有 CPU 版 torch（Dockerfile 默认参数），
+            REM 所以这里必须把镜像名改回 CPU 版，否则 compose 会去找一个不存在
+            REM 的 local-multimodal-app:gpu。
+            set "APP_IMG=local-multimodal-app:latest"
             set "NEED_BUILD=1"
         )
     )
@@ -131,6 +139,13 @@ if /i "%MODE%"=="bundled" (
         )
     )
 )
+
+REM ---- 镜像最终确定了，这时才写 .env ----
+REM ?? 必须放在第 4 步**之后**：GPU 版拉不到时 :try_registry 会把 APP_IMG 改回
+REM    CPU 版，.env 得跟着它走。写在前面的话，compose 会去找一个根本没拉下来的
+REM    镜像名，表现为「一键部署跑到最后起不来」。
+set "APP_IMG_SET=!APP_IMG!"
+call :write_env
 
 if defined NEED_BUILD (
     %DC% !FILES! !PROFILE! build
@@ -247,7 +262,12 @@ if errorlevel 1 exit /b 1
 docker rm -f mm-models-tmp >nul 2>&1
 docker create --name mm-models-tmp %REG%/multimodal-models:latest >nul 2>&1
 if errorlevel 1 exit /b 1
-docker cp mm-models-tmp:/models/. "models\"
+if not exist "models" mkdir "models"
+REM  ?? 路径**千万别写成 "models\"** —— cmd 会把末尾的 `\"` 当成**转义的引号**，
+REM     实际传给 docker 的路径会变成 `...\models"`（多一个引号），
+REM     报「文件名、目录名或卷标语法不正确」。（2026-09-19 实测踩到）
+REM     老老实实写 "models"，并先 mkdir 保证目录存在。
+docker cp mm-models-tmp:/models/. "models"
 set "CPERR=%errorlevel%"
 docker rm -f mm-models-tmp >nul 2>&1
 if not "%CPERR%"=="0" exit /b 1
