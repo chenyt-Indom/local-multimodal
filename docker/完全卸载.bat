@@ -25,7 +25,7 @@ echo [2/4] 停止并删除容器...
 docker compose -f compose.yml --profile bundled down -v 2>nul
 
 echo [3/4] 删除镜像...
-REM ?? 四个镜像都要删。原来只删了前两个，GPU 版（约 10GB）和模型镜像（约 38GB）
+REM [!] 四个镜像都要删。原来只删了前两个，GPU 版（约 10GB）和模型镜像（约 38GB）
 REM    会留在 Docker 里 —— 用户点了「完全卸载」却发现磁盘没释放多少，很难查。
 docker image rm local-multimodal-app:latest 2>nul
 docker image rm local-multimodal-app:gpu 2>nul
