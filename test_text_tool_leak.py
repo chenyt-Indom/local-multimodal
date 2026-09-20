@@ -29,9 +29,11 @@
 跑法（用带依赖的那个 Python314）：
     "%LOCALAPPDATA%\\Programs\\Python\\Python314\\python.exe" test_text_tool_leak.py
 """
+import glob
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -176,30 +178,133 @@ def main():
                 pass
     check("写进文库的文件里没有那坨工具 JSON", not leaked, str(leaked))
 
-    # ---------------- ⑥ 用真实那一轮的原文回放 ----------------
-    print("\n⑥ 回放真实那一轮（会话文件在的话）")
-    sess = os.path.join(ROOT, "sessions", "img-1789642067376.json")
-    if os.path.isfile(sess):
-        with open(sess, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        hits = 0
-        for m in d:
+    # ---------------- ⑥ 回放真实会话里残留的工具块 ----------------
+    # ⚠️ 以前这里**写死了某个会话文件名**，那个文件一被新的对话改写（内容变了）就会
+    #    假失败（2026-09-21 踩到）。改成扫**全部**会话；一条样本都没有就明确跳过 ——
+    #    在其他机器上跑更是必然没有样本，不能因此报错。
+    print("\n⑥ 回放真实会话里残留的工具块（有样本才检查）")
+    samples, bad = 0, []
+    for sp in sorted(glob.glob(os.path.join(ROOT, "sessions", "*.json"))):
+        try:
+            with open(sp, "r", encoding="utf-8") as f:
+                sd = json.load(f)
+        except Exception:
+            continue
+        s_msgs = sd if isinstance(sd, list) else (sd.get("messages") or [])
+        for m in s_msgs:
             c = str(m.get("content") or "")
             if m.get("role") != "assistant" or "```tool" not in c:
                 continue
-            hits += 1
+            samples += 1
             _cc, cl = M._split_text_tool_calls(c)
             if "```tool" in cl or '"arguments"' in cl:
-                check("真实消息里还残留工具块", False, "长度 %d" % len(c))
-                break
-        else:
-            check("真实那一轮的所有回答都不再残留工具块", hits > 0, "检查了 %d 条" % hits)
+                bad.append(os.path.basename(sp))
+    if samples:
+        check("真实会话里残留的工具块都能清掉", not bad,
+              "检查了 %d 条，文件 %s" % (samples, sorted(set(bad))))
     else:
-        check("（跳过：没有会话文件可回放）", True)
+        check("（跳过：历史会话里暂时没有工具块样本）", True)
 
     # ---------------- ⑦ 端到端：卡片运行 + 真·键盘输入 ----------------
     print("\n⑦ 端到端：程序等 input() 时，界面上能真的把内容送进去")
     _test_interactive_run()
+
+    # ---------------- ⑧ 泄漏成 <function-call> / <tool_call> 的（默认模型）----------------
+    # 2026-09-21 用户反馈：默认模型 qwen3-vl 偶尔把整个调用包一层 XML 写进**正文**，
+    # 而 Ollama 的原生通道只认它自己模板里的 <tool_call> → tool_calls 为空 →
+    # 以前只在代码模型那轮做的清理没跑到 → 那坨 JSON 原样渲染给用户看，工具压根没执行。
+    print("\n⑧ 默认模型把调用包成 XML 写进正文（截图那一轮的原样文本）")
+    LEAK_XML = (
+        "我帮你在知识库里查一下。\n\n"
+        "<function-call>\n"
+        "{\n"
+        '  "name": "search_knowledge",\n'
+        '  "arguments": {\n'
+        '    "query": "名侦探柯南 中柯哀 vs 新兰 角色塑造 社会价值观 分析",\n'
+        '    "list_all": false\n'
+        "  }\n"
+        "}\n"
+        "</function-call>\n"
+    )
+    _c, cl = M._split_text_tool_calls(LEAK_XML, allowed={"search_knowledge"}, bare=False)
+    check("壳子里的调用被认出来（不再静默丢掉一次调用）",
+          len(_c) == 1 and _c[0]["name"] == "search_knowledge", str(_c)[:120])
+    check("参数完整", _c and _c[0]["arguments"].get("query", "").startswith("名侦探柯南"),
+          str(_c[0]["arguments"])[:90] if _c else "")
+    check("正文里不再有 <function-call> 壳子", "function-call" not in cl.lower(), repr(cl[:70]))
+    check("正文里不再有裸 JSON", '"arguments"' not in cl and '"arguments"' not in cl,
+          repr(cl[:70]))
+    check("它自己的说明文字**保留**", "我帮你在知识库里查一下" in cl, repr(cl[:40]))
+
+    print("\n⑧b 各种写法都要认得（大小写 / 空格 / 下划线 / 半截 / 空壳）")
+    for name, txt in (
+        ("<tool_call>", '前文\n<tool_call>\n{"name": "get_time", "arguments": {}}\n</tool_call>\n后文'),
+        ("<FUNCTION-CALL> 大写", '前文\n<FUNCTION-CALL>\n{"name": "get_time", "arguments": {}}\n</FUNCTION-CALL>'),
+        ("<function_call> 下划线", '前文\n<function_call>\n{"name": "get_time", "arguments": {}}\n</function_call>'),
+        ("<function call> 带空格", '前文\n<function call>\n{"name": "get_time", "arguments": {}}\n</function call>'),
+        ("只写了开标签（被截断）", '前文\n<function-call>\n{"name": "get_time", "arguments": {}}'),
+        ("空壳（一对空标签）", "前文\n<function-call></function-call>\n后文"),
+    ):
+        _c2, cl2 = M._split_text_tool_calls(txt, allowed={"get_time"}, bare=False)
+        want_call = "空壳" not in name
+        ok = (len(_c2) == 1) if want_call else (len(_c2) == 0)
+        check("%s → 调用%s" % (name, "认出来" if want_call else "不执行"),
+              ok and "function" not in cl2.lower() and "tool_call" not in cl2.lower(),
+              "calls=%s clean=%r" % (_c2, cl2[:60]))
+
+    print("\n⑧c ⚠️ 别把正文里**正常的 JSON** 当成调用（聊天轮 bare=False）")
+    normal = ('这是接口返回的示例：\n```json\n{"name": "张三", "arguments": {"age": 20}}\n```\n'
+              "还有裸着的：{\"name\": \"library\", \"arguments\": {\"action\": \"list\"}}\n请参考。")
+    _c3, cl3 = M._split_text_tool_calls(normal, allowed={"library"}, bare=False)
+    check("裸 JSON **不**被当成调用", _c3 == [], str(_c3))
+    check("正常内容一个字都没少", cl3 == normal.strip(), "长度 %d → %d" % (len(normal), len(cl3)))
+    # 同一段文本在**代码轮**（bare=True）才该被认出来 —— 那轮模型本来就用文本协议
+    _c3b, _ = M._split_text_tool_calls(normal, allowed={"library"}, bare=True)
+    check("代码轮仍然认得裸 JSON（回归）", len(_c3b) == 1 and _c3b[0]["name"] == "library",
+          str(_c3b))
+
+    print("\n⑧d ⚠️ 只执行「本轮真给过它的工具」，别的只清文本")
+    _c4, cl4 = M._split_text_tool_calls(LEAK_XML, allowed={"get_time"}, bare=False)
+    check("没给它的工具**不执行**（防止绕开开关）", _c4 == [], str(_c4))
+    check("但文本仍然清干净（用户看不到裸 JSON）",
+          "function-call" not in cl4.lower() and '"arguments"' not in cl4, repr(cl4[:60]))
+
+    print("\n⑧e 逐字流式的「扣留」标记集：聊天轮要**保守**，别毁掉流式体感")
+    plain = "这是答案。接口字段是 {\"name\": \"x\", \"arguments\": {}}，就这样。"
+    check("聊天轮：正文里的 JSON **不扣**（该发的照发）",
+          M._safe_emit_len(plain, M._LEAK_MARKS) == len(plain),
+          "扣到 %d / 共 %d" % (M._safe_emit_len(plain, M._LEAK_MARKS), len(plain)))
+    check("聊天轮：<function-call> 起点就扣住",
+          M._safe_emit_len("答案如下\n<function-call>\n{", M._LEAK_MARKS) == len("答案如下\n"),
+          str(M._safe_emit_len("答案如下\n<function-call>\n{", M._LEAK_MARKS)))
+    check("聊天轮：```tool 也扣住",
+          M._safe_emit_len("答案```tool\n{}", M._LEAK_MARKS) == len("答案"))
+    check("聊天轮：结尾半个 '<' 也先按住",
+          M._safe_emit_len("答案<", M._LEAK_MARKS) == len("答案"),
+          str(M._safe_emit_len("答案<", M._LEAK_MARKS)))
+    check("代码轮（原标记集）行为没变：```json 也会扣",
+          M._safe_emit_len(plain, M._TEXT_TOOL_MARKS) < len(plain),
+          str(M._safe_emit_len(plain, M._TEXT_TOOL_MARKS)))
+
+    print("\n⑧f 「半个标签」：模型写到一半放弃留下的碎片（实机复现过）")
+    # 实机看到的现象：正文开头冒出一截 `<function`，后面直接接正常文字。
+    # 它不是调用（没有 JSON），但留着就像乱码。
+    for name, txt, keep in (
+        ("单独占一行", "<function\n以下是键值对的示例", "以下是键值对的示例"),
+        ("正文最开头", "<function以下是键值对的示例", "以下是键值对的示例"),
+        ("<tool_call 半截独占一行", "<tool_call\n正文开始", "正文开始"),
+        ("半截 + 前后都有正文", "前面的话\n<function\n后面的话", "前面的话"),
+    ):
+        _c5, cl5 = M._split_text_tool_calls(txt, allowed=set(), bare=False)
+        check("%s → 碎片被清掉" % name,
+              not re.search(r"<\s*/?\s*(?:function|tool)", cl5, re.I) and keep in cl5,
+              repr(cl5[:60]))
+    _c6, cl6 = M._split_text_tool_calls(
+        "<function> 是 JS 里定义函数的关键字，写法是 function foo() {}",
+        allowed=set(), bare=False)
+    check("⚠️ 讲标签用法的句子不被整段吃掉",
+          "是 JS 里定义函数的关键字" in cl6, repr(cl6[:70]))
+    check("碎片不会被当成调用执行", _c6 == [] and _c5 == [], "%s / %s" % (_c6, _c5))
 
     print("\n" + "=" * 64)
     print("通过 %d 项，失败 %d 项" % (PASS, FAIL))

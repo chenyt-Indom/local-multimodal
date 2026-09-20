@@ -1338,6 +1338,40 @@ _TEXT_TOOL_RE = re.compile(r"```(?:tool|tool_call|json)?[ \t]*\r?\n(.*?)```", re
 #    误删就是把用户要的内容吃掉了（见 _split_text_tool_calls 的说明）。
 _TOOL_FENCE_RE = re.compile(r"```(?:tool|tool_call)[ \t]*\r?\n(.*?)```", re.S)
 
+# ---------- 「调用壳子」：模型自己带上的 XML 包装 ----------
+# ⚠️ 这不是我们教的格式（我们教的是 ```tool 围栏），是模型从别处学来的习惯。
+#    实测（2026-09-21 用户反馈）：**默认模型 qwen3-vl 偶尔**把整个调用包成
+#    <function-call>{...}</function-call> 写进**正文**。而 Ollama 的原生工具通道
+#    只认它自己模板里的 <tool_call>，认不出这个 → tool_calls 为空 →
+#    后端以为"这轮就是普通回答"，于是那坨 JSON **被当成正文渲染成一张卡片**，
+#    用户看到的就是一坨裸露的 {"name": "search_knowledge", ...}，而工具压根没执行。
+#
+#    为什么以前没被接住：文本协议的解析（_split_text_tool_calls）**只在代码模型那轮**跑
+#    （见 `if code_model_on`），默认模型走原生通道、根本没经过它。
+_TOOL_XML_NAME = r"function[ _-]?calls?|tool[ _-]?calls?"
+# 成对的包装：<function-call>…</function-call>（前后缀必须同名，避免把普通 XML 吃进来）
+_TOOL_XML_BLOCK_RE = re.compile(
+    r"<\s*\|?\s*(%s)\s*\|?\s*>\s*(.*?)\s*<\s*/\s*\1\s*>" % _TOOL_XML_NAME,
+    re.S | re.I)
+# 只剩开标签（被截断 / 模型忘了闭合）——从开标签一直吃到结尾才安全
+_TOOL_XML_OPEN_RE = re.compile(r"<\s*\|?\s*(%s)\s*\|?\s*>" % _TOOL_XML_NAME, re.I)
+# 散落的空壳标签（里面的 JSON 已被别的分支摘走时剩下的）
+_TOOL_XML_TAG_RE = re.compile(r"<\s*\|?\s*/?\s*(?:%s)\s*\|?\s*/?\s*>" % _TOOL_XML_NAME, re.I)
+# 「半个标签」—— 模型**写到一半就放弃了**（或输出被截断），只剩 <function / <tool_call
+# 这种开头，后面没跟 `>` 就直接接正文。实测（2026-09-21，实机复现）它单独占一行出现，
+# 被流式原样推给了用户，正文开头冒出一截 `<function`，看着像程序坏了。
+# ⚠️ 判据必须**很窄**，否则会吃掉正常内容（比如回答里讲 `<function>` 标签怎么写）：
+#    只删"整行只有这么一截"的情况，以及"出现在正文最开头"的情况。
+# ⚠️ `call` 那截**写成可选**：碎片往往正是缺了它（模型刚打出 `<function` 就放弃了）。
+# ⚠️ 尾部的 `[A-Za-z0-9_.-]{0,24}` 只吃**标签名那种字符**，绝不能放 `[^>\n]` ——
+#    那样会把同一行的正文整段吃掉（实测："<function以下是…" 整行没了）。
+_TOOL_XML_STRAY_RE = re.compile(
+    r"(?m)^[ \t]*<\s*/?\s*(?:function|tool)(?:[ _-]?calls?)?[ \t]*"
+    r"[A-Za-z0-9_.\-]{0,24}>?[ \t]*$", re.I)
+# 开头那个碎片：后面跟"换行"或"非空白非 >"的字符才算（后面直接跟 `>` 的更像在讲标签用法，放过）
+_TOOL_XML_HEAD_RE = re.compile(
+    r"^\s*<\s*/?\s*(?:function|tool)(?:[ _-]?calls?)?(?=\n|[^\s>])", re.I)
+
 # ---------- 思考打转（复读）的检测 ----------
 # ⚠️ 为什么要它：思考型模型偶尔会陷进**段落级复读** —— 同一句话换个连接词
 #    反复写（「可能的题目：… 或者：… 可能需要换一个例子：… 例如：…」），
@@ -1512,7 +1546,16 @@ _TEXT_TOOL_DOCS = {
 _TEXT_TOOL_NAMES = set(_TEXT_TOOL_DOCS)
 # 正文里出现这些，就说明模型开始写"文本协议工具调用"了 —— 用来做流式时的边界判断
 _TEXT_TOOL_MARKS = ("```tool", "```tool_call", "```json", '{"name"')
-_TEXT_TOOL_MARK_MAX = max(len(m) for m in _TEXT_TOOL_MARKS)
+
+# ⚠️ **聊天轮（默认模型）用的保守标记集**：只认"无歧义"的壳子。
+#    代码轮那套（上面）连 ```json / `{"name"` 都算 —— 那轮模型本来就在用文本协议调工具，
+#    扣住是应该的；但聊天轮的正文里出现 JSON 是**正常内容**（模型在讲接口、贴数据），
+#    照抄那套会让正文从 JSON 那句起全被扣住、**逐字流式直接没了**，等整轮说完才砸下来。
+#    所以这里只留 XML 包装与 ```tool 围栏 —— 正常回答不会长这样。
+_LEAK_MARKS = ("```tool", "```tool_call",
+               "<function-call", "<function_call", "<functioncall", "<function call",
+               "<tool_call", "<tool-call", "<tool call",
+               "<function-calls", "<tool_calls")
 
 # 文本工具名 → 真实工具名（save_file 其实就是 library 的 write 动作）
 _TEXT_TOOL_ALIAS = {"save_file": "library"}
@@ -1549,8 +1592,12 @@ def _map_text_tool_args(name: str, args: dict):
     return name, args
 
 
-def _as_tool_call_obj(obj):
-    """校验并规整一个候选调用；不是合法调用就返回 None。"""
+def _as_tool_call_obj(obj, allowed=None):
+    """校验并规整一个候选调用；不是合法调用就返回 None。
+
+    allowed = 允许执行的名字集合。**默认是代码轮的文本工具名**；
+    聊天轮要传"本轮真正给过模型的工具名"，见 _split_text_tool_calls 的说明。
+    """
     if not isinstance(obj, dict):
         return None
     name = obj.get("name") or obj.get("tool") or obj.get("function")
@@ -1569,7 +1616,7 @@ def _as_tool_call_obj(obj):
     name = name.strip()
     # ⚠️ 必须走白名单：代码轮里模型会写大段 HTML/JSON，里面本来就带
     # {"name": ...} 这种字段，不做白名单会把业务数据误当成工具调用去执行。
-    if name not in _TEXT_TOOL_NAMES:
+    if name not in (allowed if allowed is not None else _TEXT_TOOL_NAMES):
         return None
     # 模型偶尔把代码里的换行写成**字面量** \n（探针里 V3 提示词下就出现了），
     # 那样丢进沙箱必然语法错误 —— 顺手兜一下。
@@ -1623,22 +1670,69 @@ def _loads_lenient(s: str):
         return None
 
 
-def _split_text_tool_calls(text: str):
-    """从代码模型的正文里拆出**所有**「文本协议工具调用」。
+def _calls_from_body(body: str, allowed=None):
+    """从一段"可能是工具调用"的文本里抠出调用 —— 一整坨、或里面塞了好几个都行。
 
-    返回 (calls, 清理后的正文)。清理后的正文里，**所有**工具块都被删掉了 ——
+    为什么不是简单 json.loads：实测模型常常把**两个**调用塞进同一个块
+    （先 write 再 run），而且第一个后面还有逗号/换行。所以先整体试，
+    失败了再按平衡括号逐个扫 —— 与正文扫描用的是同一套判据。
+    """
+    out = []
+    body = (body or "").strip()
+    if not body:
+        return out
+    obj = _loads_lenient(body)
+    if obj is not None:
+        call = _as_tool_call_obj(obj, allowed)
+        if call:
+            return [call]
+    for start in (i for i, c in enumerate(body) if c == "{"):
+        depth = 0
+        for i in range(start, len(body)):
+            if body[i] == "{":
+                depth += 1
+            elif body[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        call = _as_tool_call_obj(json.loads(body[start:i + 1]), allowed)
+                    except Exception:
+                        call = None
+                    if call:
+                        out.append(call)
+                    break
+    return out
+
+
+def _split_text_tool_calls(text: str, allowed=None, bare: bool = True):
+    """从正文里拆出**所有**「泄漏成文本的工具调用」。
+
+    返回 (calls, 清理后的正文)。清理后的正文里，**所有**调用壳子都被删掉了 ——
     ⚠️ 只删第一个是不够的：实测模型一轮里会连着输出两个块（比如先 write 再 run），
     第二个会被原样留在正文里显示成一坨 JSON 给用户看，而且还会被静默丢掉不执行。
+
+    ⚠️ 它同时服务两种模型，**两轮的"敢删到哪一步"不一样**：
+      · 代码轮（qwen2.5-coder，只能走文本协议）：
+        `allowed=代码轮可用的文本工具`、`bare=True` —— 裸 JSON 也敢认，
+        因为那轮模型本来就是把调用当 JSON 吐在正文里。
+      · 聊天轮（qwen3-vl，有原生工具通道）：
+        `allowed=本轮真正给过它的工具名`、**`bare=False`** —— 只认**带壳子**的
+        （```tool 围栏 / <function-call> 这类 XML 包装）。
+        正文里裸着的 {"name": …, "arguments": …} 在聊天回答里**是正常内容**
+        （讲 API、贴数据都会长这样），照认就会把用户要的内容吃掉、还误执行一次工具。
     """
     raw = text or ""
     if not raw:
         return [], raw
-    # ⚠️ 快路径要同时看**两个**标记，不能只看 `"name"`：
-    #    模型经常只吐一对**空的** ```tool 当分隔符（整段正文里一个 "name" 都没有），
-    #    那种也必须删掉 —— 否则前端会给它渲染出一张空的「代码卡片」，
+    # ⚠️ 快路径要同时看**三个**标记，不能只看 `"name"`：
+    #    模型经常只吐一对**空的** ```tool（或空的 <function-call></function-call>）
+    #    当分隔符（整段正文里一个 "name" 都没有），那种也必须删掉 ——
+    #    否则前端会给它渲染出一张空的「代码卡片」，
     #    用户看到的就是"莫名其妙好几张一样的卡片"。
     has_fence = ("```tool" in raw) or ("```tool_call" in raw)
-    if not has_fence and '"name"' not in raw:
+    has_xml = bool(_TOOL_XML_OPEN_RE.search(raw))
+    has_stray = bool(_TOOL_XML_STRAY_RE.search(raw)) or bool(_TOOL_XML_HEAD_RE.match(raw))
+    if not has_fence and not has_xml and not has_stray and (not bare or '"name"' not in raw):
         return [], raw
 
     calls, cleaned = [], raw
@@ -1658,21 +1752,63 @@ def _split_text_tool_calls(text: str):
             body = m.group(1).strip()
             if not body:
                 continue                  # 空的分隔块：删掉就行，没什么可执行的
-            obj = _loads_lenient(body)
-            call = _as_tool_call_obj(obj) if obj is not None else None
-            if call:
-                calls.append(call)
+            _got = _calls_from_body(body, allowed)
+            if _got:
+                calls.extend(_got)
             else:
                 # 解析不出来 = 这个调用**没有执行**。别静默 —— 记下来好排查
                 # （否则现象是"我明明调了工具，怎么没反应"，日志里一个字都没有）。
                 logger.warning("[text-tool] 工具块解析失败、已跳过：%s", body[:160])
+
+    # ①.5 XML 包装的（<function-call>…</function-call> / <tool_call>…</tool_call>）
+    #     ⚠️ 这是默认模型偶尔会用的写法（2026-09-21 用户反馈），
+    #        Ollama 的原生通道不认它，所以必须在这里接住。
+    #     与围栏同理：**不管解析成不成功，壳子一律从正文里删掉** ——
+    #        解析失败还留着的话，用户看到的就是一坨裸露的 JSON。
+    if has_xml:
+        for m in list(_TOOL_XML_BLOCK_RE.finditer(cleaned)):
+            cleaned = cleaned.replace(m.group(0), "")
+            body = (m.group(2) or "").strip()
+            if not body:
+                continue
+            _got = _calls_from_body(body, allowed)
+            if _got:
+                calls.extend(_got)
+            else:
+                logger.warning("[text-tool] XML 工具块解析失败、已跳过：%s", body[:160])
+        # 只剩开标签的（被截断 / 忘了闭合）—— 从开标签起全删，宁缺勿滥：
+        # 那种情况后面跟的必然是调用体，留着就是把半截 JSON 糊在正文里。
+        m = _TOOL_XML_OPEN_RE.search(cleaned)
+        if m:
+            body = cleaned[m.end():].strip()
+            cleaned = cleaned[:m.start()].rstrip()
+            if body:
+                _got = _calls_from_body(body, allowed)
+                if _got:
+                    calls.extend(_got)
+                else:
+                    logger.warning("[text-tool] 半截 XML 工具块解析失败、已跳过：%s",
+                                   body[:160])
+        # 散落的空壳标签（JSON 已被别的分支摘走时剩下的）
+        cleaned = _TOOL_XML_TAG_RE.sub("", cleaned)
+
+    # ①.8 「半个标签」——整行只有一截 <function / <tool_call，或正文就以它开头。
+    #      它不是调用（没有 JSON），纯粹是模型写到一半放弃留下的碎片，
+    #      留着就会在正文开头冒出一截乱码一样的文字。
+    if has_stray:
+        cleaned = _TOOL_XML_STRAY_RE.sub("", cleaned)
+        cleaned = _TOOL_XML_HEAD_RE.sub("", cleaned)
+        cleaned = cleaned.lstrip("\n")
+
     if calls:
         return calls, cleaned.strip()
 
     # ② 退一步：正文里裸的 JSON（平衡括号扫描，只在疑似时做，避免大段 HTML 拖慢）
     #    ⚠️ 这条路**必须保持严格**：正文里本来就可能有正常的 JSON 数据
     #    （模型写 .json 文件、贴接口返回），误删就是把用户要的内容吃了。
-    if '"arguments"' in cleaned or '"parameters"' in cleaned:
+    #    ⚠️ 聊天轮整段跳过（bare=False）：那边的裸 JSON 基本都是正文内容，
+    #       真正是调用的那些都带壳子，上面已经接住了。
+    if bare and ('"arguments"' in cleaned or '"parameters"' in cleaned):
         for start in (i for i, c in enumerate(cleaned) if c == "{"):
             depth = 0
             for i in range(start, len(cleaned)):
@@ -1684,7 +1820,7 @@ def _split_text_tool_calls(text: str):
                         seg = cleaned[start:i + 1]
                         call = None
                         try:
-                            call = _as_tool_call_obj(json.loads(seg))
+                            call = _as_tool_call_obj(json.loads(seg), allowed)
                         except Exception:
                             call = None
                         if call:
@@ -1694,29 +1830,32 @@ def _split_text_tool_calls(text: str):
     return calls, cleaned.strip()
 
 
-def _safe_emit_len(text: str) -> int:
-    """正文里从哪个位置开始**可能**是"文本协议工具调用"——之前的部分可以安全推给用户。
+def _safe_emit_len(text: str, marks=None) -> int:
+    """正文里从哪个位置开始**可能**是"工具调用壳子"——之前的部分可以安全推给用户。
 
-    这是"既要逐字流式、又不能把 ```tool 那坨 JSON 闪到界面上"的解法：
+    这是"既要逐字流式、又不能把 ```tool / <function-call> 那坨 JSON 闪到界面上"的解法：
     用**前缀匹配**把尾巴先扣住。只要结尾这几个字符可能是某个标记的开头，
     就先不发，等后续内容来了再判断。
+
+    marks 决定"多敢扣"：代码轮用 _TEXT_TOOL_MARKS（激进），
+    聊天轮用 _LEAK_MARKS（保守，只扣 XML 包装和 ```tool）—— 见它们的注释。
     """
     t = text or ""
     if not t:
         return 0
-    # ① 已经能看出是工具块的起点 → 从那里开始全扣住
+    ms = marks or _TEXT_TOOL_MARKS
+    low = t.lower()          # 标记统一小写，而模型可能吐 <Function-Call> —— 不区分大小写才稳
+    # ① 已经能看出是壳子的起点 → 从那里开始全扣住
     best = len(t)
-    for mark in _TEXT_TOOL_MARKS:
-        i = t.find(mark)
+    for mark in ms:
+        i = low.find(mark)
         if 0 <= i < best:
             best = i
-    # ② 结尾可能正打到一半（"`"、"``"、"{" …）→ 也扣住
-    #    用**前缀匹配**而不是穷举，这样 ```tool_call / ```json / {"name" 都能覆盖
-    for k in range(1, _TEXT_TOOL_MARK_MAX):
-        if len(t) < k:
-            break
-        suffix = t[-k:]
-        if any(m.startswith(suffix) for m in _TEXT_TOOL_MARKS):
+    # ② 结尾可能正打到一半（"`"、"``"、"<"、"<f" …）→ 也扣住
+    #    用**前缀匹配**而不是穷举，这样 ```tool_call / <function_call 都能覆盖
+    for k in range(1, min(len(t), max(len(m) for m in ms))):
+        suffix = low[-k:]
+        if any(m.startswith(suffix) for m in ms):
             best = min(best, len(t) - k)
     return max(0, best)
 
@@ -2622,6 +2761,13 @@ async def chat(req: ChatRequest):
                                       cfg.get("rag_enabled", False),
                                       cfg.get("code_exec_enabled", False),
                                       writing=writing_mode)
+    # 本轮**真正提供给模型**的工具名（原生通道）—— 用来校验"泄漏进正文的调用"。
+    # ⚠️ 必须在下面 `tool_schemas = []`（代码轮砍工具）**之前**取，否则代码轮永远是空集。
+    # ⚠️ 有了它，模型把调用写成文本时我们才敢执行：只有这一轮确实给了这个工具
+    #    （开关也开着）才放行，否则只把那段文本清掉、不执行 —— 免得模型凭空调出一个
+    #    用户已经关掉的工具（比如「联不上网却还是联网搜索了」）。
+    _native_tool_names = {s.get("function", {}).get("name")
+                          for s in (tool_schemas or []) if isinstance(s, dict)}
     if code_model_on:
         # 代码轮给足输出额度：要写整份文件 + 工具调用 JSON，
         # 用普通问答的 2048 会让文件**写一半被截断**（见 CODE_MAX_TOKENS 的说明）。
@@ -2887,17 +3033,20 @@ async def chat(req: ChatRequest):
                                 "再问一次通常就好。")}) + "\n"
                 if m.get("content"):
                     round_msg["content"] += m["content"]
+                    # **两种模型都要逐字流式**，区别只在"多敢扣住尾巴"：
+                    #   · 代码轮（文本协议）标记集激进：```json / {"name" 都算；
+                    #   · 聊天轮标记集保守：只认 XML 包装和 ```tool 围栏 ——
+                    #     正文里出现 JSON 是正常内容，激进会毁掉流式体感（见 _LEAK_MARKS）。
+                    # 见 _safe_emit_len。
+                    _safe = _safe_emit_len(
+                        round_msg["content"],
+                        _TEXT_TOOL_MARKS if code_model_on else _LEAK_MARKS)
+                    if _safe > code_emitted:
+                        _piece = round_msg["content"][code_emitted:_safe]
+                        code_emitted = _safe
+                        final_text += _piece
+                        yield json.dumps({"message": {"content": _piece}}) + "\n"
                     if code_model_on:
-                        # 代码轮**也要逐字流式** —— 只是要把"可能开始写工具调用"
-                        # 的那段尾巴先扣住，等确认不是 ```tool 块再补发（见 _safe_emit_len）。
-                        # 之前是整轮缓冲、到轮末才吐：实测 19 秒一个事件都不出、
-                        # 然后一坨砸下来，用户体感就是"模型卡住了"。
-                        _safe = _safe_emit_len(round_msg["content"])
-                        if _safe > code_emitted:
-                            _piece = round_msg["content"][code_emitted:_safe]
-                            code_emitted = _safe
-                            final_text += _piece
-                            yield json.dumps({"message": {"content": _piece}}) + "\n"
                         # ★ "AI 自动逐字输入到编辑器"就靠这一段：
                         #   模型把 workspace_write 的正文**逐字**吐出来，
                         #   我们把已经生成的部分先落盘 → 内置 VS Code 的文件监视器
@@ -2947,10 +3096,6 @@ async def chat(req: ChatRequest):
                                     "project": _target,
                                 }}) + "\n"
                                 _ws_rel, _ws_len, _ws_t = _rel, len(_partial), _now
-                    else:
-                        final_text += m["content"]
-                        # 仅把用户可见的文本增量透出
-                        yield json.dumps({"message": {"content": m["content"]}}) + "\n"
                 if "message" in obj:
                     tc = m.get("tool_calls")
                     if tc:
@@ -2962,13 +3107,25 @@ async def chat(req: ChatRequest):
                 if obj.get("done"):
                     done_reason = obj.get("done_reason") or ""
 
-            # ---- 代码轮：摘掉文本协议调用，并补发之前被扣住的尾巴 ----
+            # ---- 摘掉"泄漏成正文的工具调用"，并补发之前被扣住的尾巴 ----
+            # ⚠️ **两种模型都要跑**（2026-09-21）：默认模型走原生通道，
+            #    但它偶尔会把调用包成 <function-call>…</function-call> 写进正文，
+            #    而 Ollama 只认自己模板里的 <tool_call> → tool_calls 为空 →
+            #    以前这里被 `if code_model_on` 挡掉，那坨 JSON 就直接漏给用户了。
             # 放在 `if not tool_calls` 之前 —— 解析出来的调用要能接进下面同一套执行逻辑。
             text_protocol = False
-            if code_model_on and round_msg["content"]:
-                _calls, _clean = _split_text_tool_calls(round_msg["content"])
+            if round_msg["content"]:
+                if code_model_on:
+                    # 代码轮：只认代码轮真正给过的文本工具（开关关掉的给了也不能跑）
+                    _allowed, _bare = set(code_text_tools), True
+                else:
+                    # 聊天轮：只认"本轮真正给过它的工具"，且**只认带壳子的**
+                    # （正文里裸的 JSON 是正常内容，见 _split_text_tool_calls 的说明）
+                    _allowed, _bare = _native_tool_names, False
+                _calls, _clean = _split_text_tool_calls(
+                    round_msg["content"], allowed=_allowed, bare=_bare)
                 round_msg["content"] = _clean
-                # 逐字流式时把"可能是工具调用"的尾巴扣住了，这里确认过再补发。
+                # 逐字流式时把"可能是工具调用壳子"的尾巴扣住了，这里确认过再补发。
                 # 用 `> code_emitted` 判断：如果扣住的那段真是 ```tool 块，
                 # 清理后的正文会比已发的短，那就什么都不补。
                 if len(_clean) > code_emitted:
@@ -2976,9 +3133,9 @@ async def chat(req: ChatRequest):
                     code_emitted = len(_clean)
                     final_text += _tail
                     yield json.dumps({"message": {"content": _tail}}) + "\n"
-                # 再校验一次白名单与开关：设置里关掉了「本地算代码」就不许执行
-                _calls = [c for c in _calls if c["name"] in code_text_tools]
                 if _calls:
+                    # 这轮模型是**把调用当文本写的**（不是原生通道），
+                    # 后面组装对话时也必须按文本协议走，否则模板对不上。
                     text_protocol = True
                     tool_calls = [{"function": {"name": c["name"],
                                                 "arguments": c["arguments"]}}

@@ -200,8 +200,37 @@
       "</span>";
   }
 
+  // ⚠️⚠️ 「工具调用泄漏进正文」的最后一道闸（2026-09-21）。
+  // 模型偶尔不按 Ollama 的原生格式调用，而是自己套一层 XML 包装写进正文，例如：
+  //     <function-call>
+  //     { "name": "search_knowledge", "arguments": { … } }
+  //     </function-call>
+  // 原生通道只认它自己模板里的 <tool_call>，认不出这个 → 后端以前也只在代码模型
+  // 那轮做清理 → 这坨 JSON 就会**原样渲染给用户看**，而工具根本没执行。
+  // 后端现在会摘掉并真去执行（见 _split_text_tool_calls）；这里再兜一层，防的是：
+  // 历史会话回放、以及后端没认出来的变体（大小写/空格不同、只写了开标签）。
+  // ⚠️ 定义在**外层作用域**：renderAnswerLinks（历史回放也走它）在 doSend 之外。
+  const TOOL_LEAK_XML_RE = /<\s*\|?\s*(?:function[ _-]?calls?|tool[ _-]?calls?)\s*\|?\s*>[\s\S]*?(?:<\s*\/\s*(?:function[ _-]?calls?|tool[ _-]?calls?)\s*>|$)/gi;
+  const TOOL_LEAK_TAG_RE = /<\s*\|?\s*\/?\s*(?:function[ _-]?calls?|tool[ _-]?calls?)\s*\|?\s*\/?\s*>/gi;
+  const TOOL_LEAK_FENCE_RE = /```(?:tool|tool_call)[ \t]*\r?\n[\s\S]*?```/g;
+  // 「半个标签」：模型写到一半放弃，只剩 <function / <tool_call 就接正文了。
+  // 实机复现过（2026-09-21）：它单独占一行，被流式推出去，正文开头冒出一截 `<function`。
+  // ⚠️ 判据很窄 —— 只删"整行只有这么一截"和"出现在正文最开头"，免得吃掉讲标签用法的正常内容。
+  // ⚠️ `call` 那截写成**可选**：碎片往往正是缺了它（模型刚打出 `<function` 就放弃了）。
+  // 尾部只吃**标签名那种字符**，不能放 `[^>\n]` —— 那样会把同一行的正文整段吃掉。
+  const TOOL_LEAK_STRAY_RE = /(^|\n)[ \t]*<[ \t]*\/?[ \t]*(?:function|tool)(?:[ _-]?calls?)?[ \t]*[A-Za-z0-9_.-]{0,24}>?[ \t]*(?=\n|$)/gi;
+  const TOOL_LEAK_HEAD_RE = /^\s*<[ \t]*\/?[ \t]*(?:function|tool)(?:[ _-]?calls?)?(?=\n|[^\s>])/i;
+  function stripToolLeak(text) {
+    let s = String(text == null ? "" : text);
+    if (s.indexOf("<") < 0 && s.indexOf("```tool") < 0) return s;   // 快路径
+    s = s.replace(TOOL_LEAK_XML_RE, "").replace(TOOL_LEAK_TAG_RE, "");
+    s = s.replace(TOOL_LEAK_FENCE_RE, "");
+    s = s.replace(TOOL_LEAK_STRAY_RE, "$1").replace(TOOL_LEAK_HEAD_RE, "");
+    return s.replace(/\n{3,}/g, "\n\n").trim();
+  }
+
   function renderAnswerLinks(bubble, text) {
-    const esc = escapeHtml(text);
+    const esc = escapeHtml(stripToolLeak(text));
     let html = esc.replace(/\[([^\]]{1,40})\]\((\/api\/[^\s)]+)\)/g,
       (_, label, url) => dlGroup(label, fixApiUrl(url)));
     // 裸路径也要变按钮。⚠️ 前面那个字符类别只写「空格和半角括号」——
@@ -2600,6 +2629,7 @@
     }
 
     const renderAnswerWithCode = (bubble, text, userText) => {
+      text = stripToolLeak(text);          // 先摘掉泄漏的工具调用（见 stripToolLeak）
       const parts = [];
       const re = /```([a-zA-Z0-9_+#.-]*)[ \t]*\n([\s\S]*?)```/g;
       let last = 0, m;
@@ -2839,7 +2869,12 @@
             if (obj.message.thinking) {
               pushThinking(obj.message.thinking);  // 进入平滑播放器，逐字实时渲染
             }
-            if (obj.message.content) { answer += obj.message.content; answerBubble.textContent = answer + "▌"; }
+            if (obj.message.content) {
+              answer += obj.message.content;
+              // 逐字流式时也过一遍闸：后端会先把"可能是工具调用壳子"的尾巴扣住，
+              // 万一有变体漏过来，这里显示时也不会闪出一坨裸 JSON（`answer` 存的仍是原文）。
+              answerBubble.textContent = stripToolLeak(answer) + "▌";
+            }
           }
           if (obj.tool_start) addToolChip(obj.tool_start.name);
           // 一轮里同时发起多个工具时给个提示 —— 让用户知道这是并行执行、在省时间
