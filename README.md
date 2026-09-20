@@ -375,15 +375,15 @@ RTX 50 系显卡需用 cu130 重建：`--build-arg TORCH_INDEX=https://download.
 
 ## 测试
 
-**13 个测试脚本，约 3200 行**，每个都对应一个真实修过的 bug：
+**13 个测试脚本，约 3300 行**，每个都对应一个真实修过的 bug：
 
 | 脚本 | 验证什么 |
 |---|---|
 | `test_smoke.py` | 工具注册完整性（schema / append / dispatch / 实现函数四处对齐）+ 全工具实跑，在临时数据目录中运行，不污染用户库 |
 | `test_loop.py` | 思考打转检测与修复；采样参数是否真的进了请求体 |
 | `test_thinking_retry.py` | 重试时必须作废上一轮思考 |
-| `test_text_tool_leak.py` | 工具调用泄漏成代码卡片（```tool 围栏 / `<function-call>` XML 包装）、`input()` 无法输入 |
-| `test_tool_leak_e2e.py` | 起一个**存根 Ollama** 强制吐出泄漏的调用，验证"用户一个字都看不到 + 工具真的被执行了" |
+| `test_text_tool_leak.py` | 工具调用泄漏成代码卡片（```tool 围栏 / `<function-call>` 包装 / 裸 JSON / 半截标签）、`input()` 无法输入 |
+| `test_tool_leak_e2e.py` | 起一个**存根 Ollama** 强制吐出三种泄漏写法，验证"用户一个字都看不到 + 工具真的被执行了" |
 | `test_tool_leak_frontend.mjs` | 前端最后一道闸 `stripToolLeak`（把 app.js 里的函数**原样抠出来**跑用例） |
 | `test_run_timeout.py` | 执行超时被强杀后，**不能让模型误以为自己的代码写错了** |
 | `test_memory_extract.py` | 长期记忆提炼的取舍口径：该记的记、不该记的不记 |

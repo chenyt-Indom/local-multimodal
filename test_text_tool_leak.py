@@ -306,6 +306,46 @@ def main():
           "是 JS 里定义函数的关键字" in cl6, repr(cl6[:70]))
     check("碎片不会被当成调用执行", _c6 == [] and _c5 == [], "%s / %s" % (_c6, _c5))
 
+    print("\n⑧g 聊天轮里**裸着**的调用（实机第二次复现，run_python 一次都没执行）")
+    # 实机抓到的原文（照抄，只截短了 code）
+    REAL_BARE = ('{"name": "run_python", "arguments": {"code": "print(\'\\\\nJSON 键值对示例:\\\\n\')"}}'
+                 "\n\n<result>\n# 键值对示例\n{\"key\":\"value\"}\n</result>")
+    _c7, cl7 = M._split_text_tool_calls(REAL_BARE, allowed={"run_python"}, bare="strict")
+    check("裸调用被认出来（不再静默丢掉）",
+          len(_c7) == 1 and _c7[0]["name"] == "run_python", str(_c7)[:90])
+    check("裸 JSON 从正文里清掉", '"arguments"' not in cl7, repr(cl7[:50]))
+    check("模型**自己编的** <result> 也一起清掉（那是幻觉）", "<result>" not in cl7, repr(cl7[:50]))
+
+    print("\n⑧h ⚠️ 严格判据：这四种都**不能**动（宁漏勿误）")
+    for name, txt in (
+        ("用户要的 JSON 示例（```json 围栏里）",
+         '这是示例：\n\n```json\n{"name": "李明", "age": 30}\n```\n\n就这样。'),
+        ("夹在句子中间的举例",
+         '用法是发 {"name": "library", "arguments": {"action": "list"}} 这样的对象。'),
+        ("带业务字段（多出 age/city）",
+         '业务数据：\n{"name": "张三", "arguments": {"age": 20}, "city": "广州"}\n完。'),
+        ("名字不在本轮工具里",
+         '随便写一个：\n{"name": "some_unknown_tool", "arguments": {"x": 1}}\n完。'),
+    ):
+        _c8, cl8 = M._split_text_tool_calls(txt, allowed={"run_python", "library"}, bare="strict")
+        check("%s → 原样保留" % name, cl8 == txt.strip() and not _c8,
+              "calls=%s clean=%r" % (_c8, cl8[:44]))
+
+    print("\n⑧i 本轮**已经**有原生调用时：正文里的调用只清不跑（防同一工具跑两遍）")
+    check("_split_text_tool_calls 只管拆，管不了这个 —— 由主流程判（见源码注释）", True)
+
+    print("\n⑧j 裸调用没有标记可认 → 靠「开头就是调用形状」整段扣住")
+    for name, txt, want in (
+        ("紧凑写法", '{"name": "run_python", "arguments": {}}', True),
+        ("美化写法（换行）", '{\n  "name": "search_knowledge",\n  "arguments": {}\n}', True),
+        ("开头是 arguments", '{"arguments": {"code": "x"}}', True),
+        ("业务 JSON（第一个键不是调用那种）", '{\n  "城市": "广州",\n  "气温": 30\n}', False),
+        ("句子后面才出现", '这是一段回答 {"name": "x", "arguments": {}}', False),
+        ("普通正文", "递归就是函数调用自身。", False),
+    ):
+        got = bool(M._CALL_HEAD_RE.match(txt))
+        check("%s → %s" % (name, "扣住" if want else "不扣"), got == want, repr(txt[:34]))
+
     print("\n" + "=" * 64)
     print("通过 %d 项，失败 %d 项" % (PASS, FAIL))
     print("=" * 64)

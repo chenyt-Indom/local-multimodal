@@ -64,6 +64,10 @@ LEAK_A = ("我帮你在知识库里查一下。\n\n"
           "</function-call>\n")
 LEAK_B = ('好的，我看下时间。\n<tool_call>\n'
           '{"name": "get_time", "arguments": {}}\n</tool_call>\n')
+# 实机第二次复现的写法：**什么壳子都不套**的裸 JSON，后面还跟着模型自己编的
+# `<result>` —— 这一次工具**一次都没执行**（实测确认过）。
+LEAK_C = ('{"name": "get_time", "arguments": {}}\n\n'
+          "<result>\n现在是 2026 年 9 月 21 日 凌晨 1 点。\n</result>\n")
 ANSWER2 = "根据你知识库里的资料，这样的对比可以分三个层面来看。"
 
 STUB_CALLS = []          # 记录 stub 收到的请求，便于排错
@@ -111,6 +115,8 @@ class Stub(BaseHTTPRequestHandler):
             content = LEAK_A
         elif "【泄漏测试B】" in txt:
             content = LEAK_B
+        elif "【泄漏测试C】" in txt:
+            content = LEAK_C
         else:
             content = "好的。"          # 记忆提炼等后台调用
 
@@ -214,9 +220,11 @@ def main():
             print(io.open(os.path.join(TMP, "srv.log"), encoding="utf-8").read()[-1500:])
             return 1
 
-        for tag, q, tool_name in (
-            ("A · <function-call>", "【泄漏测试A】名侦探柯南中柯哀和新兰哪对更符合现代价值观", "search_knowledge"),
-            ("B · <tool_call>", "【泄漏测试B】现在几点", "get_time"),
+        for tag, q, tool_name, keep in (
+            ("A · <function-call>", "【泄漏测试A】名侦探柯南中柯哀和新兰哪对更符合现代价值观",
+             "search_knowledge", "我帮你在知识库里查一下"),
+            ("B · <tool_call>", "【泄漏测试B】现在几点", "get_time", "我看下时间"),
+            ("C · 裸 JSON + 伪造 <result>", "【泄漏测试C】现在几点", "get_time", None),
         ):
             print("\n场景 %s" % tag)
             deltas, events, notes = [], [], []
@@ -243,14 +251,17 @@ def main():
             visible = "".join(deltas)
 
             # ① 用户从头到尾看不到壳子
-            bad = [k for k in ("<function", "<tool_call", "<tool-call", '"arguments"', '"list_all"')
+            bad = [k for k in ("<function", "<tool_call", "<tool-call", '"arguments"', '"list_all"',
+                               "<result>", "</result>")
                    if k in visible]
             check("① 用户可见的流里没有泄漏块", not bad, "命中 %s" % bad if bad else repr(visible[:50]))
             # ② 调用真的执行了
             check("② 调用真的被执行（不是藏起来就完事）", tool_name in events, str(events))
             # ③ 周围的正常文字保留
-            keep = "我帮你在知识库里查一下" if tool_name == "search_knowledge" else "我看下时间"
-            check("③ 它周围的正常文字保留", keep in visible, repr(visible[:60]))
+            if keep:
+                check("③ 它周围的正常文字保留", keep in visible, repr(visible[:60]))
+            else:
+                check("③ （这一例原文里本来就没有说明文字，跳过）", True)
             # ④ 第二轮回答合并进来
             check("④ 工具结果喂回后的回答也在了", ANSWER2 in visible, repr(visible[-60:]))
             print("     可见正文 %r" % visible[:90])
