@@ -71,6 +71,28 @@ def main() -> int:
     check("三遍才算打转",
           bool(M.find_looping_piece("这是一句比较长的话哦。" * 3)))
 
+    # ⚠️ 假警报：英文侧全是**标识符碎片** —— 正则把 `search_knowledge` 拆成
+    #    `search` / `knowledge`，模型正常讨论几次工具名就"重复 3 次"了。
+    #    实测（2026-09-21）日志里 8 条打转警告全是同一个词 `search`，属误报。
+    eng = ("I should call search_knowledge here. Actually search_knowledge returns the docs. "
+           "Then search_knowledge again for the second query.")
+    check("讨论工具名（search_knowledge 出现 3 次）→ 不误报",
+          M.find_looping_piece(eng) == "", repr(M.find_looping_piece(eng)))
+    check("纯英文短词反复 → 不误报",
+          M.find_looping_piece("search search search knowledge knowledge knowledge") == "")
+    check("特别长的英文串反复（≥16）→ 仍然算",
+          bool(M.find_looping_piece("abcdefghijklmnopqrstuvwx " * 3)),
+          "留个安全阀，别把英文场景整个废掉")
+    check("中文段落复读**没有**被这层过滤误伤",
+          bool(M.find_looping_piece("这段话在思考里原封不动地重复了三遍哦。" * 3)))
+    # 实机第二次误报：9 字常用短语在不同句子里出现 3 次，是正常表达
+    common = ("用户导入的领域文档可能有几份。我先看看用户导入的领域文档里都有什么，"
+              "再决定要不要引用用户导入的领域文档。")
+    check("9 字常用短语重复 3 次 → 不误报（实机抓到的假警报）",
+          M.find_looping_piece(common) == "", repr(M.find_looping_piece(common)))
+    check("⚠️ 但真正那段 30~60 字的复读**仍然要抓得到**",
+          bool(M.find_looping_piece(shot)), repr(M.find_looping_piece(shot)[:20]))
+
     # ---------------- ② 采样参数进没进请求体 ----------------
     print("\n② 采样参数必须真的进到 Ollama 请求里（这是本 bug 的根因）")
     cfg = C.load_config()

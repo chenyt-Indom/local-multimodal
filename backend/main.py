@@ -1380,6 +1380,20 @@ _TOOL_XML_HEAD_RE = re.compile(
 #    采样参数（`repeat_last_n` / `repeat_penalty`）能大幅减少它，但压不干净 ——
 #    真发生时至少要让用户看到实话、并在日志里留下证据。
 _LOOP_PIECE_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]{6,}")
+# ⚠️ 片段长度门槛（判据本意是抓**段落级**复读，实测重复的原句有 30~60 字）：
+#   · 中文侧：**≥10 字**才算。9 字以下的多半是"用户导入的领域文档"这种常用短语，
+#     在互不相同的句子里出现三次是**正常表达**，不是打转（实机误报抓到的就是这个）。
+#   · 英文侧：**≥16**，因为正则会把 `search_knowledge` 拆成 `search` / `knowledge`，
+#     模型正常讨论几次工具名就"重复 3 次"了（日志里 8 条警告全是同一个词 `search`）。
+_LOOP_MIN_CJK = 10
+_LOOP_MIN_ASCII = 16
+
+
+def _looping_piece_ok(piece: str) -> bool:
+    """这个片段值得拿去判"复读"吗（见 _LOOP_MIN_CJK / _LOOP_MIN_ASCII 上面的说明）。"""
+    if piece.isascii():
+        return len(piece) >= _LOOP_MIN_ASCII
+    return len(piece) >= _LOOP_MIN_CJK
 
 
 def find_looping_piece(text: str, threshold: int = 3) -> str:
@@ -1387,11 +1401,15 @@ def find_looping_piece(text: str, threshold: int = 3) -> str:
 
     只看长度 ≥6 的连续中英文片段：短词（"的"、"然后"、"所以"）重复是**正常语言**，
     拿它们做判据会疯狂误报。段落级复读的重复片段通常有 10~60 个字，跑不掉。
+    ⚠️ 纯英文片段再叠一层过滤（见 _LOOP_MIN_ASCII）：英文侧的全是标识符碎片，
+    正常讨论工具名就会"重复"，实测假警报就是这么来的。
     """
     if not text:
         return ""
     count = {}
     for piece in _LOOP_PIECE_RE.findall(text):
+        if not _looping_piece_ok(piece):
+            continue
         n = count.get(piece, 0) + 1
         count[piece] = n
         if n >= threshold:
