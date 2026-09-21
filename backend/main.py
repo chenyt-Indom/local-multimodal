@@ -68,6 +68,59 @@ def _recent_image() -> list:
     return []
 
 
+# 「这一轮是不是还在说上一张图」的判据。
+#
+# ⚠️⚠️ 为什么必须有：`_recent_image()` 的**有效期是 1 小时**，而 `ctx["images"]`
+# 原来写的是 `images or _recent_image()` —— 等于**用户拖过一次图之后的整整一小时里，
+# 每一轮都会被系统当成"这一轮的图"**。三个真实后果：
+#   ① 「把这张图改成蓝色」之外的**全新话题**，也会拿着那张旧图去当底图（微改/参考图）；
+#   ② `writing_mode` 被旧图挡掉（`and not _recent_image()`）→ 写长文退化成普通问答；
+#   ③ `simple_q` 也不收紧 → 白等更久。
+# 用户 2026-09-22 报的「上一轮画水母，这一轮要旅行计划，结果又出了水母的图」
+# 就是这一类**跨轮串扰**。⇒ 只有在用户**明确指向**上一张图时才复用。
+#
+# ⚠️ 判据要**双条件**：「指代词」或「改图动作」**单独出现都不算** ——
+# "帮我写份文档，**换成** Word" 里的"换成"跟图片毫无关系，
+# 只看动词会把旧图接到文档任务上（那就是另一种串扰）。
+_IMG_WORDS = ("图", "照片", "图片", "海报", "壁纸", "插画", "头像", "图标",
+              "logo", "抠图", "画")
+_IMG_DEIXIS = ("这张", "那张", "这幅", "那幅", "此图", "该图", "原图", "参考图",
+               "上图", "刚才", "刚刚", "上一张", "上张", "前一张",
+               "上面那", "上面这")
+_IMG_EDIT = ("改成", "改为", "换成", "再改", "继续改", "修一下", "调一下",
+             "加个", "去掉", "裁剪", "放大")
+# 外观类词：配合"改图动作"判断（「改成红色」这种短句常常不带"图"字）
+_IMG_LOOK = ("红", "蓝", "绿", "黄", "黑", "白", "灰", "紫", "橙", "颜色", "色系",
+             "亮", "暗", "背景", "尺寸", "大小", "比例", "风格", "清晰")
+
+
+def _refers_to_prev_image(text: str) -> bool:
+    """这句话是不是在指「上一轮那张图」。
+
+    宁漏勿误：判不出来就**不复用**旧图（大不了让用户重拖一次，或让工具明确报
+    "无法确定要修改的图片"），因为"把上一轮的图悄悄接到新话题上"是更糟的错误。
+    """
+    t = str(text or "")
+    if not t:
+        return False
+    has_img = any(w in t for w in _IMG_WORDS)
+    # ① 明确指向"某张图"：图相关词 + 指代词
+    if has_img and any(d in t for d in _IMG_DEIXIS):
+        return True
+    # ② 在改这张图：图相关词 + 改图动作
+    if has_img and any(e in t for e in _IMG_EDIT):
+        return True
+    # ③ 短句只说"改成红色 / 调亮一点"这类（没带"图"字，但说的是外观）
+    if any(e in t for e in _IMG_EDIT) and any(w in t for w in _IMG_LOOK):
+        return True
+    return False
+
+
+def _prev_image_for(text: str) -> list:
+    """本轮可复用的"上一张图"：只有用户明确指向时才给。"""
+    return _recent_image() if _refers_to_prev_image(text) else []
+
+
 # 启动时做一次轻量清理：移除「太久未用 + 几乎没内容」的僵尸会话。
 # 有实际内容的会话一律保留；真正重要的信息由长期记忆承载，不靠聊天记录堆积。
 try:
@@ -2793,6 +2846,11 @@ async def chat(req: ChatRequest):
 
     last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
 
+    # 本轮可复用的"上一张图" —— **只有用户明确指向它时才给**（见 _refers_to_prev_image）。
+    # 单用户桌面应用，`_LAST_IMAGE` 只存最近一张；以前是"无脑复用"，会把上一轮的图
+    # 悄悄接到新话题上，导致"问旅行计划却拿旧图去改/去当参考图"这类串扰。
+    prev_img = _prev_image_for(last_user)
+
     # ⚠️ 迭代轮次：上一轮刚写过代码时，这轮用户可能只说「再改两处」——
     # 里面一个代码关键词都没有，只按本句判定就会掉回默认模型。
     #
@@ -2835,7 +2893,7 @@ async def chat(req: ChatRequest):
     #   - 联网模式已开启（要搜索 + 深度阅读 + 引用来源，最耗 token）
     web_on = bool(cfg.get("web_enabled"))
     simple_q = (_is_simple_question(last_user)
-                and not images and not _recent_image() and not web_on)
+                and not images and not prev_img and not web_on)
     if simple_q:
         cfg["max_tokens"] = min(int(cfg.get("max_tokens") or 2048), SIMPLE_MAX_TOKENS)
     elif web_on:
@@ -2950,6 +3008,29 @@ async def chat(req: ChatRequest):
         "- ⚠️ **一轮问清、只问一次**：拿到答复就一次做完；"
         "用户已经回答过、或说过「你看着办 / 直接做」→ 绝不再问。"
         "反复确认比不问更烦人。\n")
+    # ⚠️ 跨轮串扰：用户 2026-09-22 报「上一轮画水母、这一轮要旅行计划，结果又出了水母的图」。
+    # 这类问题的**根子是"默认沿用上文"**：模型会把上一轮的对象/产物/图片无脑带下来。
+    # 代码侧已把"旧图自动复用"改成"只在明确指向时才复用"（见 _refers_to_prev_image），
+    # 这里再给模型一条明确的判断规则 —— 相关不相关**由它自己判**，但要判对。
+    sys_prompt += (
+        "\n\n【每一轮先判一句：这是在接着说上面那件事，还是开了个新话题】\n"
+        "- **接着说的信号**：有指代词或承接词（它 / 这个 / 那张 / 刚才 / 上面说的 / "
+        "再改改 / 继续 / 还有吗 / 换成…），或明确提到了上文的对象。"
+        "→ 那就沿用上文的对象、结论和产物。\n"
+        "- **新话题的信号**：换了领域、且**没提上文任何东西**（例如上一轮在画图，"
+        "这一轮在问旅行安排）。→ **当全新的需求处理**。\n"
+        "- ⚠️⚠️ 新话题时**绝对不要**把上一轮的东西再端出来：\n"
+        "    · **上一轮生成/搜过图片 ≠ 这一轮还要图片** —— 这一轮没提图，就不要出图、"
+        "不要把那张旧图拿出来说事；\n"
+        "    · 上一轮写过文件/做过表 ≠ 这一轮还要写文件；\n"
+        "    · 不要因为「刚才在聊 A」就把 B 硬往 A 上靠。\n"
+        "- 判断**拿不准**时：按新话题做（宁可不带旧上下文），"
+        "或者用 ask_user 问一句「你是指刚才那张图，还是新的一件事？」。\n"
+        "- 长期记忆与知识库检索到的东西同理：**只在与本轮问题确实相关时才用**，"
+        "不相关就别往回答里塞（塞了只会显得答非所问）。\n"
+        "- 如果你觉得用户这句话是在指**更早**聊过的东西（不在你能看到的最近几轮里）："
+        "先去系统提示里的**历史摘要 / 长期记忆**找，再决定；"
+        "实在找不到就别硬猜，用 ask_user 问一句「你是指之前聊的 XX 吗？」。\n")
     # 长文创作（作文/方案/报告…）：这一轮只需要"问细节"和"存文件"两个工具，
     # 其余 schema 全砍掉，把省下的额度让给正文；同时把输出上限提上去。
     # 为什么要这么绕：默认模型是思考型的，18 个工具的 schema（约 5800 token）
@@ -2958,7 +3039,7 @@ async def chat(req: ChatRequest):
                     # ⚠️ 「帮我写一段代码」同时命中写代码与长文创作，必须排除 ——
                     # 否则会被当成"作文"砍掉工具、又切到代码模型，两头不讨好。
                     and not _is_code_task(last_user)
-                    and not images and not _recent_image())
+                    and not images and not prev_img)
     if writing_mode:
         cfg["max_tokens"] = max(int(cfg.get("max_tokens") or 2048), WRITING_MAX_TOKENS)
     tool_schemas = tools.make_schemas(cfg.get("web_enabled", False),
@@ -3462,7 +3543,7 @@ async def chat(req: ChatRequest):
             # images：本轮拖入的图（否则复用最近一张）
             # shown_images：本轮已展示给用户的图，供「保存到图库」工具按序号引用
             # session：记忆按对话隔离，写记忆的工具必须知道当前是哪个对话
-            ctx = {"images": images or _recent_image(), "shown_images": [],
+            ctx = {"images": images or prev_img, "shown_images": [],
                    "session": session,
                    # 危险操作（删文件、起进程、联网…）先问用户，批准了再执行
                    # ask：材料不足时弹出问答框向用户追问细节
