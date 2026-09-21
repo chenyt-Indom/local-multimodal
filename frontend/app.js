@@ -1087,6 +1087,8 @@
         const on = key === "memory_enabled" ? c.memory_enabled !== false : !!c[key];
         p.classList.toggle("on", on);
       });
+      // 询问模式：二选一，不是开关（见 index.html 里为什么不加 data-cfg）
+      setAskMode(c.ask_mode === "deep" ? "deep" : "quick");
       // 若联网模式已开启，顺带校验当前网络（断网时给出提示）
       if (c.web_enabled) {
         const net = await checkNetwork();
@@ -1094,6 +1096,30 @@
       }
     } catch {}
   }
+  // ---------- 询问模式：快速了解 / 深度询问 ----------
+  // 用户 2026-09-22：两种模式的区别只在"问到什么程度就动手"，
+  // **两种模式都不限制问题个数**（后端 ask_mode 注入系统提示，见 main.py）。
+  function setAskMode(mode) {
+    document.querySelectorAll(".pill.askmode").forEach((p) => {
+      p.classList.toggle("on", p.dataset.askmode === mode);
+    });
+  }
+  async function saveAskMode(mode) {
+    setAskMode(mode);
+    try {
+      await api("/api/config", { method: "POST", body: JSON.stringify({ ask_mode: mode }) });
+      showToast(mode === "deep"
+        ? "已切到「深度询问」：模型会把关键信息问透再动手"
+        : "已切到「快速询问」：模型只问最关键的几条", "ok");
+    } catch (e) {
+      showToast("切换失败：" + String(e.message || e), "warn");
+    }
+  }
+  // ⚠️ 单独绑定：**不能**并入上面的 .pill[data-cfg] 遍历 ——
+  //    那条会把 onclick 覆盖成"布尔开关 + saveToggles"，两选一的控件会互相打架。
+  document.querySelectorAll(".pill.askmode").forEach((p) => {
+    p.onclick = () => saveAskMode(p.dataset.askmode === "deep" ? "deep" : "quick");
+  });
   async function saveToggles() {
     const body = {
       memory_enabled: $('.pill[data-cfg="memory_enabled"]').classList.contains("on"),
@@ -1102,6 +1128,11 @@
       auto_memorize: $('.pill[data-cfg="auto_memorize"]').classList.contains("on"),
       code_auto_route: $('.pill[data-cfg="code_auto_route"]').classList.contains("on"),
       code_exec_enabled: $('.pill[data-cfg="code_exec_enabled"]').classList.contains("on"),
+      // ⚠️ 带上询问模式：否则用户改完模式、再点任意开关时，
+      //    保存的 body 里没有 ask_mode —— 后端只 merge 传了的键，本身不会丢，
+      //    但两处状态容易不同步（这里显式带上，前端为准）。
+      ask_mode: document.querySelector('.pill.askmode[data-askmode="deep"]').classList.contains("on")
+        ? "deep" : "quick",
     };
     await api("/api/config", { method: "POST", body: JSON.stringify(body) });
   }
