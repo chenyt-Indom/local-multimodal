@@ -715,7 +715,7 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "名词短语关键词，如「埃菲尔铁塔 照片」「橘猫 壁纸」。**只放名词**，不要塞「详细特征/介绍/怎么样」这类词，那样会搜出无关内容"},
+                        "query": {"type": "string", "description": "名词短语关键词，如「埃菲尔铁塔」「橘猫」。**越短越准**：1~2 个词最好；不要塞「详细特征/介绍/怎么样/高清大图」这类修饰词，那样会搜出无关内容。一次搜不到或结果不对时，**换个更常见的叫法/学名再搜一次**（如「维纳斯捕蝇草」→「捕蝇草」），而不是就此收工"},
                         "n": {"type": "integer", "description": "想要几张，默认 4，最多 8。用户嫌少时可以调大或再搜一次"},
                     },
                     "required": ["query"],
@@ -1695,7 +1695,9 @@ def _do_web_image_search(arguments, ui_events):
         if shown >= n:
             break
         tried += 1
-        referer = r.get("source") or None
+        # ⚠️ 用结果自带的 referer（各图库的自家 referer，如 image.so.com），
+        # 拿不到才退回来源页 —— 360 的图只认前者，给来源页会 403。
+        referer = r.get("referer") or r.get("source") or None
         raw = web_tools.download_image(r["url"], referer=referer)
         if not raw and r.get("thumb"):
             # 原图被防盗链挡住时退一步用缩略图 —— 缩略图通常挂在允许外链的 CDN 上，

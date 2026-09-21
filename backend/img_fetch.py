@@ -316,7 +316,8 @@ def search_one(query: str, want_wide: bool = False, exclude=None) -> str:
         if tried >= 6:
             break
         tried += 1
-        referer = r.get("source") or None
+        # ⚠️ 优先用结果自带的 referer（各图库的自家 referer），拿不到才退回来源页。
+        referer = r.get("referer") or r.get("source") or None
         for url in (r.get("url"), r.get("thumb")):
             if not url:
                 continue

@@ -816,57 +816,242 @@ def _clean_img_query(q: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+def _core_img_query(q: str) -> str:
+    """把「捕蝇草 植物 高清」这类查询收缩到**最核心的一段**（首个词）。
+
+    ⚠️ 为什么要收缩：图片搜索对"修饰词"的耐受度比文本搜索差得多。
+    实测「捕蝇草 植物」在某个源上会返回一堆毫不相干的图，
+    而单独搜「捕蝇草」就完全正常。搜索词越短越具体，越不容易被带偏。
+    只在原查询**一条相关结果都拿不到**时才用它兜底，不改变首选查询。
+    """
+    import re
+    parts = [p for p in re.split(r"[\s,，、/;；:：()（）\[\]【】]+", q or "")
+             if len(p) >= 2]
+    if len(parts) < 2:
+        return ""
+    core = max(parts, key=len)          # 取最长的一段（通常是主体名词）
+    return "" if core == q else core
+
+
+# --------------------------------------------------------------------------
+# 图片源
+# --------------------------------------------------------------------------
+def _img_360(query: str, n: int) -> list:
+    """360 图片（`image.so.com/j`，JSON 接口）—— **首选源**。
+
+    ⚠️ 为什么把它放在第一位（2026-09-21 实测）：
+    Bing 图片搜索在"无 JS 抓取"这个场景下**不稳定到不可用**。同一个接口：
+      · 搜「捕蝇草」         → 35 条，全对；
+      · 搜「捕蝇草 植物」   → 1 条，内容是"地暖保温条"；
+      · 搜「维纳斯捕蝇草」 → 12 条，全是 Photoshop CS6 下载页；
+      · 搜「捕蝇草 结构」   → 12 条，全是"世界旅游胜地"。
+    加 Cookie、加 mkt/FORM 参数都无效（已逐一验证）。**返回的页面 title 是
+    对的、结果区却是别的内容**，所以模型会拿这堆图当"用户的答案"去描述 ——
+    比"搜不到"危害大得多。
+    360 这边同两个查询分别返回 57 / 117 条，标题全部对得上，还附带宽高。
+
+    ⚠️ 它的 `img` 直链在 `*.qhimg.com` CDN 上，**Referer 要给 image.so.com**。
+    """
+    import json as _json
+    url = ("https://image.so.com/j?q=" + urllib.parse.quote(query)
+           + f"&pn={max(int(n), 12)}&src=srp&sn=0")
+    h = dict(IMG_HEADERS)
+    h["Referer"] = "https://image.so.com/"
+    h["Accept"] = "application/json, text/plain, */*"
+    req = urllib.request.Request(url, headers=h)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = _json.loads(_read_body(resp).decode("utf-8", "ignore"))
+    out = []
+    for it in (data.get("list") or []):
+        if not isinstance(it, dict):
+            continue
+        img = str(it.get("img") or it.get("https") or "").strip()
+        if img.startswith("//"):
+            img = "https:" + img
+        if not img.startswith("http"):
+            continue
+        try:
+            wid = int(it.get("width") or 0)
+            hei = int(it.get("height") or 0)
+        except Exception:
+            wid = hei = 0
+        out.append({
+            "title": _clean(it.get("title") or ""),
+            "url": img,
+            "thumb": str(it.get("thumb") or it.get("thumb_bak") or "").strip(),
+            "source": str(it.get("link") or "").strip() or ("https://" + str(it.get("site") or "").strip()),
+            "referer": "https://image.so.com/",
+            "width": wid, "height": hei,
+        })
+    return out
+
+
+def _img_baidu(query: str, n: int) -> list:
+    """百度图片（`image.baidu.com/search/acjson`，JSON 接口）—— 备用源。"""
+    import json as _json
+    url = ("https://image.baidu.com/search/acjson?tn=resultjson_com&logid=1"
+           "&ipn=rj&ct=201326592&fp=result&word=" + urllib.parse.quote(query)
+           + f"&pn=0&rn={max(int(n), 30)}")
+    h = dict(IMG_HEADERS)
+    h["Referer"] = "https://image.baidu.com/"
+    h["Accept"] = "application/json, text/plain, */*"
+    req = urllib.request.Request(url, headers=h)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = _json.loads(_read_body(resp).decode("utf-8", "ignore"))
+    out = []
+    for it in (data.get("data") or []):
+        if not isinstance(it, dict):
+            continue
+        img = str(it.get("middleURL") or it.get("thumbURL") or "").strip()
+        if not img.startswith("http"):
+            continue
+        out.append({
+            "title": _clean(it.get("fromPageTitleEnc") or ""),
+            "url": img,
+            "thumb": str(it.get("thumbURL") or "").strip(),
+            "source": str(it.get("fromURL") or it.get("fromURLHost") or "").strip(),
+            "referer": "https://image.baidu.com/",
+            "width": 0, "height": 0,
+        })
+    return out
+
+
+def _img_bing(query: str, n: int) -> list:
+    """Bing 图片搜索（HTML 抓取）—— **最后的兜底**，见 `_img_360` 的说明。"""
+    import html as _html
+    import re
+    url = ("https://cn.bing.com/images/search?q=" + urllib.parse.quote(query)
+           + f"&count={max(int(n) * 4, 24)}")
+    page = _fetch(url)
+    out = []
+    for m in re.finditer(r'class="iusc"[^>]*m="([^"]+)"', page):
+        try:
+            data = json.loads(_html.unescape(m.group(1)))
+        except Exception:
+            continue
+        murl = str(data.get("murl") or "").strip()
+        if not murl.startswith("http"):
+            continue
+        purl = str(data.get("purl") or "").strip()
+        out.append({
+            "title": _clean(data.get("t") or ""),
+            "url": murl,
+            "thumb": str(data.get("turl") or "").strip(),
+            "source": purl,
+            # ⚠️ 防盗链：给图片所在页的成功率最高，给 cn.bing.com 反而 403
+            "referer": purl or "https://cn.bing.com/",
+            "width": 0, "height": 0,
+        })
+    return out
+
+
+_IMG_SOURCES = (
+    ("360图片", _img_360),
+    ("百度图片", _img_baidu),
+    ("Bing图片", _img_bing),
+)
+
+
+def _img_overlap(query: str, items: list) -> bool:
+    """这批结果里，**有没有任何一条的标题真的提到了查询词**。
+
+    ⚠️ 为什么用"标题里出现查询词"这么朴素的判据：
+    图片搜索的标题通常就是来源网页的标题，正文里必然带着查询词
+    （实测搜「捕蝇草」35 条标题里 35 条含"捕蝇草"）；
+    而源返回垃圾时（Photoshop 下载页、地暖保温条、光学透镜图），
+    标题与查询**零重合**。所以"零重合"就是"这个源这次给的东西不能用"的信号。
+
+    ⚠️ 三个把判据做准的细节（都是踩出来的）：
+    1. **只看标题，不看来源网址** —— URL 里满是随机字母数字，
+       一个乱码查询的 2 字片断（"9f"/"qq"）能轻松在网址里命中，于是垃圾被判成"相关"；
+    2. **词元要够具体**：优先用 3 字及以上的片断；只有 2 字片断可用时，
+       要求**两个字都不是虚词**（"的词"这种必须排除，否则
+       "形容心情不好的词语"会被当成乱码查询的命中结果）；
+    3. 纯英文数字片断要求 3 位以上，同理排除 "9f" 这类碎片。
+    """
+    terms = _terms(query)
+    if not terms:
+        return True                      # 没啥可判的，别拦
+    strong = [t for t in terms if len(t) >= 3]
+    if not strong:
+        strong = [t for t in terms if len(t) == 2
+                  and not any(c in _LOW_INFO_CHARS for c in t)]
+    if not strong:
+        return True
+    for it in items:
+        title = str(it.get("title") or "")
+        if title and any(t in title for t in strong):
+            return True
+    return False
+
+
 def image_search(query: str, n: int = 4) -> list:
-    """联网搜图：返回 [{title, url, thumb, source}]。
+    """联网搜图：返回 [{title, url, thumb, source, referer, width, height}]。
 
     **与 generate_image 的区别**：这里找的是网上已存在的图片（原图直出），
     不做任何绘制；用户要求「找张图/搜张图/给我看看 xx 长什么样」时用它。
+
+    取图策略（顺序即优先级）
+    ------------------------
+    1. 查询词：先清洗掉「照片/高清」等冗余词，**一条相关结果都拿不到时**
+       再收缩到核心词重试一次（见 `_core_img_query`）；
+    2. 源：360 → 百度 → Bing，**第一个给出可用结果的源就用它**，不再往下试；
+    3. 每个候选批次都过一遍 `_img_overlap` —— 整批与查询零重合的直接丢弃，
+       换下一个源；全部源都失败就返回空列表。
+
+    ⚠️ 第 3 条是这套东西的**安全底线**：宁可返回空（模型会如实说"没搜到"），
+    也绝不能把别的主题的图当成用户的答案交出去 —— 实测过"搜捕蝇草返回
+    光学透镜示意图"，模型会照着图片内容去描述，用户看到的就是一本正经的错。
     """
-    import html as _html
-    import re
+    q = str(query or "").strip()
+    if not q:
+        return []
+    want = max(int(n) * 3, 12)
 
-    def _run(q: str) -> list:
-        url = ("https://cn.bing.com/images/search?q=" + urllib.parse.quote(q)
-               + f"&count={max(n * 4, 24)}")
-        try:
-            page = _fetch(url)
-        except Exception:
-            return []
-        out = []
-        for m in re.finditer(r'class="iusc"[^>]*m="([^"]+)"', page):
+    tries = []
+    for cand in (_clean_img_query(q), _core_img_query(q)):
+        if cand and cand not in tries:
+            tries.append(cand)
+
+    for cq in tries:
+        for src_name, fn in _IMG_SOURCES:
             try:
-                data = json.loads(_html.unescape(m.group(1)))
+                raw = fn(cq, want)
             except Exception:
+                continue                 # 某个源抽风不影响别的源
+            # 去重（同一张图在源里可能重复）
+            seen, batch = set(), []
+            for r in raw:
+                u = r.get("url") or ""
+                if not u or u in seen:
+                    continue
+                seen.add(u)
+                r["engine"] = src_name
+                batch.append(r)
+            if not batch:
                 continue
-            murl = (data.get("murl") or "").strip()
-            if not murl.startswith("http"):
-                continue
-            out.append({
-                "title": _clean(data.get("t") or ""),
-                "url": murl,
-                "thumb": (data.get("turl") or "").strip(),
-                "source": (data.get("purl") or "").strip(),
-            })
-        return out
+            if not _img_overlap(cq, batch):
+                continue                 # 整批与查询零重合 → 这个源这次信不过
+            out = _rank_images(cq, batch)[:n]
+            if out:
+                return out
+    return []
 
-    # 先用清洗后的关键词（更准），数量不足再用原始词补充
-    cleaned = _clean_img_query(query)
-    results = []
-    if cleaned and cleaned != query:
-        results = _run(cleaned)
-    if len(results) < n:
-        results += _run(query)
 
-    # 去重并按原图 URL 收敛
-    seen, final = set(), []
-    for r in results:
-        if r["url"] in seen:
-            continue
-        seen.add(r["url"])
-        final.append(r)
-        if len(final) >= n:
-            break
-    return final
+def _rank_images(query: str, items: list) -> list:
+    """按标题相关度排序，并把「零重合」的条目压在最后（有更好的就别给这些）。"""
+    scored = []
+    for i, it in enumerate(items):
+        try:
+            rel = relevance_ratio(query, it)
+        except Exception:
+            rel = 0.0
+        scored.append((rel, i, it))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    good = [it for rel, _i, it in scored if rel > 0]
+    if len(good) >= 1:
+        return good
+    return [it for _rel, _i, it in scored]
 
 
 def _fetch_bytes(url: str, referer: str | None, max_bytes: int,
@@ -893,13 +1078,16 @@ def download_image(url: str, max_bytes: int = 8 * 1024 * 1024,
     改成**图片所在页**或 `https://baike.baidu.com/` 就能正常拿到
     （实测同一张图：bing 的 Referer → 403；来源页 → 11248 字节，正常）。
 
-    所以这里按「来源页 → 百度 → bing → 不带」依次重试。
+    所以这里按「结果里带的 referer → 各图库的自家 referer → 不带」依次重试。
     只在 **401/403**（防盗链）时才换下一个 Referer ——
     404 之类换 Referer 也没用，网络超时更不该反复重试浪费时间。
+    ⚠️ 360 的图挂在 `*.qhimg.com` 上，**认的是 `https://image.so.com/`**
+    （不是图片所在页！），所以它必须在这个重试链里。
     """
     import urllib.error
 
-    refs = [referer, "https://baike.baidu.com/", "https://cn.bing.com/", None]
+    refs = [referer, "https://image.so.com/", "https://image.baidu.com/",
+            "https://baike.baidu.com/", "https://cn.bing.com/", None]
     tried = set()
     for i, r in enumerate(refs):
         if r in tried:
