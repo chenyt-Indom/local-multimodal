@@ -7,7 +7,9 @@
 # 绘图想走显卡（体积会大很多，约 3~4 GB）：
 #   docker build -f docker/Dockerfile.app \
 #     --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu130 \
-#     -t local-multimodal-app:latest .
+#     -t local-multimodal-app:gpu .
+#   ⚠️ GPU 版一定要打 :gpu 标签。写成 :latest 会**把 CPU 版镜像覆盖掉**，
+#      而部署脚本正是靠 `local-multimodal-app:latest` / `:gpu` 这两个标签二选一的。
 #
 # ⚠️ CUDA 版本怎么选（实测踩过坑）：
 #   torch 轮子是按 GPU **算力架构**编译的，选错了会在推理时报
