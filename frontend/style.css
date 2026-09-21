@@ -1326,6 +1326,28 @@ body.dark .map-note { color: #d0b070; }
 /* ⚠️ `button.pill-btn:hover` 的优先级比 `.pill-btn.bad` 高，会把异常的红边冲成蓝色，
    这里补回来，免得"有故障"的按钮一悬停就看着正常了。 */
 button.pill-btn.bad:hover { border-color: #8a463c; }
+
+/* ---------- 「询问方式」选择面板 ----------
+   一个按钮（#askModeBtn）显示当前选择，点开这里二选一。
+   用户 2026-09-22 要求把原来的两个按钮合并成这一个。 */
+.askmode-box { width: min(520px, 92vw); }
+.askmode-opt {
+  display: flex; align-items: flex-start; gap: 10px; width: 100%;
+  margin-top: 10px; padding: 12px 13px; text-align: left;
+  background: var(--panel2); border: 1px solid var(--border); border-radius: 11px;
+  color: var(--text); cursor: pointer; font: inherit;
+}
+.askmode-opt:hover { border-color: var(--accent); }
+.askmode-opt.on { border-color: var(--accent); background: #1c2947; }
+.askmode-mark { color: var(--accent); font-size: 13px; line-height: 1.5; }
+.askmode-text { display: flex; flex-direction: column; gap: 4px; }
+.askmode-text b { font-size: 13.5px; }
+.askmode-text em {
+  font-style: normal; font-size: 12.5px; color: var(--muted); line-height: 1.65;
+}
+/* ⚠️ 按钮里的当前选择要一眼可读，别用小字号灰字（顶栏本来就密） */
+.askmode-btn { white-space: nowrap; }
+
 /* 面板里的状态行 -- 配色见上面 `.amap-state` 那段（深色主题专用值） */
 
 /* ---------- 高德 key 面板：只读展示 + 「更改 API」 ---------- */

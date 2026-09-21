@@ -191,12 +191,14 @@
       <label class="pill" data-cfg="auto_memorize"><i class="sw"></i>自动记忆</label>
       <label class="pill" data-cfg="code_auto_route" title="写代码或写长文时，自动换用专用模型（qwen2.5-coder，非思考型，更稳更快）"><i class="sw"></i>专用模型</label>
       <label class="pill" data-cfg="code_exec_enabled" title="让模型在本机真跑 Python 把结果算出来（默认关闭；开启后模型写的代码会在你电脑上执行）"><i class="sw"></i>本地算代码</label>
-      <!-- 询问模式：二选一（不是开关）。
+      <!-- 询问方式：**一个按钮**，按钮上直接显示当前选的是哪种，点开可切换。
            ⚠️ 故意**不加 data-cfg** —— 那条规则会把 .pill[data-cfg] 当成布尔开关处理
-           （`p.onclick` 被覆盖成 toggle + saveToggles），两选一的控件套进去会互相打架。
-           这里用 data-askmode，由 app.js 单独绑定。 -->
-      <span class="pill askmode" data-askmode="quick" title="只问最关键的 1~3 个问题，拿到基本信息就开工（默认）">💬 快速询问</span>
-      <span class="pill askmode" data-askmode="deep" title="问题个数不限、可以分多轮，把关键信息问透再动手 —— 想做出来的东西越复杂，越建议开这个">🔍 深度询问</span>
+           （`p.onclick` 被覆盖成 toggle + saveToggles），二选一的控件套进去会互相打架。
+           这里由 app.js 的 showAskModePicker() 单独接管。
+           用户 2026-09-22：原来是「快速询问 / 深度询问」两个按钮并排，
+           要求合并成一个「询问方式」按钮，并在按钮里显示当前选择。 -->
+      <button type="button" class="pill pill-btn askmode-btn" id="askModeBtn"
+              title="模型在动手前会问你多少问题：快速了解 = 只问最关键的几条；深度询问 = 分多轮把关键信息问透。点这里切换（下一次提问生效）。">询问方式：快速</button>
       <!-- 模型**全自动选择**，这里不放选择器。
            一度加过"手动指定模型"的下拉，用户试用后反馈：
            "算了，我还是想要自动选择，手动太麻烦了" —— 于是移除。

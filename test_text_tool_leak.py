@@ -117,6 +117,41 @@ def main():
           and "workspace_write" not in clean2, repr(clean2[:60]))
     check("没有把它当成有效调用执行", _c2 == [], str(_c2))
 
+    # ---------------- ③b 没闭合的围栏：标记本身也要删干净 ----------------
+    # ⚠️ 2026-09-22 回放真实会话 `sessions/mode-quick.json` 发现的残留：
+    #    模型写完 JSON 就直接接着写正文（没有收尾的 ```），而 `_TOOL_FENCE_RE`
+    #    要求有收尾符所以匹配不到 → 正文里冒出一行孤零零的 ```tool。
+    #    修法是兜底删掉这个标记，**但不吞后面的正文**（模型后面写的往往是正常内容）。
+    print("\n③b 没有收尾 ``` 的围栏：标记不能留在正文里，但后面的正文要保住")
+    unclosed = ("明白了，我们先把代码写进文件：\n\n### 步骤 2: 写前端页面\n\n"
+                "```tool\n"
+                '{"name": "workspace_write", "arguments": {"rel": "static/index.html", '
+                '"text": "<!DOCTYPE html>"}}\n'
+                "好的，接下来我们运行这个 FastAPI 应用。\n")
+    _c4, clean4 = M._split_text_tool_calls(unclosed)
+    check("围栏标记不再残留在正文里", "```tool" not in clean4, repr(clean4[-80:]))
+    check("那坨 JSON 也不见了",
+          '"arguments"' not in clean4 and "workspace_write" not in clean4)
+    check("⚠️ 围栏后面的正文被保住（不能整段吞掉）",
+          "接下来我们运行这个 FastAPI 应用" in clean4, repr(clean4[-60:]))
+    check("前面的正文也还在", "步骤 2" in clean4)
+
+    # ---------------- ③c 开头那截"写到一半放弃"的裸调用残片 ----------------
+    # ⚠️ 2026-09-22 实机复现：模型起了个头 `{"name` 就改成正常说话，
+    #    既解析不出调用（不是合法 JSON），扣住的尾巴又会被原样补发 →
+    #    用户看到的回答变成「{"name您好！我是……」。
+    print("\n③c 开头的裸调用残片要删掉，但用户要的 JSON 不能动")
+    deb = '{"name您好！我是本地助手，可以帮你处理这些事情。'
+    _c5, clean5 = M._split_text_tool_calls(deb)
+    check("残片被删掉", clean5.startswith("您好"), repr(clean5[:30]))
+    check("正文一点没少", "我是本地助手" in clean5)
+    js = '{"name": "张三", "age": 20, "city": "广州"}'
+    _c6, clean6 = M._split_text_tool_calls(js)
+    check("⚠️ 用户要的合法 JSON 原样保留", '"name"' in clean6, repr(clean6[:40]))
+    js2 = '{"name": "张三",\n "age": 20}'
+    _c7, clean7 = M._split_text_tool_calls(js2)
+    check("⚠️ 多行的合法 JSON 也不动", '"name"' in clean7, repr(clean7[:40]))
+
     # ---------------- ④ 别误删正常 JSON ----------------
     print("\n④ 正常 JSON 数据不能被误删")
     data = ("这是接口返回：\n\n```json\n{\"name\": \"张三\", \"age\": 20}\n```\n\n"

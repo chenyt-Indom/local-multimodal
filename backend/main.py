@@ -130,10 +130,116 @@ except Exception:
 
 
 def _now_str() -> str:
-    """返回本地当前时间的中文描述，供注入系统提示，让模型具备时间感知。"""
+    """返回本地当前时间的中文描述，供注入对话，让模型具备时间感知。"""
     now = datetime.datetime.now()
     wd = "一二三四五六日"[now.weekday()]
     return f"{now.year}年{now.month}月{now.day}日（星期{wd}），{now.strftime('%H:%M:%S')}"
+
+
+def _memory_ctx(session: str, last_user_text: str, cfg: dict) -> str:
+    """组装要注入的**记忆**内容（长期+短期 + 目标/计划的用法说明）。
+
+    ⚠️⚠️ 这段**不能放进系统提示**（2026-09-22 实测）：
+
+    系统提示渲染在**工具定义之前**，所以系统提示里任何一处变化，都会让它后面的
+    整段（38 个工具定义 ≈ 13000 token）一起作废，Ollama 只能整份重新预填充
+    （~10 秒）。而记忆恰好是"每轮都会变"的：
+
+      · 后台的记忆提炼**每一轮都可能改写短期记忆**；
+      · 换一个对话（session）就是另一份短期记忆。
+
+    实测（同一会话连问 5 轮，每轮之间等 14 秒让提炼跑）：
+    首字 15.2s / 17.4s / 15.4s / **0.78s** / 17.3s —— 只要记忆被改写就打回原形。
+
+    所以改由 `_attach_live_ctx` 挂到**最后一条用户消息**上（排在工具定义之后）。
+    返回空串表示没有可注入的记忆。
+    """
+    if not (cfg or {}).get("memory_enabled", True):
+        return ""
+    try:
+        ctx = memory.build_context(session, query=last_user_text)
+    except Exception:
+        logger.warning("读取记忆失败（本轮不注入）", exc_info=True)
+        return ""
+    if not ctx:
+        return ""
+    # 目标/计划类记忆的用法：当背景用，别当催命符；有进展就更新。
+    return ctx + "\n\n" + (
+        "【关于记忆里的目标与计划】\n"
+        "- 记忆里可能有用户的目标、计划、答应过要做的事。把它们当**已知背景**，\n"
+        "  不要每轮都追问进展，也不要每次回答都提一遍。\n"
+        "- 但话题相关时可以自然地关心一句，或提醒关键时间点（临近报名/考试/截止）。\n"
+        "- 用户说「做完了 / 没做成 / 改主意了 / 不打算做了」时，**立刻更新记忆**：\n"
+        "  用 remember 工具，action=\"update\"，old 填记忆里的原句，content 填最新状态；\n"
+        "  彻底放弃的用 action=\"forget\" 删掉。**别让档案里留着过期目标。**\n"
+        "- 用户透露**新目标**时，除了记进记忆，还要给**可执行的规划建议**：\n"
+        "  拆成几步、每步做什么、大致什么时间做，并指出最容易卡住的地方。\n"
+        "  不要只说「加油」「坚持就是胜利」这种空话。")
+
+
+def _attach_live_ctx(working: list, *, digest: str = "", mem_ctx: str = "",
+                     rag_ctx: str = "") -> list:
+    """把**每轮会变的**内容（历史摘要/记忆/知识库检索/当前时间）挂到**最后一条用户消息**上。
+
+    返回一份新列表；`working` 本身不动。
+
+    ⚠️⚠️ 为什么这些内容不能放进系统提示 —— 2026-09-22 实测出来的
+    「发出去半天没反应」的根因：
+
+    Ollama 的前缀缓存按 **token 前缀**复用 KV 缓存。而系统提示渲染在
+    **工具定义之前**（qwen 模板把 tools 拼在第一条 system 里），所以系统提示里
+    任何一处变化，**它后面的整段（含 38 个工具定义 ≈ 13000 token）全部作废**。
+    而系统提示里恰好塞了四样「每轮都会变」的东西：
+
+      ① 第一行是「当前时间：…HH:MM:SS」（带秒）→ 每个 token 都变；
+      ② 知识库材料（RAG）是**按本轮问题检索**的 → 换一个问题就不同；
+      ③ 记忆会被后台提炼**每轮改写** → 同一会话里也会不停变；
+      ④ 历史摘要会随上下文裁剪而变。
+
+    后果（Ollama 日志原文，实跑取证）：
+      · `f_sim_best = 0.18` —— 只认出 18% 的公共前缀，几乎等于没命中；
+      · `prompt eval time = 10607 ms / 19837 tokens` —— **10.6 秒全花在重算前缀上**。
+
+    把这些内容挪到**最后一条用户消息**里，它就排在「系统提示 + 工具定义」**之后**，
+    那一大段稳定前缀就能一直被复用。实测（同一台机器，修复前后）：
+      · 换问题（知识库开着）：首字 11.1s → **0.2s 量级**
+      · 同一句话连发：11.6s → **0.12s**
+      · 同一会话连问 5 轮（记忆被改写）：15~17s → **0.2~0.8s**
+
+    ⚠️ 必须**复制**一条消息再改：`working` 与落盘用的历史共享同一批 dict，
+    原地改会把记忆/检索材料/时间戳写进聊天记录（越积越多、还会污染后续轮次）。
+    """
+    out = list(working)
+    for i in range(len(out) - 1, -1, -1):
+        if out[i].get("role") != "user":
+            continue
+        m = dict(out[i])
+        q = str(m.get("content") or "")
+        blocks = []
+        if digest:
+            blocks.append("【较早对话的摘要】（更早的内容已被折叠，"
+                          "需要细节就问用户）\n" + digest)
+        if mem_ctx:
+            blocks.append(mem_ctx)
+        if rag_ctx:
+            blocks.append(rag_ctx)
+            # ⚠️ 必须点明"这是文档、不是用户本人"：实测（2026-09-22）知识库里那份
+            #    《入团申请书》里有个学生名字，模型随后写旅行攻略时把它当成了**用户的名字**
+            #    （标题写成「【某某某专属版】」）。资料来自用户导入的文档，
+            #    里面的人物不等于用户本人。
+            blocks.append("（以上是系统按你的问题自动检索到的**文档资料**，"
+                          "来自用户导入的文件 —— **不等于用户本人的情况**，"
+                          "别把它里面的人名/身份当成用户的；"
+                          "请优先依据它作答并注明出自哪一篇；"
+                          "与问题无关就忽略，不要硬扯。）")
+        if blocks:
+            blocks.append("【用户这一轮说的话】")
+        blocks.append(q)
+        blocks.append("\n\n（当前时间：" + _now_str() + "）")
+        m["content"] = "\n\n".join(blocks)
+        out[i] = m
+        break
+    return out
 
 
 # 简单问题识别：命中则收紧生成长度，避免模型对"你好"这类问题长篇思考。
@@ -1297,9 +1403,16 @@ _CODE_WEAK = (
 # ⚠️ "报错 / 错误" **不能放在动作词里** —— 它们是"现象描述"不是"动作"，
 # 否则「为什么会报错」会同时命中 weak 与 actions，又被判成代码任务。
 # 「帮我修一下这个报错」里有 "帮我" 兜着，不会漏。
+# ⚠️ 「帮我 / 给我 / 生成 / 完成」**已经从动作词里拿掉**（2026-09-22 实测）。
+#
+# 它们不是"代码动作"，而是**通用请求标记** —— 任何一个客气的请求都带一个，
+# 配上 `_CODE_WEAK` 里的常用术语就必然误判。实测用户原话：
+#   · 「帮我用一句话**解释**什么是向量**数据库**」→ "帮我"+"数据库" → 判成写代码 ❌
+#   · 「再帮我说说它和普通**数据库**的区别」    → 同上 ❌
+# 后果不只是"模型选错"，而是**换模型要卸载/重载数 GB 的模型**：
+# 实测这几轮的 Ollama 侧耗时 15~17 秒，而同一模型连着的下一轮只要 0.7 秒。
 _CODE_ACTIONS = (
-    "写", "改", "实现", "调试", "运行", "跑", "修复", "优化",
-    "生成", "帮我", "给我", "补全", "完成",
+    "写", "改", "实现", "调试", "运行", "跑", "修复", "优化", "补全",
 )
 
 # "接着上一轮继续改"的意图词 —— 用来判断"上一轮写过代码，这轮还在改它"。
@@ -1315,10 +1428,24 @@ _CONTINUE_HINTS = (
 # 「我想要个记账的小程序」。光靠上面那两张技术词表，这类请求**一个都匹配不上**，
 # 会被送到**思考型默认模型**上 —— 实测「帮我做一个小网页，番茄钟」跑了 7 分钟
 # 还没出结果（GPU 一直 97% 在"思考"），因为思考型模型既慢又不擅长写代码。
-# 规则：**造东西的动作（或明确的"我想要"） + 软件类产物名词** → 当成代码任务。
+# ⚠️ 规则：**"求你做"的措辞（或明确的"我想要"） + 软件类产物名词** → 当成代码任务。
 # 只留明确的软件产物，别放「清单/表格/方案」这类也能是文档的词（会误切）。
-_BUILD_VERBS = ("做", "写", "实现", "开发", "搭", "搞", "弄", "生成", "编",
-                "想要", "我要", "要个", "来个")
+#
+# ⚠️⚠️ 这里原来是一串**光杆动词**（"做/写/搞/弄/生成…"），2026-09-22 发现它会误判：
+#   用户原话「你好，我叫陈工，**在做**本地 AI **应用**」
+#   —— 只是在**介绍自己的背景**，却因为句子里有"做"和"应用"被判成写代码，
+#      切到 14B 代码模型 → 卸载/重载 15 秒。
+#   所以改成**只认"请求式"搭配**：光杆动词不算，要么有"帮我/给我/我想…"这类求助口气，
+#   要么是"做个 / 写个 / 搞个 / 搭个"这种**动词紧跟量词**的造物口吻。
+#   「在做本地 AI 应用」里没有"做个"，也不带求助口气 → 不再命中。
+_BUILD_REQ = (
+    # 求助 / 意愿口气
+    "帮我", "给我", "帮忙", "麻烦", "能不能", "可不可以", "我要", "我想要", "想要",
+    # 动词 + 量词（造物口吻）。⚠️ 别写成光杆动词，那样"在做 xx 应用"也会中
+    "做个", "做一个", "做个一", "写个", "写一个", "搞个", "搞一个", "弄个", "弄一个",
+    "搭个", "搭一个", "建个", "建一个", "编个", "编一个", "生成个", "生成一个",
+    "开发个", "开发一个", "实现个", "实现一个", "来个", "来一个", "要个", "要一个",
+)
 _PRODUCT_NOUNS = (
     "网页", "页面", "网站", "小程序", "应用", "软件", "工具", "脚本",
     "程序", "插件", "组件", "界面", "面板", "游戏", "app", "exe",
@@ -1337,8 +1464,9 @@ def _is_code_task(text: str) -> bool:
     if any(k in t for k in _CODE_WEAK):
         return any(a in t for a in _CODE_ACTIONS)
     # 大白话的造物需求：「帮我做个小网页」「我想要个记账的小程序」
-    # （没有技术词，但有"做/写/搞…" + 软件类产物）
-    if any(k in t for k in _PRODUCT_NOUNS) and any(k in t for k in _BUILD_VERBS):
+    # （没有技术词，但要有**求助口气或"做个/写个"这类造物口吻** + 软件类产物）
+    # ⚠️ 判据见 _BUILD_REQ 的说明：光杆动词会误伤"我在做 xx 应用"这种自我介绍。
+    if any(k in t for k in _PRODUCT_NOUNS) and any(k in t for k in _BUILD_REQ):
         return True
     return False
 
@@ -1452,6 +1580,10 @@ _TEXT_TOOL_RE = re.compile(r"```(?:tool|tool_call|json)?[ \t]*\r?\n(.*?)```", re
 #    `json` 不能算进来：模型写 .json 文件、贴接口返回时也用它，
 #    误删就是把用户要的内容吃掉了（见 _split_text_tool_calls 的说明）。
 _TOOL_FENCE_RE = re.compile(r"```(?:tool|tool_call)[ \t]*\r?\n(.*?)```", re.S)
+# ⚠️ 配套的"**没闭合**"版：只匹配那行标记本身（不含内容），用来清理残留。
+#    见 _split_text_tool_calls 里 ① 的兜底说明 —— 流被截断时收尾的 ``` 永远等不到，
+#    只靠上面那条正则会留下一行孤零零的 ```tool 在正文里。
+_TOOL_FENCE_OPEN_RE = re.compile(r"```(?:tool|tool_call)[ \t]*\r?\n?")
 
 # ---------- 「调用壳子」：模型自己带上的 XML 包装 ----------
 # ⚠️ 这不是我们教的格式（我们教的是 ```tool 围栏），是模型从别处学来的习惯。
@@ -1708,6 +1840,11 @@ _LEAK_MARKS = ("```tool", "```tool_call",
 # ⚠️ 只认"开头"，不认"中间" —— 正文中间出现 {"name": …} 多半是在讲接口，扣住会毁掉流式。
 _CALL_HEAD_RE = re.compile(
     r'^\s*\{\s*"(?:name|tool|function|arguments|parameters|args|input)"\s*:', re.I)
+# 同一个"调用形状"的开头，但**不要求有冒号、也不要求引号闭合** ——
+# 用来认"写到一半放弃"的残片（实测模型会只写 `{"name` 就改口说人话，
+# 连 `name` 后面的引号都没写）。见 _strip_call_head_debris。
+_CALL_HEAD_ANY_RE = re.compile(
+    r'^\s*\{\s*"(?:name|tool|function|arguments|parameters|args|input)"?', re.I)
 
 # 文本工具名 → 真实工具名（save_file 其实就是 library 的 write 动作）
 _TEXT_TOOL_ALIAS = {"save_file": "library"}
@@ -1938,6 +2075,30 @@ def _calls_from_body(body: str, allowed=None):
     return out
 
 
+def _strip_call_head_debris(text: str) -> str:
+    """删掉正文**开头**那截"写到一半放弃"的裸调用残片。
+
+    实测（2026-09-22）：模型想调工具，起了个头 `{"name` 之后就改成正常说话了 ——
+    既解析不出调用（不是合法 JSON），扣住的尾巴又会被原样补发，
+    于是用户看到的回答变成「{"name您好！我是……」这种，前面糊了一截乱码。
+
+    ⚠️ 判据必须**两条同时满足**才敢删，否则会把用户要的 JSON 吃掉：
+      ① 以 `{"name"` 这类调用键开头；
+      ② **整段不是合法 JSON**，且残片后面紧跟**中文**（JSON 里不可能出现中文标点之外的裸中文键外内容）。
+    用户要一段 JSON 示例时，整段是合法 JSON → 条件 ② 不成立 → 原样保留。
+    """
+    t = text or ""
+    m = _CALL_HEAD_ANY_RE.match(t)
+    if not m:
+        return t
+    if _loads_lenient(t) is not None:      # 整段是合法 JSON → 是用户要的内容
+        return t
+    rest = t[m.end():]
+    if rest[:1] and ("\u4e00" <= rest[0] <= "\u9fff"):
+        return rest.lstrip()
+    return t
+
+
 def _split_text_tool_calls(text: str, allowed=None, bare: bool = True):
     """从正文里拆出**所有**「泄漏成文本的工具调用」。
 
@@ -1958,6 +2119,10 @@ def _split_text_tool_calls(text: str, allowed=None, bare: bool = True):
     raw = text or ""
     if not raw:
         return [], raw
+    # ⚠️ 先摘掉**开头那截裸调用残片**（见 _strip_call_head_debris）：
+    #    它不含任何标记（连 `"name"` 的闭合引号都没有），下面的快路径判据
+    #    全都认不出来，会直接原样返回 —— 所以必须在快路径**之前**处理。
+    raw = _strip_call_head_debris(raw)
     # ⚠️ 快路径要同时看**三个**标记，不能只看 `"name"`：
     #    模型经常只吐一对**空的** ```tool（或空的 <function-call></function-call>）
     #    当分隔符（整段正文里一个 "name" 都没有），那种也必须删掉 ——
@@ -1996,6 +2161,15 @@ def _split_text_tool_calls(text: str, allowed=None, bare: bool = True):
                 # 解析不出来 = 这个调用**没有执行**。别静默 —— 记下来好排查
                 # （否则现象是"我明明调了工具，怎么没反应"，日志里一个字都没有）。
                 logger.warning("[text-tool] 工具块解析失败、已跳过：%s", body[:160])
+        # ⚠️⚠️ **没闭合的围栏**（流被截断、或模型写完 JSON 就直接接着写正文）：
+        #    上面的 `_TOOL_FENCE_RE` 要求有收尾的 ```，匹配不到 → 那个 "```tool"
+        #    标记会**原样留在正文里**。实测（2026-09-22 回放真实会话
+        #    `sessions/mode-quick.json`）：正文里冒出一行孤零零的 ```tool。
+        #    这里兜底把残留的标记行删掉。
+        #    ⚠️ 只删**标记本身**、绝不吞后面的正文 —— 实测模型常常在 JSON 之后
+        #       继续写正常内容（"…接下来我们运行这个应用"），整段截掉会误删用户要的东西。
+        if _TOOL_FENCE_OPEN_RE.search(cleaned):
+            cleaned = _TOOL_FENCE_OPEN_RE.sub("", cleaned)
 
     # ①.5 XML 包装的（<function-call>…</function-call> / <tool_call>…</tool_call>）
     #     ⚠️ 这是默认模型偶尔会用的写法（2026-09-21 用户反馈），
@@ -2051,7 +2225,7 @@ def _split_text_tool_calls(text: str, allowed=None, bare: bool = True):
             cleaned = _TOOL_ECHO_BLOCK_RE.sub("", cleaned)
 
     if calls:
-        return calls, cleaned.strip()
+        return calls, _strip_call_head_debris(cleaned).strip()
 
     # ③ 代码轮：宽松的裸 JSON 扫描（那轮模型本来就是把调用当 JSON 吐在正文里）
     #    ⚠️ 这条路在聊天轮**不能开**：正文里贴接口返回、写 .json 文件都会长这样，
@@ -2075,7 +2249,7 @@ def _split_text_tool_calls(text: str, allowed=None, bare: bool = True):
                             calls.append(call)
                             cleaned = cleaned.replace(seg, "")
                         break
-    return calls, cleaned.strip()
+    return calls, _strip_call_head_debris(cleaned).strip()
 
 
 def _safe_emit_len(text: str, marks=None) -> int:
@@ -2538,9 +2712,20 @@ class _SystemPrompt:
               no_tools: bool = False):
         cfg = config.load_config()
         parts = [
-            # 时间感知：让模型始终知道"今夕是何年何时"，避免说"不知道今天日期"
-            "当前时间：" + _now_str(),
+            # ⚠️⚠️ **系统提示的第一行必须是「稳定不变」的内容。**
+            # 这里原来放的是「当前时间：…HH:MM:SS」（带秒）—— 结果每发一条消息，
+            # 提示词的**第一个 token 就变了**，Ollama 的前缀缓存（KV 复用）**永远命不中**，
+            # 于是每一轮都要把整份提示词重新预填充一遍。
+            # 实测（2026-09-22，Qwen3-VL:8B / RTX 5070 Ti）：
+            #   提示词 19863 token（其中工具定义 38 个 ≈ 13029 token），
+            #   Ollama 侧 `prompt eval time = 10607 ms / 19837 tokens` ——
+            #   **10.6 秒全在重算前缀**，用户看到的就是"发出去半天没反应"。
+            # 现在把时间挪到**最后一条用户消息的末尾**（见 _attach_live_ctx），
+            # 它排在「系统提示 + 工具定义」之后，大段稳定前缀就能被缓存复用。
             "你是本地多模态助手，像一位能干的项目助理。你的所有处理都在用户本机完成，注意保护隐私。",
+            # 告诉模型时间去哪儿找（这句本身是稳定的，不会破坏缓存）
+            "需要知道「现在几点/今天几号」时，看**用户消息末尾附的「当前时间」**，"
+            "或调用 get_time 工具；不要凭训练数据猜日期。",
             "你可以调用以下工具来完成具体任务，而不仅是空谈：\n"
             "- 视觉识别（直接看，不要调用工具）：当图片/视频已经附在当前对话中（用户拖入/上传），直接用你自身的多模态视觉能力识别、描述或分析其内容即可，绝对不要为「看图」调用任何工具。只有以下四种情况才需要调用工具：\n"
             "  ① 用户想要**真实存在**的图片，如「找张 xx 的图」「搜一下 xx 图片」「xx 长什么样」「来点 xx 壁纸」→ 调用 web_image_search（到网上搜索现成的真实图片）；\n"
@@ -2678,22 +2863,10 @@ class _SystemPrompt:
         ]
         # 长期记忆：**只注入当前对话的那一块** + 极简全局偏好。
         # 对话之间互不相通 —— 切到别的对话就换一份记忆。
-        if cfg.get("memory_enabled", True):
-            ctx = memory.build_context(session, query=last_user_text)
-            if ctx:
-                parts.append(ctx)
-                # 目标/计划类记忆的用法：当背景用，别当催命符；有进展就更新。
-                parts.append(
-                    "【关于记忆里的目标与计划】\n"
-                    "- 记忆里可能有用户的目标、计划、答应过要做的事。把它们当**已知背景**，\n"
-                    "  不要每轮都追问进展，也不要每次回答都提一遍。\n"
-                    "- 但话题相关时可以自然地关心一句，或提醒关键时间点（临近报名/考试/截止）。\n"
-                    "- 用户说「做完了 / 没做成 / 改主意了 / 不打算做了」时，**立刻更新记忆**：\n"
-                    "  用 remember 工具，action=\"update\"，old 填记忆里的原句，content 填最新状态；\n"
-                    "  彻底放弃的用 action=\"forget\" 删掉。**别让档案里留着过期目标。**\n"
-                    "- 用户透露**新目标**时，除了记进记忆，还要给**可执行的规划建议**：\n"
-                    "  拆成几步、每步做什么、大致什么时间做，并指出最容易卡住的地方。\n"
-                    "  不要只说「加油」「坚持就是胜利」这种空话。")
+        #
+        # ⚠️⚠️ 这块**不在这里拼**了 —— 见 `_memory_ctx()` 的说明：
+        # 记忆每轮都可能被后台提炼改写，放在系统提示里会让整段前缀（含工具定义）
+        # 每轮作废、重算 10 秒。现在由 `_attach_live_ctx` 挂到最后一条用户消息上。
         # 用户拖进来的文档：正文直接给模型，让它能针对内容回答
         if docs:
             blocks, budget = [], 60000      # 总字数上限，避免把上下文撑爆
@@ -2712,11 +2885,18 @@ class _SystemPrompt:
                     "【用户本轮拖入的文档】—— 请**直接依据这些内容**回答；"
                     "用户问文档里的事时不要说自己看不到文件，也不要凭空编造文中没有的内容：\n\n"
                     + "\n\n---\n\n".join(blocks))
-        # RAG 知识库
-        if cfg.get("rag_enabled"):
-            ctx = kb.build_rag_context(last_user_text, top_k=cfg.get("rag_top_k", 4))
-            if ctx:
-                parts.append(ctx)
+        # ⚠️⚠️ RAG 知识库材料**不能放在这里**（系统提示 = 缓存前缀里）。
+        #
+        # `kb.build_rag_context(last_user_text, ...)` 是**按本轮问题检索**的 ——
+        # 用户每换一个问题，检索到的资料就不同，于是系统提示在第 6000 字左右分叉，
+        # 它后面的**全部内容（含 38 个工具定义 ≈ 13000 token）一起作废**，
+        # Ollama 只能整份重新预填充。
+        # 实测（2026-09-22）：直连 Ollama 固定 system+tools 只换问题时，预填充 0.03s（缓存命中）；
+        # 而走应用时 Ollama 日志是 `f_sim_best = 0.18`（只认出 18% 的公共前缀）、
+        # `prompt eval time = 10607 ms / 19837 tokens` —— 每次都从零算，10.6 秒。
+        #
+        # 现在改由 `_attach_live_ctx` 挂到**最后一条用户消息**上（排在工具定义之后），
+        # 系统提示 + 工具定义这一大段就恒定不变了，缓存能一直命中。
         parts.append("回答请使用中文，简洁、直接、可执行。")
         if no_tools:
             # ⚠️ **必须把工具说明整段摘掉，光追加一句"没有工具"不够。**
@@ -3063,7 +3243,7 @@ async def chat(req: ChatRequest):
         "- 长期记忆与知识库检索到的东西同理：**只在与本轮问题确实相关时才用**，"
         "不相关就别往回答里塞（塞了只会显得答非所问）。\n"
         "- 如果你觉得用户这句话是在指**更早**聊过的东西（不在你能看到的最近几轮里）："
-        "先去系统提示里的**历史摘要 / 长期记忆**找，再决定；"
+        "先去**记忆**（在用户消息里）或**历史摘要**里找，再决定；"
         "实在找不到就别硬猜，用 ask_user 问一句「你是指之前聊的 XX 吗？」。\n")
     # 长文创作（作文/方案/报告…）：这一轮只需要"问细节"和"存文件"两个工具，
     # 其余 schema 全砍掉，把省下的额度让给正文；同时把输出上限提上去。
@@ -3111,7 +3291,19 @@ async def chat(req: ChatRequest):
     # 曾经的写法是裁剪后直接覆盖 messages，结果每次落盘都只存下裁剪后的部分，
     # 早期对话被永久删除（重启后恢复出来就是残的）。裁剪只影响"这一轮发给模型什么"。
     all_messages = list(messages)
-    messages, dropped = _trim_history_to_budget(messages, sys_prompt, tool_schemas, cfg)
+    # ⚠️ 记忆 / 知识库材料现在挂在**用户消息**上（见 _attach_live_ctx），
+    #    但它们同样要占上下文额度 —— 预算里必须算进去，否则会撑爆窗口。
+    mem_ctx = _memory_ctx(session, last_user, cfg)
+    rag_ctx = ""
+    if cfg.get("rag_enabled"):
+        try:
+            rag_ctx = kb.build_rag_context(last_user,
+                                           top_k=cfg.get("rag_top_k", 4)) or ""
+        except Exception:
+            logger.warning("知识库检索失败（本轮忽略）", exc_info=True)
+            rag_ctx = ""
+    budget_sys = sys_prompt + "\n\n" + mem_ctx + "\n\n" + rag_ctx
+    messages, dropped = _trim_history_to_budget(messages, budget_sys, tool_schemas, cfg)
     digest = _history_digest(dropped)
 
     # 联网搜索：以前这里会**预先**跑一次搜索并把结果塞进上下文，
@@ -3133,7 +3325,9 @@ async def chat(req: ChatRequest):
         # 工具执行期间要能**实时**把弹窗推给前端，所以单独开一个队列
         loop = asyncio.get_running_loop()
         live_ui: asyncio.Queue = asyncio.Queue()
-        full_sys = sys_prompt + ("\n\n" + digest if digest else "")
+        # ⚠️ 历史摘要**不能并进系统提示** —— 它会随上下文裁剪而变，
+        #    同样会把它后面的工具定义一起废掉（见 _attach_live_ctx 的说明）。
+        full_sys = sys_prompt
         # 代码模型走不了原生工具通道 → 改用它能用的"文本协议"（见 _split_text_tool_call）
         code_text_tools = _code_text_tools(cfg) if code_model_on else {}
         if code_model_on:
@@ -3296,7 +3490,12 @@ async def chat(req: ChatRequest):
                 "\n· 尽量只用标准库（沙箱里的第三方库不保证装全）。"
                 "\n· 网页类产物：写成**单个自包含的 .html**（样式和脚本都内联），"
                 "用户双击就能用，别引用外部 CDN。")
-        working = [{"role": "system", "content": full_sys}] + messages
+        # ⚠️ 记忆、知识库检索、当前时间、历史摘要都挂到**最后一条用户消息**上
+        #    （见 _attach_live_ctx）：它们都是"每轮都会变"的内容，放进系统提示
+        #    会把后面的工具定义一起废掉，导致 Ollama 每轮重算 ~10 秒。
+        #    放在稳定前缀之后，缓存才能一直命中。
+        working = _attach_live_ctx([{"role": "system", "content": full_sys}] + messages,
+                                   digest=digest, mem_ctx=mem_ctx, rag_ctx=rag_ctx)
         final_text = ""
         final_thinking = ""
         used_tools = set()          # 本轮真正调用过的工具（用来判断"是不是光嘴上说说"）
@@ -4374,14 +4573,59 @@ async def ide_run_in_terminal(body: dict):
     return r
 
 
+def _warm_models(models: list) -> None:
+    """后台把模型拉进显存（空 prompt + 保活），失败只记日志、不影响使用。"""
+    import urllib.request as _u
+    try:
+        cfg = config.load_config() or {}
+    except Exception:
+        cfg = {}
+    base = str(cfg.get("ollama_url") or "http://127.0.0.1:11434").rstrip("/")
+    keep = str(cfg.get("model_keep_alive") or "30m")
+    for m in models:
+        try:
+            raw = json.dumps({"model": m, "prompt": "", "stream": False,
+                              "keep_alive": keep,
+                              "options": {"num_predict": 1}}).encode()
+            req = _u.Request(base + "/api/generate", data=raw,
+                             headers={"Content-Type": "application/json"})
+            _u.urlopen(req, timeout=600).read()
+            logger.info("已预热模型 %s", m)
+        except Exception as e:
+            # 预热失败无所谓（模型没下载/显存不够），真正请求时还会再试一次。
+            logger.warning("预热模型 %s 失败：%s", m, e)
+
+
+@app.on_event("startup")
+def _warmup_on_start():
+    """启动后**主动预热默认模型**，让用户的第一条消息不用等模型加载。
+
+    ⚠️ 为什么以前没有：之前这件事挂在"开发台"（studio.js）里，而开发台已整块移除，
+    于是 `/api/ws/warm` 成了一个**没人调用的死接口** —— 实测确认预热从未执行过
+    （`grep -rn "ws/warm" frontend/` 只剩 studio.js 一处，而它已不加载）。
+
+    只预热**默认模型**：显卡显存装不下默认模型 + 代码模型两个，
+    同时加载会溢出到内存，反而更慢。代码模型仍按需加载。
+    """
+    try:
+        cfg = config.load_config() or {}
+    except Exception:
+        cfg = {}
+    if not cfg.get("warmup_on_start", True):
+        return
+    m = str(cfg.get("default_model") or "").strip()
+    if m:
+        threading.Thread(target=_warm_models, args=([m],), daemon=True).start()
+
+
 @app.post("/api/ws/warm")
 def ws_warm(body: dict):
-    """**预热模型**：打开开发台时调一次，免得第一次写代码干等十几秒。
+    """**预热模型**（按需调用）：免得第一次写代码干等十几秒。
 
     实测冷启动那一下：代码模型要现加载，首字节能到 14 秒（界面上就是"没反应"）。
-    这里在后台用空 prompt 把它拉进显存并设 30 分钟保活，后面就是秒回。
+    这里在后台用空 prompt 把它拉进显存并按配置保活，后面就是秒回。
+    `body.model` 指定单个模型；不传则预热"代码模型 + 默认模型"。
     """
-    import urllib.request as _u
     try:
         cfg = config.load_config() or {}
     except Exception:
@@ -4391,23 +4635,7 @@ def ws_warm(body: dict):
         m for m in [cfg.get("code_model"), cfg.get("default_model")] if m]
     if not models:
         return {"ok": False, "error": "没有可预热的模型"}
-    base = str(cfg.get("ollama_url") or "http://127.0.0.1:11434").rstrip("/")
-    payloads = [json.dumps({"model": m, "prompt": "", "stream": False,
-                            "keep_alive": "30m",
-                            "options": {"num_predict": 1}}).encode()
-                for m in models]
-
-    def _job():
-        for m, raw in zip(models, payloads):
-            try:
-                req = _u.Request(base + "/api/generate", data=raw,
-                                 headers={"Content-Type": "application/json"})
-                _u.urlopen(req, timeout=600).read()
-                logger.info("已预热模型 %s", m)
-            except Exception as e:
-                logger.warning("预热模型 %s 失败：%s", m, e)
-
-    threading.Thread(target=_job, daemon=True).start()
+    threading.Thread(target=_warm_models, args=(models,), daemon=True).start()
     return {"ok": True, "models": models}
 
 

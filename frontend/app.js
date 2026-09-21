@@ -1096,30 +1096,91 @@
       }
     } catch {}
   }
-  // ---------- 询问模式：快速了解 / 深度询问 ----------
-  // 用户 2026-09-22：两种模式的区别只在"问到什么程度就动手"，
-  // **两种模式都不限制问题个数**（后端 ask_mode 注入系统提示，见 main.py）。
+  // ---------- 询问方式：快速了解 / 深度询问 ----------
+  // 用户 2026-09-22：
+  //   · 两种模式的区别只在"问到什么程度就动手"，**两种模式都不限制问题个数**
+  //     （后端 ask_mode 注入系统提示，见 main.py 的 _ask_mode_line）；
+  //   · 前端原来并排两个按钮，要求**合并成一个「询问方式」按钮**，
+  //     并把当前选择直接显示在按钮上。
+  const ASK_MODES = {
+    quick: {
+      name: "快速",
+      full: "快速了解",
+      desc: "只问最关键的 1~3 个问题，拿到基本信息就开工；"
+          + "剩下的按最合理的默认做，并在结果里说明替你假设了什么。",
+    },
+    deep: {
+      name: "深度",
+      full: "深度询问",
+      desc: "问题个数不限、可以分多轮，把关键信息问透再动手。"
+          + "想做的东西越复杂，越建议用这个。",
+    },
+  };
+  let askMode = "quick";                       // 当前选择（唯一事实来源）
+
+  function askModeLabel() {
+    return "询问方式：" + (ASK_MODES[askMode] || ASK_MODES.quick).name;
+  }
   function setAskMode(mode) {
-    document.querySelectorAll(".pill.askmode").forEach((p) => {
-      p.classList.toggle("on", p.dataset.askmode === mode);
-    });
+    askMode = ASK_MODES[mode] ? mode : "quick";
+    const b = document.getElementById("askModeBtn");
+    if (b) {
+      b.textContent = askModeLabel();
+      // 深度模式给个视觉标记（开着 accent 色），一眼能看出不是默认档
+      b.classList.toggle("on", askMode === "deep");
+    }
   }
   async function saveAskMode(mode) {
     setAskMode(mode);
     try {
-      await api("/api/config", { method: "POST", body: JSON.stringify({ ask_mode: mode }) });
-      showToast(mode === "deep"
+      await api("/api/config", { method: "POST", body: JSON.stringify({ ask_mode: askMode }) });
+      showToast(askMode === "deep"
         ? "已切到「深度询问」：模型会把关键信息问透再动手"
-        : "已切到「快速询问」：模型只问最关键的几条", "ok");
+        : "已切到「快速了解」：模型只问最关键的几条", "ok");
     } catch (e) {
       showToast("切换失败：" + String(e.message || e), "warn");
     }
   }
-  // ⚠️ 单独绑定：**不能**并入上面的 .pill[data-cfg] 遍历 ——
-  //    那条会把 onclick 覆盖成"布尔开关 + saveToggles"，两选一的控件会互相打架。
-  document.querySelectorAll(".pill.askmode").forEach((p) => {
-    p.onclick = () => saveAskMode(p.dataset.askmode === "deep" ? "deep" : "quick");
-  });
+  // 点按钮 → 弹一个小面板二选一（不新开页面、不占顶栏宽度）
+  function showAskModePicker() {
+    if (document.querySelector(".askmode-layer")) return;      // 防重复弹层
+    const layer = document.createElement("div");
+    layer.className = "confirm-layer askmode-layer";
+    const opts = Object.keys(ASK_MODES).map((k) => {
+      const m = ASK_MODES[k];
+      const on = k === askMode;
+      return '<button type="button" class="askmode-opt' + (on ? " on" : "") +
+        '" data-mode="' + k + '">' +
+        '<span class="askmode-mark">' + (on ? "●" : "○") + "</span>" +
+        '<span class="askmode-text"><b>' + m.full + "</b><em>" + m.desc + "</em></span>" +
+        "</button>";
+    }).join("");
+    layer.innerHTML =
+      '<div class="confirm-box askmode-box">' +
+      '<div class="confirm-title">💬 询问方式</div>' +
+      '<div class="sample-sub">决定模型在<b>动手之前</b>会问你多少问题。' +
+      '随时可以换，<b>下一次提问就生效</b>。</div>' +
+      opts +
+      '<div class="confirm-btns">' +
+      '<button class="btn primary askmode-close" type="button">完成</button>' +
+      "</div></div>";
+    document.body.appendChild(layer);
+
+    const close = () => layer.remove();
+    layer.querySelector(".askmode-close").onclick = close;
+    layer.addEventListener("click", (e) => {
+      if (e.target === layer) close();          // 点遮罩关闭
+    });
+    layer.querySelectorAll(".askmode-opt").forEach((btn) => {
+      btn.onclick = async () => {
+        await saveAskMode(btn.dataset.mode);
+        close();
+      };
+    });
+  }
+  document.getElementById("askModeBtn") &&
+    (document.getElementById("askModeBtn").onclick = showAskModePicker);
+  window.__showAskMode = showAskModePicker;
   async function saveToggles() {
     const body = {
       memory_enabled: $('.pill[data-cfg="memory_enabled"]').classList.contains("on"),
@@ -1128,11 +1189,11 @@
       auto_memorize: $('.pill[data-cfg="auto_memorize"]').classList.contains("on"),
       code_auto_route: $('.pill[data-cfg="code_auto_route"]').classList.contains("on"),
       code_exec_enabled: $('.pill[data-cfg="code_exec_enabled"]').classList.contains("on"),
-      // ⚠️ 带上询问模式：否则用户改完模式、再点任意开关时，
+      // ⚠️ 带上询问方式：否则用户改完模式、再点任意开关时，
       //    保存的 body 里没有 ask_mode —— 后端只 merge 传了的键，本身不会丢，
       //    但两处状态容易不同步（这里显式带上，前端为准）。
-      ask_mode: document.querySelector('.pill.askmode[data-askmode="deep"]').classList.contains("on")
-        ? "deep" : "quick",
+      //    合并成一个按钮后，模式的唯一事实来源是 `askMode` 变量（不再从 DOM 反推）。
+      ask_mode: askMode,
     };
     await api("/api/config", { method: "POST", body: JSON.stringify(body) });
   }

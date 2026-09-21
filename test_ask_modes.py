@@ -140,21 +140,25 @@ _ = T.dispatch("ask_user", {"questions": [{"question": "x?"}]}, [],
 check("深度模式：弹框提示写明「深度询问」", "深度询问" in (hint.get("v") or ""), str(hint.get("v"))[:50])
 _ = T.dispatch("ask_user", {"questions": [{"question": "x?"}]}, [],
                {"ask": _grab, "ask_mode": "quick"})
-check("快速模式：弹框提示写明「快速询问」", "快速询问" in (hint.get("v") or ""), str(hint.get("v"))[:50])
+check("快速模式：弹框提示写明「快速了解」", "快速了解" in (hint.get("v") or ""), str(hint.get("v"))[:50])
 
-print("\n=== 前端：两个按钮 + 不能被当成布尔开关 ===")
-check("index.html 有「快速询问」按钮", 'data-askmode="quick"' in HTML)
-check("index.html 有「深度询问」按钮", 'data-askmode="deep"' in HTML)
-askmode_tags = [l for l in HTML.splitlines() if "data-askmode" in l]
-check("⚠️ 这两个按钮**不带 data-cfg**（否则会被当成布尔开关，两选一互相打架）",
-      all("data-cfg" not in l for l in askmode_tags))
-check("app.js 有独立的绑定与保存逻辑",
-      "setAskMode" in JS and "saveAskMode" in JS)
-check("app.js 单独遍历 .pill.askmode（没有混进 data-cfg 的遍历）",
-      '.pill.askmode' in JS)
+print("\n=== 前端：合并成一个「询问方式」按钮（用户 2026-09-22 要求）===")
+check("⚠️ 已不再并排两个按钮（data-askmode 痕迹清干净）", "data-askmode" not in HTML,
+      "index.html 里仍有 data-askmode")
+check("有一个按钮，id=askModeBtn", 'id="askModeBtn"' in HTML)
+check("按钮上写着「询问方式」", "询问方式" in HTML)
+btn_lines = [l for l in HTML.splitlines() if "askModeBtn" in l and "<button" in l]
+check("⚠️ 这个按钮**不带 data-cfg**（否则会被当成布尔开关，与 saveToggles 打架）",
+      bool(btn_lines) and all("data-cfg" not in l for l in btn_lines))
+check("按钮有默认文案（未读配置前也不会空着）", "询问方式：快速" in HTML)
+check("app.js 用 ASK_MODES 描述两种模式", "ASK_MODES" in JS)
+check("app.js 把当前选择写进按钮文字", "askModeLabel" in JS and "textContent" in JS)
+check("app.js 有选择面板（点开切换，不用挤在两个按钮里）", "showAskModePicker" in JS)
+check("⚠️ 模式的唯一事实来源是变量（不再从 DOM 反推）",
+      "let askMode" in JS and '.pill.askmode' not in JS)
 check("读配置时会把模式刷到界面上", "setAskMode(c.ask_mode" in JS)
 check("存开关时会带上 ask_mode（两处状态不错步）", "ask_mode:" in JS)
-check("切模式后给用户反馈", "深度询问" in JS and "快速询问" in JS)
+check("切模式后给用户反馈", "深度询问" in JS and "快速了解" in JS)
 
 print(f"\n{'=' * 60}\n通过 {PASS} 项，失败 {len(FAIL)} 项")
 for f in FAIL:

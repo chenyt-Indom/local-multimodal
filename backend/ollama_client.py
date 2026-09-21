@@ -70,6 +70,15 @@ class OllamaClient:
         也不会再踩这个坑。num_predict / temperature 仍可按调用区分。
         """
         payload = {"model": model, "messages": messages, "stream": stream}
+        # ⚠️ **必须显式给 keep_alive**：Ollama 默认只保活 5 分钟，超时就卸载模型。
+        # 不给的话，用户隔几分钟再发消息就要重新加载（实测冷启动 4.5 秒起步），
+        # 体感就是"发出去半天没反应"。值走配置（model_keep_alive，默认 30m）。
+        try:
+            _ka = (config.load_config() or {}).get("model_keep_alive")
+        except Exception:
+            _ka = None
+        if _ka:
+            payload["keep_alive"] = _ka
         if params:
             try:
                 fixed_ctx = int(config.load_config().get("num_ctx") or 8192)

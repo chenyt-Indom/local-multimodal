@@ -3996,7 +3996,7 @@ def _do_ask_user(arguments, context=None):
                    "hint": ("🔍 深度询问：模型可以多轮追问，问透为止。"
                             "填完它就接着做；不想答的直接跳过。"
                             if str((context or {}).get("ask_mode") or "") == "deep"
-                            else "💬 快速询问：只问最关键的几条，答完就开工。"
+                            else "💬 快速了解：只问最关键的几条，答完就开工。"
                                  "不想答的直接跳过。")})
     if not answers:
         return ("用户没有回答（可能直接关掉了弹框）。请**按最合理的默认假设继续做**，"

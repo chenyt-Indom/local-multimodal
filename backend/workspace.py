@@ -1059,8 +1059,14 @@ def reap_orphan_code_server() -> dict:
             if pid:
                 try:
                     import subprocess as _sp
+                    # ⚠️ 必须显式指定 utf-8 + errors="replace"：Windows 下 text 模式
+                    #    默认用 **GBK** 解码子进程输出，taskkill 打印的路径里只要有一个
+                    #    非 GBK 字节（实测 0x80），读取线程就抛 UnicodeDecodeError，
+                    #    日志里冒出 "Exception in thread Thread-xx (_readerthread)" 的
+                    #    traceback，而且那次 kill 还会失败（残留进程杀不掉）。2026-09-22 修。
                     _sp.run(["taskkill", "/PID", str(pid), "/F", "/T"],
-                            capture_output=True, timeout=15)
+                            capture_output=True, timeout=15,
+                            encoding="utf-8", errors="replace")
                     killed = 1
                 except Exception:
                     pass
@@ -1095,8 +1101,10 @@ def stop_code_server() -> dict:
         try:
             import subprocess as _sp
             # 连带子进程一起杀（只 terminate 外层壳的话，node 会活下来）
+            # ⚠️ 编码必须显式给 utf-8 —— 见上面 reaper 里那段说明（GBK 解码会炸）。2026-09-22
             _sp.run(["taskkill", "/PID", str(p.pid), "/F", "/T"],
-                    capture_output=True, timeout=15)
+                    capture_output=True, timeout=15,
+                    encoding="utf-8", errors="replace")
         except Exception:
             try:
                 p.kill()
