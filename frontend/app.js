@@ -2856,7 +2856,15 @@
           if (!line.trim()) continue;
           let obj;
           try { obj = JSON.parse(line); } catch { continue; }
-          if (obj.error) throw new Error(obj.error);
+          if (obj.error) {
+            // ⚠️ `explained` = 后端已经把原因翻成人话、也给了下一步怎么办。
+            // 这类错误**不要**再跟一句"（可能内存/模型未就绪，请查看状态）"——
+            // 实测用户看到那句会去查显存，而真正的原因（模型把工具调用的 JSON
+            // 写坏了）跟硬件毫无关系。见下面 catch 里的用法。
+            const _e = new Error(obj.error);
+            if (obj.explained) _e.explained = true;
+            throw _e;
+          }
           if (obj.message) {
             if (obj.message.thinking_reset) {
               // 后端因"思考吃满了输出空间"而加长上限重试：上一轮的思考已经作废。
@@ -2953,7 +2961,10 @@
         showToast("已终止本次生成");
         try { persistSession(); } catch (e) { /* 落盘失败不影响使用 */ }
       } else {
-        answerBubble.textContent = "❌ " + err.message + "（可能内存/模型未就绪，请查看状态）";
+        // 后端已经解释过原因的（explained），正文里就是完整的人话，别再补尾巴。
+        answerBubble.textContent = "❌ " + err.message
+          + (err.explained ? "" : "（可能内存/模型未就绪，请查看状态）");
+        answerBubble.classList.remove("empty-answer");
       }
     } finally {
       streaming = false;

@@ -1130,6 +1130,52 @@ def pull_model(body: dict):
 # ---------- 对话 ----------
 MAX_TOOL_ROUNDS = 10  # 单次对话内最多连续调用工具轮次，防止死循环
 
+# Ollama 解析"模型写出来的工具调用"失败时，会把 Go 的 JSON 错误塞进流里。
+# ⚠️ 用户看到的是一句英文，比如
+#     invalid character '\'' looking for beginning of object key string
+#   前端还会跟一句"（可能内存/模型未就绪，请查看状态）" —— 完全指错了方向。
+# 2026-09-22 用户就是拿这句话来问"这是什么原因"的。
+# 实测 Ollama 日志里的真身（`%LOCALAPPDATA%\Ollama\server.log`）：
+#     level=WARN source=qwen3vl.go:90 msg="qwen tool call parsing failed"
+#       error="invalid character '\'' looking for beginning of object key string"
+#   ——是**模型自己**把参数写成了单引号（或写残了），Ollama 解析不出来。
+# 这是采样噪声、不是环境问题，**重新发一次通常就好**，所以值得自动重试一次。
+_TOOLPARSE_MARKS = (
+    "looking for beginning of object key string",
+    "looking for beginning of value",
+    "unexpected end of JSON input",
+    "tool call parsing failed",
+)
+
+
+def _is_toolparse_err(msg) -> bool:
+    """判断这是不是"Ollama 解析模型输出的工具调用失败"。"""
+    m = str(msg or "")
+    return any(k in m for k in _TOOLPARSE_MARKS)
+
+
+def _friendly_ollama_error(msg) -> str:
+    """把 Ollama 的内部英文报错翻成用户能懂、也知道下一步怎么办的话。
+
+    ⚠️ 原样转发等于没说 —— 用户会来问"这是什么原因"，而且前端那句
+    "可能内存/模型未就绪"会把人带去查硬件（查了也没用）。
+    """
+    m = str(msg or "").strip()
+    if _is_toolparse_err(m):
+        return ("模型这一次生成的**工具调用格式不对**（JSON 引号写错了），"
+                "所以这一轮没执行成功。\n"
+                "**这不是你的操作问题，也不是内存/显存不够** —— "
+                "直接**把刚才那句话再发一次**通常就好了。\n"
+                "如果反复出现，把下面这行发给开发者：\n`%s`" % m)
+    if "not found" in m.lower() and "model" in m.lower():
+        return ("找不到这个模型（可能还没下载，或名字写错了）。"
+                "可以在设置里换一个已下载的模型。\n`%s`" % m)
+    if "connection" in m.lower() or "refused" in m.lower():
+        return ("连不上本机的 Ollama 服务（它可能没在运行）。"
+                "启动 Ollama 之后直接再发一次即可。\n`%s`" % m)
+    return m
+
+
 
 # =====================================================================
 #  代码能力：专用代码模型的路由
@@ -3149,6 +3195,10 @@ async def chat(req: ChatRequest):
         # 变成局部变量，导致前面读取 cfg 时报 UnboundLocalError。
         retries_done = 0
         _MAX_EMPTY_RETRIES = 2
+        # "Ollama 解析工具调用失败"的自动重试次数（见 _is_toolparse_err）。
+        # 给 2 次：一次是采样噪声，连着两次都写坏的概率很低。
+        _toolparse_retries = 0
+        _MAX_TOOLPARSE_RETRIES = 2
         gen_params = dict(cfg)
 
         # 【完整性兜底】整次生成共用一份"预览过哪些文件、当时写进了哪个项目"的记录。
@@ -3180,6 +3230,8 @@ async def chat(req: ChatRequest):
             # 孤儿文件就永远清不掉（实测正是这么漏的）。
             tool_calls = None
             done_reason = ""
+            # 本轮是否需要"原样再来一次"（Ollama 解析工具调用失败的自动重试）
+            _retry_round = False
             # 注意：必须用 _stream_lines（子线程读 + 队列），
             # 不能直接 for line in resp.iter_lines() —— 见它的注释
             async for line in _stream_lines(resp, session):
@@ -3192,7 +3244,24 @@ async def chat(req: ChatRequest):
                 except Exception:
                     continue
                 if obj.get("error"):
-                    yield json.dumps({"error": obj["error"], "__end": True}) + "\n"
+                    _emsg = str(obj["error"])
+                    # ⚠️ 这种情况**不是环境坏了**，是模型这一次把工具调用的 JSON
+                    # 写坏了（单引号 / 写残）。同一句话重来一次基本就好，
+                    # 所以先重试，别急着把英文报错丢给用户。
+                    if (_is_toolparse_err(_emsg)
+                            and _toolparse_retries < _MAX_TOOLPARSE_RETRIES):
+                        _toolparse_retries += 1
+                        _retry_round = True
+                        logger.warning("[tool-parse] 模型工具调用 JSON 写坏，自动重试 %d/%d：%s",
+                                       _toolparse_retries, _MAX_TOOLPARSE_RETRIES, _emsg[:120])
+                        yield json.dumps({"note": (
+                            "模型这次把调用格式写错了，正在自动重试（第 %d 次）…"
+                            % _toolparse_retries)}) + "\n"
+                        break
+                    # 重试用完（或不是这类错误）→ 给一句人话，别再丢英文原文
+                    logger.warning("[ollama-error] %s", _emsg[:200])
+                    yield json.dumps({"error": _friendly_ollama_error(_emsg),
+                                      "explained": True, "__end": True}) + "\n"
                     return
                 m = obj.get("message") or {}
                 if m.get("thinking"):
@@ -3294,6 +3363,13 @@ async def chat(req: ChatRequest):
                 # 这是判断"回答是否被思考吃光"的**可靠信号**，比猜正文长不长准得多。
                 if obj.get("done"):
                     done_reason = obj.get("done_reason") or ""
+
+            if _retry_round:
+                # 这一轮整轮作废、原样重来。
+                # ⚠️ 放在**任何后续处理之前**：报错是在读到错误事件那一刻发生的，
+                # 此时 `working` 还没被追加过任何东西（工具结果/助手消息都在后面），
+                # 所以直接 continue 重新发一次请求即可，不需要清理状态。
+                continue
 
             # ---- 摘掉"泄漏成正文的工具调用"，并补发之前被扣住的尾巴 ----
             # ⚠️ **两种模型都要跑**（2026-09-21）：默认模型走原生通道，
