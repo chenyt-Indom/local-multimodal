@@ -2923,6 +2923,31 @@
     $("#sendBtn").disabled = true;
     setStopVisible(true);
     abortCtl = new AbortController();
+    // ⏳ 卡顿看门狗：**没有任何数据进来时，界面不能一声不吭**。
+    //
+    // 为什么需要（2026-09-22 用户拿着截图问"思考才憋出两个字然后卡着不动，正常吗"）：
+    //   第 0.5 秒到第一个 token 之间是**纯等待**（Ollama 要先预填充整份提示词，
+    //   启动后第一条约 2 万 token，实测 10~16 秒；并发时还可能被前一条占住几十秒）。
+    //   这段时间界面只有一个不动的「🧠 思考中…」，用户完全无法分辨
+    //   "在算" 还是 "死了"。这里每收到一块就重置计时，超过 4 秒就报出已等待时长。
+    // ⚠️ 有数据进来后自然恢复成「思考中…（N 字）」——因为 updateThinkStatus 会覆盖它。
+    let _stallT0 = 0;
+    let _stallTimer = null;
+    const _clearStall = () => {
+      if (_stallTimer) { clearInterval(_stallTimer); _stallTimer = null; }
+    };
+    const _armStall = () => {
+      _clearStall();
+      _stallT0 = Date.now();
+      _stallTimer = setInterval(() => {
+        const sec = Math.round((Date.now() - _stallT0) / 1000);
+        if (sec >= 4) {
+          thinkStatus.textContent = "⏳ 模型正在准备…已等待 " + sec
+            + " 秒（大提示词要先读一遍；若前面还有任务在跑，会等它让出来）";
+        }
+      }, 1000);
+    };
+    _armStall();
     try {
       const resp = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" },
         signal: abortCtl.signal,
@@ -2942,6 +2967,7 @@
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
+        _armStall();                 // 收到数据 → 重新计时（不再是"卡住"状态）
         buf += decoder.decode(value, { stream: true });
         const lines = buf.split("\n"); buf = lines.pop();
         for (const line of lines) {
@@ -3061,6 +3087,7 @@
     } finally {
       streaming = false;
       abortCtl = null;
+      _clearStall();                 // 别忘了停掉卡顿看门狗
       $("#sendBtn").disabled = false;
       setStopVisible(false);
     }

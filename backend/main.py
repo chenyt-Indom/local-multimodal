@@ -478,12 +478,17 @@ _extract_abort = False  # 用户开始说话了 → 让提炼主动断开，把�
 _busy_lock = threading.Lock()
 
 
-def _chat_started() -> None:
-    """有聊天请求进来：登记 + 通知正在跑的提炼"让路"。"""
+def _chat_started() -> bool:
+    """有聊天请求进来：登记 + 通知正在跑的提炼"让路"。
+
+    返回 **这条之外是否还有聊天在跑** —— Ollama 一次只服务一个生成，
+    所以"有别人在跑"就等于"这条要等"，得提前告诉用户（见 _track_chat）。
+    """
     global _chat_busy, _extract_abort
     with _busy_lock:
         _chat_busy += 1
         _extract_abort = True
+        return _chat_busy > 1
 
 
 def _chat_finished() -> None:
@@ -493,12 +498,21 @@ def _chat_finished() -> None:
 
 
 async def _track_chat(agen):
-    """包住聊天流：登记"有聊天在跑"，并顺带告知用户何时在等后台提炼。"""
-    _chat_started()
+    """包住聊天流：登记"有聊天在跑"，并顺带告知用户**这条为什么可能慢**。
+
+    ⚠️ Ollama 一次只跑一个生成（单 slot）。所以"模型被别的东西占着"是真实存在的
+    等待来源，而用户看到的现象只是"半天没反应"。实测（2026-09-22）：
+    两条聊天并发时，先发的那条会在吐 1 个思考字之后**静默 26 秒**，
+    界面上完全看不出在等什么。⇒ 两种占用都提前说出来。
+    """
+    _other_chat = _chat_started()      # 登记 + 让提炼让路；返回"是否已有别的聊天在跑"
     try:
         if _extracting:
             yield json.dumps({"note": (
                 "正在后台整理上一轮的记忆，模型被占用，这次回复会稍慢一些…")}) + "\n"
+        elif _other_chat:
+            yield json.dumps({"note": (
+                "还有一条回复正在生成，模型一次只跑一个，你这条要等它让出来…")}) + "\n"
         async for chunk in agen:
             yield chunk
     finally:

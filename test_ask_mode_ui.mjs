@@ -12,7 +12,8 @@
 //    （弹层、事件绑定都在 app.js 里），光 grep 字符串证明不了"点了真的有反应"。
 //    脚本验证：按钮存在且写着当前模式 → 点开有面板 → 选另一个 → 按钮文字变了、
 //    **后端真的存了** ask_mode → 面板关闭 → 还能再打开 → 最后截图留证。
-const BASE = "http://127.0.0.1:9222";
+// ⚠️ 调试端口可配：无头浏览器换了端口就不用改脚本（MM_CDP=http://127.0.0.1:9223 node ...）
+const BASE = process.env.MM_CDP || "http://127.0.0.1:9222";
 const APP = "http://127.0.0.1:8000";
 
 const list = await (await fetch(BASE + "/json")).json();

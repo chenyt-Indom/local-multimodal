@@ -10,7 +10,8 @@
 //    光看代码或 grep 字符串证明不了"点了真的有反应"。
 //    脚本会验证：按钮 → 弹层 → 两条滑条（范围/步长）→ 拖动后**后端真的存了** →
 //    建议值跳回 → 关闭后还能再打开，最后截一张图留证。
-const BASE = "http://127.0.0.1:9222";
+// ⚠️ 调试端口可配：无头浏览器换了端口就不用改脚本（MM_CDP=http://127.0.0.1:9223 node ...）
+const BASE = process.env.MM_CDP || "http://127.0.0.1:9222";
 const APP = "http://127.0.0.1:8000";
 
 const list = await (await fetch(BASE + "/json")).json();
