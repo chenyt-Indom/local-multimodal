@@ -741,7 +741,10 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
             "type": "function",
             "function": {
                 "name": "generate_image",
-                "description": "根据描述生成图片（文生图）。prompt 必须是详细具体的**英文**描述，生成后直接展示给用户。",
+                "description": "根据描述生成图片（文生图）。prompt 必须是详细具体的**英文**描述，生成后直接展示给用户。"
+                               "⚠️ 用户只说了主体、没说风格/用途/氛围/尺寸时（例如「画一只狐狸」），"
+                               "**先调 ask_user 问一轮再画** —— 画一次要几十秒，风格选错就得重画；"
+                               "用户已经说清风格与用途时直接画，不要再问。",
                 "parameters": {
                     "type": "object",
                     "properties": {

@@ -3074,8 +3074,21 @@
       if (aborted || (err && err.name === "AbortError")) {
         // 用户点了「■ 终止」：把已经生成出来的部分留着，别报成错误
         answerBubble.classList.remove("empty-answer");
-        answerBubble.textContent = answer ? answer + "\n\n〔已终止〕" : "〔已终止〕";
-        if (answer) history.push({ role: "assistant", content: answer });
+        // ⚠️⚠️ **终止也必须往历史里写一条助手消息**（哪怕一个字都没生成）。
+        //
+        // 实测（2026-09-22 用户反馈）：点了终止之后，历史里只留下一条"没人回答的用户消息"，
+        // 下一轮模型会把它当成**未完成的需求接着做** —— 用户问「红腹锦鸡长什么样」，
+        // 图库里却混进一张上一条要的狐狸图。⚠️ 已复现：把这种历史直接发给后端，
+        // 模型当场又调了一次 generate_image，而且**完全没回答这一轮真正的问题**。
+        //
+        // 文案要**对模型说话**（它会被写进提示词），用户看了也不突兀：
+        // 明确"这条需求作废、别在新的一轮补做"。显示与落盘用**同一段文本**，
+        // 免得刷新后两处不一致。
+        const stopMark = "〔已终止〕用户主动中断了这次生成 —— 上面那条需求就此作废，"
+                       + "不要在新的一轮里接着做，除非用户再次明确要求。";
+        answerBubble.textContent = answer ? answer + "\n\n" + stopMark : stopMark;
+        history.push({ role: "assistant",
+                       content: (answer ? answer + "\n\n" : "") + stopMark });
         showToast("已终止本次生成");
         try { persistSession(); } catch (e) { /* 落盘失败不影响使用 */ }
       } else {
