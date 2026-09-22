@@ -710,7 +710,13 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
                     "【联网搜图】到网上找**已经存在**的真实图片并展示原图。\n"
                     "用户说「找/搜/看看……的图」「……长什么样」「来点……壁纸」时用它。\n"
                     "与 generate_image 的区别：本工具=找现成的真实图，不绘制；"
-                    "generate_image=AI 从零画。说「画/生成/绘制」时用 generate_image。"
+                    "generate_image=AI 从零画。说「画/生成/绘制」时用 generate_image。\n"
+                    "⚠️⚠️ **不许抢 edit_image / generate_image 的活**（2026-09-22 用户实测踩过）：\n"
+                    "· 用户说「微改 / 改成 / 换成 / 加个 / 去掉 / 调一下」且**上文有图**"
+                    "（本轮附件、或刚生成/刚微改过的那张）→ 用 **edit_image**，不要搜图；\n"
+                    "· 用户说「画 / 生成 / 做张图」→ 用 **generate_image**，不要搜图；\n"
+                    "· 只有当用户**明确要现成的真实照片/素材**（「找张真的」「网上有没有」"
+                    "「长什么样」「壁纸」）时才用本工具。"
                 ),
                 "parameters": {
                     "type": "object",
@@ -761,7 +767,12 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
             "type": "function",
             "function": {
                 "name": "edit_image",
-                "description": "对一张已有图片做局部微改（图生图），如「把背景改成夜晚」「戴上帽子」。source 填本地路径；若用户本轮拖入的图要微改则不填 source。prompt 用英文，并注明保持其他部分不变。",
+                "description": "对一张已有图片做局部微改（图生图），如「把背景改成夜晚」「戴上帽子」。"
+                               "source 填本地路径；**若用户本轮拖入的图、或刚才生成/微改的那张要改，"
+                               "就不用填 source**（系统会自动拿「最近那张图」当底图）——"
+                               "用户说「微改这张图 / 把刚才那张改成…」时直接调用本工具即可，"
+                               "不要让他重新拖一次，也不要改用搜图。"
+                               "prompt 用英文，并注明保持其他部分不变。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1866,9 +1877,10 @@ def _do_edit_image(arguments, ui_events, context):
                 f"笼统说法 —— 用户需要看到真实原因才能判断问题在哪。")
     _ui(ui_events, {"type": "image", "mime": "image/png", "b64": result["b64"],
                     "prompt": "微改：" + prompt, "device": result.get("device"),
-                    "model": result.get("model"), "cost_s": round(cost, 1)})
+                    "model": result.get("model"), "cost_s": round(cost, 1),
+                    "origin": "edit"})   # ← 前端据此标「AI 微改」（原来没标，显示成"图片"）
     return (f"已根据修改要求生成新图（用 {round(cost,1)} 秒）。原图已按描述微改并展示给用户。"
-            f"若还要继续调整，请直接说明新的修改点。")
+            f"若还要继续调整，**直接说明新的修改点即可**，不用再拖一次图。")
 
 
 # ---------- 文件系统 ----------

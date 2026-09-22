@@ -20,6 +20,7 @@ import base64
 import codecs
 import io
 import json
+import math
 import time
 import asyncio
 import datetime
@@ -88,7 +89,10 @@ _IMG_DEIXIS = ("这张", "那张", "这幅", "那幅", "此图", "该图", "原�
                "上图", "刚才", "刚刚", "上一张", "上张", "前一张",
                "上面那", "上面这")
 _IMG_EDIT = ("改成", "改为", "换成", "再改", "继续改", "修一下", "调一下",
-             "加个", "去掉", "裁剪", "放大")
+             "加个", "去掉", "裁剪", "放大", "微改")
+# ⚠️ **只可能用在图片上**的动作词：出现它们就等于在说图片，不需要再配"图"字或指代词。
+#    （用户实测原话：「我直接发文字让它给刚才生成的图片进行微改」→ 说了"微改"。）
+_IMG_ONLY_VERBS = ("微改", "改图", "修图", "p图", "P图", "抠图", "加滤镜", "调色")
 # 外观类词：配合"改图动作"判断（「改成红色」这种短句常常不带"图"字）
 _IMG_LOOK = ("红", "蓝", "绿", "黄", "黑", "白", "灰", "紫", "橙", "颜色", "色系",
              "亮", "暗", "背景", "尺寸", "大小", "比例", "风格", "清晰")
@@ -112,6 +116,12 @@ def _refers_to_prev_image(text: str) -> bool:
         return True
     # ③ 短句只说"改成红色 / 调亮一点"这类（没带"图"字，但说的是外观）
     if any(e in t for e in _IMG_EDIT) and any(w in t for w in _IMG_LOOK):
+        return True
+    # ④ ⚠️ **图片专属的动作词**：这些词只会用在图片上（"微改文档"不是人话），
+    #    所以单独出现就够 —— 用户实测常说「帮我微改一下」「改图」「修图」，
+    #    不带"图"字也不带指代词，前三条全都判不出来 → 底图取不到 →
+    #    edit_image 只能回「无法确定要修改的图片」（2026-09-22 报的"找不到刚才的图"）。
+    if any(w in t for w in _IMG_ONLY_VERBS):
         return True
     return False
 
@@ -382,13 +392,56 @@ def _history_digest(dropped: list, per_msg: int = 90, cap: int = 1500) -> str:
             + "\n".join(lines))
 
 
+# 历史至少要留这么多 token。⚠️⚠️ 见 _trim_history_to_budget 里的说明 ——
+# 这一条是"模型老是失忆"的正面修复：以前输出预留（max_tokens）不设上限地挤占历史，
+# 结果 `24576 - 8192(输出) - 16025(系统提示+工具) - 3800(联网预留) - 512 = -3953`
+# → **负数** → 历史每轮被砍到只剩最后 2 条，其余压成 743 字摘要。
+MIN_HISTORY_TOKENS = 2500
+# 「较早对话摘要」的预留：摘要是在裁剪**之后**才生成的，之前完全没进预算，
+# 等于白送最多 1500 字（~1200 token）→ 也是撑爆窗口的一份子。这里先扣掉。
+DIGEST_RESERVE = 700
+
+
+def _image_tokens(images_b64: list) -> int:
+    """估算这一轮附件图片要吃掉多少 token。
+
+    ⚠️⚠️ 以前**完全没算**：图片挂在最后一条 user 消息上发给 Ollama
+    （见 ollama_client.chat 的 `images_base64`），但预算只按文字长度估 ——
+    用户拖一张大图进来就会撑爆窗口，Ollama 直接回 400：
+      `request (26352 tokens) exceeds the available context size (24576 tokens)`
+    （2026-09-22 用户截图里的报错就是这个）。
+
+    估法：Qwen3-VL 把图切成 28×28 的 patch、再 2×2 合并，所以
+    `token ≈ ceil(w/28) * ceil(h/28) / 4`。取不到尺寸时按 1024×1024 的常见上限估。
+    ⚠️ 宁可**高估**：多留一点空间只是少带两条历史，估少了就是直接报错。
+    """
+    total = 0
+    for b64 in (images_b64 or [])[:6]:          # 超过 6 张按同样大小累加即可
+        w = h = 1024
+        try:
+            from PIL import Image as _PILImage      # 懒导入：没装 PIL 也能跑（退化成按 1024 估）
+            raw = base64.b64decode(str(b64).split(",")[-1], validate=False)
+            with _PILImage.open(io.BytesIO(raw)) as im:
+                w, h = im.size
+        except Exception:
+            pass
+        total += int(math.ceil(w / 28.0) * math.ceil(h / 28.0) / 4) + 8
+    return total
+
+
 def _trim_history_to_budget(messages: list, sys_prompt: str, tool_schemas: list,
-                            cfg: dict) -> tuple:
+                            cfg: dict, images_b64: list | None = None) -> tuple:
     """按上下文预算裁剪历史消息。
 
-    token 账：num_ctx = 系统提示 + 工具定义 + 历史 + 本轮输出 + 检索材料。
-    系统提示/工具定义/检索材料都是"写死的开销"，唯一能压缩的就是历史，
-    所以这里从最旧的开始丢，直到装得下。
+    token 账：num_ctx = 系统提示 + 工具定义 + 附件图片 + 检索材料 + 历史 + 本轮输出。
+    除了历史，其它都是"写死的开销"，所以这里从最旧的开始丢，直到装得下。
+
+    ⚠️⚠️ **输出预留（max_tokens）不能无上限地挤历史**（2026-09-22 修）：
+    用户把 max_tokens 调到 8192 之后，账变成
+      `24576 − 8192(输出) − 16025(系统提示+工具) − 3800(联网预留) − 512 = −3953`
+    是**负数** → 走下面那条兜底分支，历史每轮只剩最后 2 条、其余压成 743 字摘要。
+    用户体感就是"**模型老是失忆**"。
+    修法：输出预留只当**上限**，并且历史至少要能拿到 MIN_HISTORY_TOKENS。
 
     **返回 (保留的历史, 被丢掉的历史)**。
     丢掉的那部分不是直接扔 —— 调用方会把它压成「较早对话摘要」注入，
@@ -396,9 +449,9 @@ def _trim_history_to_budget(messages: list, sys_prompt: str, tool_schemas: list,
     """
     try:
         ctx_limit = int(cfg.get("num_ctx") or 8192)
-        reserve_out = int(cfg.get("max_tokens") or 2048)
+        reserve_out_cfg = int(cfg.get("max_tokens") or 2048)
     except Exception:
-        ctx_limit, reserve_out = 8192, 2048
+        ctx_limit, reserve_out_cfg = 8192, 2048
 
     import json as _json
     overhead = (_est_tokens(sys_prompt)
@@ -407,9 +460,16 @@ def _trim_history_to_budget(messages: list, sys_prompt: str, tool_schemas: list,
     # 追加进上下文，此时还不知道具体多大 —— 按实测约 3600 token 预留，
     # 否则"历史 + 检索材料"一起会撑爆窗口，Ollama 直接截断提示词。
     search_reserve = 3800 if cfg.get("web_enabled") else 0
-    budget = ctx_limit - reserve_out - overhead - search_reserve - 512
-    if budget <= 0:
+    img_tokens = _image_tokens(images_b64)
+    room = ctx_limit - overhead - search_reserve - img_tokens - DIGEST_RESERVE - 512
+    if room <= 512:
         # 连固定开销都快占满了：只带最近 2 条，别把提示词撑爆
+        return messages[-2:], messages[:-2]
+
+    # 输出愿留多少就留多少，但**不许把历史挤没**（见函数说明）
+    reserve_out = min(reserve_out_cfg, max(512, room - MIN_HISTORY_TOKENS))
+    budget = room - reserve_out
+    if budget <= 0:
         return messages[-2:], messages[:-2]
 
     kept, used = [], 0
@@ -1410,6 +1470,54 @@ def _ask_rules(cfg: dict) -> str:
         "- 用户已经回答过、或说过「你看着办 / 直接做」→ 不要再问同一个方向，直接做完。\n"    )
 
 
+def _is_context_err(msg) -> bool:
+    """是不是"提示词超出模型窗口"这一类报错。
+
+    Ollama 原文长这样（2026-09-22 用户截图里那条）：
+      `{"error":{"code":400,"message":"request (26352 tokens) exceeds the available
+        context size (24576 tokens), try increasing it",
+        "type":"exceeded_context_size_error","param":26352,"n_ctx":24576}}`
+
+    ⚠️ 这不是"环境坏了"，是**这一轮带的东西太多**（常见元凶：附件图片 + 长历史）。
+    处置见 gen() 里的兜底：砍到最近两条 + 丢掉检索材料再试一次，别把英文丢给用户。
+    """
+    m = str(msg or "").lower()
+    return ("exceeded_context_size" in m
+            or "exceeds the available context size" in m
+            or ("n_ctx" in m and "exceed" in m))
+
+
+def _shrink_for_model(images: list, max_side: int = 1024) -> list:
+    """把过大的附件图缩到长边 ≤ max_side，**只影响发给模型的那份**。
+
+    ⚠️ 图片是按像素折算成 token 的（Qwen3-VL：28×28 patch、2×2 合并），
+    一张 2048×2048 要 1300+ token，四张就是半个对话框 —— 用户拖几张图进来
+    就可能把窗口撑爆。缩到 1024 长边能省掉约 3/4。
+    ⚠️ 原件**不动**：落盘、后续「把这张图改进 PPT」都要用清晰的原始字节。
+    取不到尺寸 / 不是图片 → 原样返回那一项（宁可多占点，也别把图弄丢）。
+    """
+    out = []
+    for b64 in (images or []):
+        s = str(b64)
+        try:
+            from PIL import Image as _PILImage
+            raw = base64.b64decode(s.split(",")[-1], validate=False)
+            with _PILImage.open(io.BytesIO(raw)) as im:
+                if max(im.size) <= max_side:
+                    out.append(s)
+                    continue
+                im2 = im.convert("RGB")
+                ratio = max_side / float(max(im2.size))
+                im2 = im2.resize((max(1, int(im2.width * ratio)),
+                                  max(1, int(im2.height * ratio))))
+                buf = io.BytesIO()
+                im2.save(buf, format="JPEG", quality=88)
+            out.append(base64.b64encode(buf.getvalue()).decode("ascii"))
+        except Exception:
+            out.append(s)
+    return out
+
+
 def _is_toolparse_err(msg) -> bool:
     """判断这是不是"Ollama 解析模型输出的工具调用失败"。"""
     m = str(msg or "")
@@ -1435,6 +1543,17 @@ def _friendly_ollama_error(msg) -> str:
     if "connection" in m.lower() or "refused" in m.lower():
         return ("连不上本机的 Ollama 服务（它可能没在运行）。"
                 "启动 Ollama 之后直接再发一次即可。\n`%s`" % m)
+    # ⚠️ 「超出上下文窗口」：自动精简重试过了还失败，才走到这里。
+    #    必须说清**怎么办** —— 那条英文原文（26352 > 24576）用户看了只会一头雾水，
+    #    而前端默认的"可能内存/模型未就绪"会把人带去查硬件（查了也没用）。2026-09-22。
+    if _is_context_err(m):
+        return ("这一轮的内容**超出了模型能装下的长度**（`num_ctx` 不够用），"
+                "自动精简后仍然装不下。\n"
+                "**下一步（任选其一即可）**：\n"
+                "· 少附几张图 / 少拖几个文件再问一次；\n"
+                "· 或者**新开一个对话**（旧对话的历史太长）；\n"
+                "· 或者到设置里把「上下文长度 num_ctx」调大（比如 24576 → 32768）。\n"
+                "**这不是内存或显存坏了**，纯粹是这一轮带的内容太长。\n`%s`" % m)
     return m
 
 
@@ -3110,6 +3229,10 @@ async def chat(req: ChatRequest):
     model_note = ""
     images = list(req.images_b64 or [])
     _remember_image(images)          # 记住本轮图片，供后续「把这张图改成…」直接引用
+    # ⚠️ 发给模型的那份要**压到长边 ≤1024**：图片是按像素折算 token 的，
+    #    2048 的图一张就要 1300+ token，拖几张就把窗口撑爆（Ollama 回 400）。
+    #    原件**不动** —— 落盘、"放进 PPT" 都还要清晰的原图。
+    model_images = _shrink_for_model(images)
     # ⚠️ 本轮附件还必须**落盘**：模型能"看到"图，却拿不到图的字节 ——
     # 用户说「把这张图放进 PPT / 插到文档里」时，只有磁盘上的文件才能被
     # python-pptx / python-docx 使用。落盘后把路径写进提示词，模型照抄即可。
@@ -3357,7 +3480,10 @@ async def chat(req: ChatRequest):
             logger.warning("知识库检索失败（本轮忽略）", exc_info=True)
             rag_ctx = ""
     budget_sys = sys_prompt + "\n\n" + mem_ctx + "\n\n" + rag_ctx
-    messages, dropped = _trim_history_to_budget(messages, budget_sys, tool_schemas, cfg)
+    # ⚠️ 附件图片也要占上下文（挂在最后一条 user 消息上发给 Ollama）——
+    #    以前没算，拖一张大图进来就会撑爆窗口、Ollama 直接回 400。
+    messages, dropped = _trim_history_to_budget(messages, budget_sys, tool_schemas, cfg,
+                                                images_b64=model_images)
     digest = _history_digest(dropped)
 
     # 联网搜索：以前这里会**预先**跑一次搜索并把结果塞进上下文，
@@ -3576,9 +3702,12 @@ async def chat(req: ChatRequest):
         # 必须放在轮次循环**外面**：模型常常第 1 轮建项目+预览、第 2 轮才正式写入，
         # 每轮清空就看不出"预览写到 A 项目、正式写入落在 B 项目"，孤儿文件清不掉。
         _wsstate = {"streamed": {}, "written": {}}
+        # 「提示词超出窗口」只自动重试一次（见下面 _is_context_err 分支）——
+        # 再砍就什么都没了，第二次还失败就如实告诉用户。
+        _ctx_trimmed = False
         for _round in range(MAX_TOOL_ROUNDS):
             # 工具调用中间轮不再重复附图片
-            attach_images = images if _round == 0 else None
+            attach_images = model_images if _round == 0 else None
             try:
                 resp = client.chat(working, model=model, stream=True,
                                    images_base64=attach_images, params=gen_params,
@@ -3628,6 +3757,23 @@ async def chat(req: ChatRequest):
                         yield json.dumps({"note": (
                             "模型这次把调用格式写错了，正在自动重试（第 %d 次）…"
                             % _toolparse_retries)}) + "\n"
+                        break
+                    # ⚠️ 提示词真的超出窗口（Ollama 明说 prompt_tokens > n_ctx）：
+                    #    不是环境坏了，是这一轮带的东西太多（附件图片 + 长历史最常见）。
+                    #    硬砍到最近两条、连检索材料一起丢掉，再试一次 —— 用户不该为这个
+                    #    看到一屏英文报错（2026-09-22 用户截图里那条就是这个）。
+                    if _is_context_err(_emsg) and not _ctx_trimmed:
+                        _ctx_trimmed = True
+                        _retry_round = True
+                        _hard = all_messages[-2:] if len(all_messages) > 2 else all_messages
+                        working[:] = _attach_live_ctx(
+                            [{"role": "system", "content": full_sys}] + list(_hard),
+                            digest=digest, mem_ctx=mem_ctx, rag_ctx="")
+                        logger.warning("[ctx-overflow] 提示词超出窗口，已精简到最近 %d 条重试：%s",
+                                       len(_hard), _emsg[:120])
+                        yield json.dumps({"note": (
+                            "这一轮带的内容超出了模型窗口（图片或前文太长），"
+                            "已自动精简后重试…")}) + "\n"
                         break
                     # 重试用完（或不是这类错误）→ 给一句人话，别再丢英文原文
                     logger.warning("[ollama-error] %s", _emsg[:200])
@@ -3945,6 +4091,15 @@ async def chat(req: ChatRequest):
                 for e in ev:
                     if e.get("type") == "image":
                         ctx["shown_images"].append(e)
+                        # ⚠️⚠️ 生成/微改出来的图**也要记成"最近一张图"**：
+                        #    以前只有"用户自己拖进来的图"才会被 `_remember_image` 记住，
+                        #    所以用户接着说「微改**刚才那张**」时 `_recent_image()` 是空的，
+                        #    edit_image 只能回「无法确定要修改的图片」——
+                        #    这就是 2026-09-22 用户报的"模型找不到刚才生成的图"。
+                        #    记进来之后，下一轮只要用户明确指向它（_refers_to_prev_image）
+                        #    就能直接拿来当底图，不用重新拖一次。
+                        if e.get("b64") and e.get("origin") in ("gen", "edit"):
+                            _remember_image([e["b64"]])
                 ui_events.extend(ev)
                 if text_protocol:
                     # 文本协议没有 tool_call_id 可关联。实测用 user 消息 +

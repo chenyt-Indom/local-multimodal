@@ -1308,20 +1308,40 @@
   }
 
   function onDropFiles(files) {
-    const list = files ? [...files] : [];
+    let list = files ? [...files] : [];
     if (!list.length) {
       // 别静默失败：拖进来却什么都没发生，用户只会以为功能坏了
       showToast("没有读到文件。请从资源管理器把文件直接拖到窗口里再松开。", "warn");
       return;
     }
+    // ⚠️ **同一批里先去重**（2026-09-22 用户报"拖一张图结果贴上两张"）：
+    //    剪贴板/拖拽源有时会同时给出同一个文件的多个表示（PNG + JPG、带/不带元数据），
+    //    WebView2 下尤其常见 —— 按 名字+大小+修改时间 判重就够了。
+    const seen = new Set();
+    list = list.filter((f) => {
+      if (!f) return false;
+      const key = [f.name || "", f.size || 0, f.lastModified || 0].join("|");
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
     list.forEach((f) => {
       if (!f) return;
       if (f.type && f.type.startsWith("image/")) {
         const reader = new FileReader();
-        reader.onload = () => { images.push(reader.result); renderAttachments(); };
+        reader.onload = () => {
+          const src = String(reader.result || "");
+          // ⚠️ 再按**内容**兜一道：同一张图（字节完全相同）已经挂在那儿了就别重复挂。
+          //    （跨批次也拦，因为"同一个图挂两遍"几乎总是误操作，用户不会这么干。）
+          if (src && images.indexOf(src) >= 0) {
+            showToast("这张图已经在附件里了，没有重复添加", "warn");
+            return;
+          }
+          images.push(src);
+          renderAttachments();
+        };
         reader.readAsDataURL(f);
-      } else if (/\.(mp4|avi|mkv|mov|webm|flv|wmv|m4v|ts)$/i.test(f.name || "")) {
-        // 视频：交给底部按钮处理逻辑保持一致（复用 videoInput）
+      } else if (/\.(mp4|avi|mkv|mov|webm|flv|wmv|m4v|ts)$/i.test(f.name || "")) {        // 视频：交给底部按钮处理逻辑保持一致（复用 videoInput）
         const dt = new DataTransfer(); dt.items.add(f);
         $("#videoInput").files = dt.files;
         $("#videoInput").dispatchEvent(new Event("change"));
@@ -1440,7 +1460,7 @@
     items.forEach((m) => {
       const cell = document.createElement("div");
       cell.className = "lib-item";
-      const tag = m.origin === "web" ? "🌐" : (m.origin === "gen" ? "🎨" : "🖼️");
+      const tag = m.origin === "web" ? "🌐" : ((m.origin === "gen" || m.origin === "edit") ? "🎨" : "🖼️");
       cell.innerHTML = `
         <img src="/api/library/images/${m.id}/raw" alt="${m.name}" loading="lazy">
         <div class="lib-name" title="${m.name}">${tag} ${m.name}</div>
@@ -2858,8 +2878,10 @@
       card.className = "media-card";
       const mime = ui.mime || "image/png";
       const b64 = ui.b64 || "";
-      // 明确区分「网上搜到的」与「AI 生成的」，避免混淆
-      const badge = isWeb ? "🌐 网上搜到的" : (ui.origin === "gen" ? "🎨 AI 生成" : "🖼️ 图片");
+      // 明确区分「网上搜到的」「AI 生成的」「AI 微改的」，避免混淆
+      const badge = isWeb ? "🌐 网上搜到的"
+        : (ui.origin === "gen" ? "🎨 AI 生成"
+        : (ui.origin === "edit" ? "🎨 AI 微改" : "🖼️ 图片"));
       const caption = (ui.prompt || "").slice(0, 60);
       card.innerHTML = `
         <div class="media-cap"><span class="badge ${isWeb ? "web" : "gen"}">${badge}</span>${
