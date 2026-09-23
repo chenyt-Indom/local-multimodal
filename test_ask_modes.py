@@ -143,7 +143,11 @@ def _grab(payload):
     return []
 
 
-_ = T.dispatch("ask_user", {"questions": [{"question": "x?"}]}, [],
+# ⚠️ 2026-09-23：深度模式加了**代码层兜底**（一次问得太少会驳回要求补全，见 _do_ask_user），
+#    所以这里必须给够问题数（≥ASK_DEEP_MIN），否则根本不会弹框、也就没有 hint 可查。
+T.ask_guard_reset("")
+_ = T.dispatch("ask_user",
+               {"questions": [{"question": "问题%d？" % i} for i in range(5)]}, [],
                {"ask": _grab, "ask_mode": "deep"})
 check("深度模式：弹框提示写明「深度询问」", "深度询问" in (hint.get("v") or ""), str(hint.get("v"))[:50])
 _ = T.dispatch("ask_user", {"questions": [{"question": "x?"}]}, [],

@@ -140,6 +140,140 @@ import json as _json   # noqa: E402
 _all_txt = _json.dumps(T._ask_user_schema("quick"), ensure_ascii=False)
 check("⚠️ ask_user 里仍保留「别凑数」的刹车（整份 schema 里）", "别凑数" in _all_txt)
 
+print()
+print("=" * 68)
+print("⑤ 深度询问的**代码层兜底**（光靠提示词不可靠，实测两次结果不一致）")
+print("=" * 68)
+check("有 ASK_DEEP_MIN 常量且 >1", getattr(T, "ASK_DEEP_MIN", 0) > 1,
+      getattr(T, "ASK_DEEP_MIN", None))
+check("有 ask_guard_reset（每轮清零）", callable(getattr(T, "ask_guard_reset", None)))
+check("chat 接口每轮会重置守卫", "tools.ask_guard_reset(session)" in SRC_MAIN)
+
+
+class _FakeUI:
+    """假的前端通道：把弹框调用记下来。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, payload):
+        self.calls.append(payload)
+        return [{"question": q["question"], "answer": "随便，你定"}
+                for q in (payload.get("questions") or [])]
+
+
+def ask(n, mode):
+    ui = _FakeUI()
+    T.ask_guard_reset("t-" + mode + str(n))
+    out = T._do_ask_user({"questions": [{"question": "问题%d？" % i} for i in range(1, n + 1)]},
+                         {"ask": ui, "ask_mode": mode, "session": "t-" + mode + str(n)})
+    return ui, out
+
+
+ui, out = ask(3, "deep")
+check("深度模式只问 3 个 → **不弹框**，驳回并要求补全", not ui.calls and "至少" in out,
+      out[:80])
+check("驳回文案里给了具体数量（至少 N 个 / 5~7 个）", "5~7" in out and "至少" in out)
+ui, out = ask(5, "deep")
+check("深度模式第一轮问 5 个 → 正常弹框", len(ui.calls) == 1 and not out.startswith("⚠️"),
+      "%d 次弹框" % len(ui.calls))
+
+# ⚠️⚠️ 关键：**下限只管第一轮**。第二轮是"追问"，问 2 个才正常 ——
+# 第一版没加这个条件时，模型第二轮想追问 2 个被驳回，那一轮**根本没弹出来**（越修越糟）。
+T.ask_guard_reset("t-round2")
+# ⚠️ 两次都要用**同一个 session**（ask() 辅助函数会自己重置守卫，不能用它）
+_ui1 = _FakeUI()
+T._do_ask_user({"questions": [{"question": "第一轮问题%d？" % i} for i in range(5)]},
+               {"ask": _ui1, "ask_mode": "deep", "session": "t-round2"})
+ui2 = _FakeUI()
+out2 = T._do_ask_user({"questions": [{"question": "追问1？"}, {"question": "追问2？"}]},
+                      {"ask": ui2, "ask_mode": "deep", "session": "t-round2"})
+check("⚠️ 第二轮**追问**只问 2 个 → 照样弹框（不能被下限拦住）",
+      len(ui2.calls) == 1 and not out2.startswith("⚠️"),
+      "%d 次弹框 / %s" % (len(ui2.calls), out2[:40]))
+check("⚠️ 弹框之后，工具返回值里有「该不该再问一轮」的自查提示",
+      "请先自查再动手" in out, out[-90:].replace("\n", " "))
+ui, out = ask(2, "quick")
+check("快速模式问 2 个 → 照样弹框（不设下限，别打扰）", len(ui.calls) == 1)
+
+# 驳回最多 2 次，之后必须放行（否则会死循环）
+T.ask_guard_reset("t-cap")
+outs = []
+for _ in range(3):
+    ui = _FakeUI()
+    outs.append(T._do_ask_user(
+        {"questions": [{"question": "只问一个？"}]},
+        {"ask": ui, "ask_mode": "deep", "session": "t-cap"}))
+check("⚠️ 连续驳回最多 2 次，第 3 次必须放行（不会死循环）",
+      outs[0].startswith("⚠️") and outs[1].startswith("⚠️") and not outs[2].startswith("⚠️"),
+      [o[:12] for o in outs])
+check("下限常量与目标一致（5）", getattr(T, "ASK_DEEP_MIN", 0) == 5,
+      getattr(T, "ASK_DEEP_MIN", None))
+
+# 问到第 3 轮时要催它动手
+T.ask_guard_reset("t-rounds")
+# ⚠️ 每轮问**不同的话题**，否则会被复问去重拦下（那条是另一条断言在管的）
+_round_axes = (("用途", "受众", "篇幅", "风格", "约束"),
+               ("交付", "节奏", "口吻", "案例", "禁忌"),
+               ("配图", "尺寸", "语言", "版本", "落款"))
+for k in range(3):
+    ui = _FakeUI()
+    last = T._do_ask_user(
+        {"questions": [{"question": "%s方面还有别的要求吗%d？" % (ax, k)}
+                       for ax in _round_axes[k]]},
+        {"ask": ui, "ask_mode": "deep", "session": "t-rounds"})
+check("⚠️ 问到第 3 轮时提示「现在就动手做」", "现在就动手做" in last, last[-70:])
+
+print()
+print("=" * 68)
+print("⑥ 复问去重（第二轮不许把已经答过的方向再问一遍）")
+print("=" * 68)
+check("有 _q_similar / _q_topic", callable(getattr(T, "_q_similar", None))
+      and callable(getattr(T, "_q_topic", None)))
+# 判据用**真机上第二轮的原话**校准
+_pairs = [("希望控制在几页左右？", "希望控制多少页？", True),
+          ("这份PPT主要用于什么场合？", "这份PPT主要为哪些人准备的？", False),
+          ("这份PPT是用于什么场景呢？", "这份PPT是用于什么场景？", True),
+          ("有没有特别要强调的内容？", "偏向什么色彩搭配？", False),
+          ("受众是谁？", "要多少页？", False),
+          ("您倾向哪种风格？", "偏爱什么样的色彩搭配？", True)]
+_okn = sum(1 for a, b, e in _pairs if T._q_similar(a, b) == e)
+check("判重判据在 6 组真机样本上全对（换词同问要判重、不同问题不能误判）",
+      _okn == len(_pairs), "%d/%d" % (_okn, len(_pairs)))
+
+# 行为：第二轮整批复问 → 驳回
+T.ask_guard_reset("t-dup")
+_ui = _FakeUI()
+T._do_ask_user({"questions": [{"question": "这份PPT用于什么场合？"},
+                              {"question": "希望控制在几页？"},
+                              {"question": "倾向哪种风格？"},
+                              {"question": "面向哪些人？"},
+                              {"question": "有什么必须包含的？"}]},
+               {"ask": _ui, "ask_mode": "deep", "session": "t-dup"})
+_ui2 = _FakeUI()
+_out2 = T._do_ask_user({"questions": [{"question": "这份PPT主要用于什么场合呢？"},
+                                      {"question": "大约要多少页？"},
+                                      {"question": "偏爱什么色彩搭配？"}]},
+                       {"ask": _ui2, "ask_mode": "deep", "session": "t-dup"})
+check("⚠️ 第二轮整批复问 → **不弹框**、驳回并要求只问空白",
+      not _ui2.calls and "重复" in _out2, _out2[:70])
+
+# 行为：第二轮问**新方向** → 放行
+T.ask_guard_reset("t-new")
+_ui3 = _FakeUI()
+T._do_ask_user({"questions": [{"question": "这份PPT用于什么场合？"},
+                              {"question": "希望控制在几页？"},
+                              {"question": "倾向哪种风格？"},
+                              {"question": "面向哪些人？"},
+                              {"question": "有什么必须包含的？"}]},
+               {"ask": _ui3, "ask_mode": "deep", "session": "t-new"})
+_ui4 = _FakeUI()
+_out4 = T._do_ask_user({"questions": [{"question": "需要配图吗？要实景照片还是示意图？"}]},
+                       {"ask": _ui4, "ask_mode": "deep", "session": "t-new"})
+check("第二轮问**新方向**（配图）→ 正常弹框", len(_ui4.calls) == 1, _out4[:60])
+check("⚠️ 去重驳回**最多一次**（第二次必须放行，别卡死）",
+      "重复" in _out2 and "重复" not in _out4)
+
 shutil.rmtree(TMP, ignore_errors=True)
 print()
 print("=" * 68)
