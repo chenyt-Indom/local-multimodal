@@ -682,7 +682,8 @@ _WS_PROJECT_SCHEMAS = [
 
 
 def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
-                 code_exec: bool = False, writing: bool = False) -> list:
+                 code_exec: bool = False, writing: bool = False,
+                 ask_mode: str = "quick") -> list:
     """返回工具 schema 列表。
 
     web_enabled=True 时才暴露联网搜索工具——保证"开关不开不联网"的约定：
@@ -691,13 +692,15 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
     code_exec 同理：关着就不给"本地跑代码"的工具（默认关，避免模型擅自执行代码）。
 
     writing=True 是**长文创作**场景，只给最必要的几个工具（见下面）。
+    ask_mode 会写进 ask_user 的**工具描述**（模型挑工具时先看它）：
+    深度模式要求一轮问 5~7 条、不够再问下一轮 —— 只写在系统提示里不够。
     """
     if writing:
         # 写作文/方案这类任务只需要「问细节」和「存文件」，
         # 其余工具（画图、搜图、文件系统、跑代码…）这轮根本用不上。
         # 砍掉它们的收益很实在：18 个工具的 schema ≈ 5800 token，
         # 而长文生成既要思考又要写几百上千字，额度本来就很紧张。
-        picked = [_ASK_USER_SCHEMA, _LIBRARY_SCHEMA]
+        picked = [_ask_user_schema(ask_mode), _LIBRARY_SCHEMA]
         if kb_enabled:
             picked.insert(0, _KB_SCHEMA)      # 写东西时查用户资料是常见需求
         return picked
@@ -747,17 +750,43 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
             "type": "function",
             "function": {
                 "name": "generate_image",
-                "description": "根据描述生成图片（文生图）。prompt 必须是详细具体的**英文**描述，生成后直接展示给用户。"
+                "description": "根据描述生成图片（文生图）。prompt 必须是详细具体的**英文**描述，生成后直接展示给用户。\n"
                                "⚠️ 用户只说了主体、没说风格/用途/氛围/尺寸时（例如「画一只狐狸」），"
                                "**先调 ask_user 问一轮再画** —— 画一次要几十秒，风格选错就得重画；"
-                               "用户已经说清风格与用途时直接画，不要再问。",
+                               "用户已经说清风格与用途时直接画，不要再问。\n"
+                               "⚠️⚠️ **prompt 写得越具体越像**（用户报过「偏离要求」「不够满意」）——"
+                               "必须凑齐这几样，缺哪样就按用户原话补：\n"
+                               "  ① 主体 + 动作/状态（a red fox **sitting and looking at camera**）\n"
+                               "  ② 场景/背景（in an autumn forest, fallen leaves on the ground）\n"
+                               "  ③ 光线与时间（golden hour backlight / soft window light）\n"
+                               "  ④ 镜头与画质（close-up portrait, shallow depth of field）\n"
+                               "  ⑤ **风格词必须写**：要写实就写 photorealistic, 35mm photograph, "
+                               "realistic texture（别只写 realistic 一个词）；"
+                               "要插画写 digital illustration；要卡通写 anime style。\n"
+                               "  ❌ 反例（太笼统，出来必然不像）：「a beautiful fox, high quality」\n"
+                               "  ✅ 正例：「a red fox sitting in an autumn forest, golden hour "
+                               "backlight, close-up portrait, shallow depth of field, "
+                               "photorealistic, 35mm photograph, realistic fur texture」\n"
+                               "⚠️ 用户要「写实」时，**negative_prompt 里排除绘画感**："
+                               "cartoon, anime, illustration, painting, 3d render, "
+                               "plastic, oversaturated, blurry, deformed, extra limbs。",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "prompt": {"type": "string", "description": "详细的英文图片描述（SDXL 风格 prompt，英文）"},
-                        "negative_prompt": {"type": "string", "description": "英文负面描述，可选，例如 'low quality, blurry, watermark'"},
-                        "size": {"type": "integer", "enum": [512, 768], "description": "图片边长，默认512"},
-                        "hd": {"type": "boolean", "description": "是否高清放大（默认 false）。当用户要求「高清/高分辨率/4K/画质好点/放大」时设为 true：会额外做 4 倍超分（512→2048），耗时约多 5 秒"},
+                        "prompt": {"type": "string",
+                                   "description": "详细的英文图片描述。要写全：主体+动作、场景、光线、镜头、风格"
+                                                  "（写实类务必带 photorealistic / 35mm photograph）"},
+                        "negative_prompt": {"type": "string",
+                                            "description": "英文负面描述。写实类建议：" 
+                                                           "cartoon, anime, illustration, painting, 3d render, "
+                                                           "plastic, oversaturated, blurry, deformed, extra limbs"},
+                        "size": {"type": "integer", "enum": [512, 768],
+                                 "description": "图片边长，默认512。要细节/要印出来用 768"},
+                        "hd": {"type": "boolean",
+                               "description": "是否出高清成品（默认 false）。"
+                                              "用户要「高清/高分辨率/画质好点/能放大看/要写实细节」时设为 true ——"
+                                              "会先放大一档**做细节精修**（真正长细节）再超分，"
+                                              "512→2048，多花约 30 秒（实测 37.9s），但清晰度和质感明显更好"},
                     },
                     "required": ["prompt"],
                 },
@@ -767,18 +796,22 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
             "type": "function",
             "function": {
                 "name": "edit_image",
-                "description": "对一张已有图片做局部微改（图生图），如「把背景改成夜晚」「戴上帽子」。"
+                "description": "对一张已有图片做**局部**修改（图生图），如「把背景改成夜晚」「戴上帽子」。\n"
+                               "⚠️ 这是「改现成的图」，**不是重画**：改动之外的构图/主体/光线应当保持原样。\n"
                                "source 填本地路径；**若用户本轮拖入的图、或刚才生成/微改的那张要改，"
                                "就不用填 source**（系统会自动拿「最近那张图」当底图）——"
                                "用户说「微改这张图 / 把刚才那张改成…」时直接调用本工具即可，"
-                               "不要让他重新拖一次，也不要改用搜图。"
-                               "prompt 用英文，并注明保持其他部分不变。",
+                               "不要让他重新拖一次，也不要改用搜图。\n"
+                               "prompt 用英文，**第一句写「要改什么」**（比如 change the background to night），"
+                               "系统会自动补上「其余保持不变」的约束。\n"
+                               "⚠️ 用户要「写实/真实」时，prompt 里要点明 photorealistic / "
+                               "consistent with the original photo，别只在口头答应。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "prompt": {
                             "type": "string",
-                            "description": "英文描述要做的修改，含 keep the rest unchanged 之类约束"},
+                            "description": "英文描述要做的修改（只写「要改什么」，不用写「其余不变」）"},
                         "source": {
                             "type": "string",
                             "description": "（可选）本地图片绝对路径；不填则使用用户本轮拖入对话的那张图"},
@@ -787,7 +820,17 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
                             "description": "英文负面描述，可选，例如 'low quality, blurry, distorted'"},
                         "strength": {
                             "type": "number",
-                            "description": "修改强度 0~1，默认0.6；0.3=轻微微调，0.8=大改"},
+                            "description": "修改幅度 0~1，**默认 0.5**。"
+                                           "⚠️ 实测规律（同一张底图让它「把背景改成夜晚」）："
+                                           "**0.35~0.65 主体几乎不动，但场景级的改动（换背景/换日夜/"
+                                           "换天气）基本不会生效**；要到 0.8~0.9 才真能改出来，"
+                                           "代价是主体会被明显重画。按用户要的改动量选档：\n"
+                                           "    · 0.35~0.45 = 换颜色 / 加小物件 / 微调光影（最保原图）\n"
+                                           "    · 0.5（默认） = 一般细节改动\n"
+                                           "    · 0.6~0.7  = 换服装 / 换小场景\n"
+                                           "    · 0.8~0.9  = **换背景 / 换日夜 / 换天气这类大改**"
+                                           "（用户明确说「把背景改成…」「换成夜晚」时必须用这一档，"
+                                           "否则用户会觉得「根本没改」）"},
                     },
                     "required": ["prompt"],
                 },
@@ -919,7 +962,7 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
     # 知识库工具只在「知识库」开关打开时暴露 —— 与联网同样的约定：
     # 开关关着，模型连工具都看不到，自然就不会去翻资料。
     schemas.append(_LIBRARY_SCHEMA)
-    schemas.append(_ASK_USER_SCHEMA)
+    schemas.append(_ask_user_schema(ask_mode))
     schemas.append(_CONNECT_AMAP_SCHEMA)
     # 开发工作区：人机协同开发用（多文件项目，相对路径，后端拼绝对路径）
     schemas.append(_WS_LIST_SCHEMA)
@@ -1125,11 +1168,31 @@ _CONNECT_AMAP_SCHEMA = {
 #    只要关键前提没说清都可以先问一次。以前描述里只写"创作类任务"，
 #    还明确写着"纯技术或计算任务别用" —— 结果是**做代码/画图时从来不问**
 #    （2026-09-21 用户反馈："生成内容时模型不会在前端二次询问"）。
-_ASK_USER_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "ask_user",
-        "description": (
+def _ask_user_schema(ask_mode: str = "quick") -> dict:
+    """构造 ask_user 的工具描述。
+
+    ⚠️ 2026-09-23：把"这一轮该问几条"写进**工具描述**（模型挑工具时先看 schema）。
+    用户报"开启深度询问时没有多轮提问、单轮问题数也不够"——只把要求写在系统提示里
+    不够；schema 里那句「宁可少而精，别凑数」反而在**劝它少问**。
+    这里按模式分别给出明确数量。
+    """
+    if str(ask_mode or "quick").lower() == "deep":
+        count_line = (
+            "\n⚠️⚠️ **当前是「深度询问」模式** —— 用户明确要求把信息问透：\n"
+            "  · **本轮一次给出 5~7 个问题**，覆盖：用途/受众、范围与篇幅、风格或口径、"
+            "硬性约束与雷区、交付形式（格式/尺寸/页数）、有没有参考样例；\n"
+            "  · 拿到答复后**如果还有影响做法的空白，就再调用本工具问下一轮**"
+            "（通常 2~3 轮）—— 不要问一轮就动手，也不要复问已经答过的；\n"
+            "  · 用户答了「随便/你定」的方向就别再追。\n")
+    else:
+        count_line = (
+            "\n⚠️ **当前是「快速了解」模式**：只问最关键的 1~3 个问题，"
+            "拿到基本信息就开工。\n")
+    return {
+        "type": "function",
+        "function": {
+            "name": "ask_user",
+            "description": (
             "【向用户提问】在界面上弹出一个问答框，让用户补充信息，他填完你继续做。\n"
             "什么时候用：**这一轮要产出东西、而关键前提没说清**时 —— 先问清楚再动手，"
             "比硬猜一个交付物强得多。适用于各类有交付物的任务：\n"
@@ -1157,8 +1220,9 @@ _ASK_USER_SCHEMA = {
             "只是问个问题 / 查资料 / 解释概念；算个数这类一次性计算；"
             "关键信息你自己查得到（search_knowledge / web_search）；"
             "打招呼、闲聊、表达情绪的对话。\n"
-            "每题给 2-4 个选项（用户也可以不选、自己写）。"
-        ),
+                "每题给 2-4 个选项（用户也可以不选、自己写）。"
+                + count_line
+            ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -1211,6 +1275,11 @@ _KB_SCHEMA = {
         },
     },
 }
+
+
+# ⚠️ 兼容别名：原来是个常量 `_ASK_USER_SCHEMA`，2026-09-23 改成按询问模式生成的
+# 函数（`_ask_user_schema(mode)`）。保留这个名字，免得外部引用（测试/脚本）炸掉。
+_ASK_USER_SCHEMA = _ask_user_schema("quick")
 
 
 # 天气工具：走结构化数据源，不要用搜索引擎
@@ -1687,6 +1756,54 @@ _IMAGE_PROMPT_BOOST = (
     "professional photography, highly detailed, sharp focus, "
     "vivid colors, 8k, cinematic lighting, masterpiece, best quality"
 )
+# 没识别出风格时的中性加成（不含任何风格词，避免和用户要求打架）
+_IMAGE_PROMPT_NEUTRAL = "highly detailed, sharp focus, best quality, well composed"
+_IMAGE_NEG_DEFAULT = "low quality, blurry, watermark, text, deformed, extra limbs"
+
+# ⚠️⚠️ **按风格分别加强**（2026-09-23 修，用户报"要求写实的时候也不写实""没按用户要求改"）：
+# 原来**所有请求**都追加同一句 "professional photography, 8k, cinematic lighting" ——
+# 用户要"卡通/动漫/插画"时，这句正向词和需求**直接打架**：模型两头都占一点 →
+# 出来的是四不像（既不像照片也不像插画）。反过来，要"写实"时又缺真正的摄影系词
+# （35mm / natural lighting / realistic texture）；加上 SD-Turbo 本身 CFG=0
+# 没有分类器引导加成，全靠提示词 —— 提示词写歪了，成图就跟着歪。
+# ⇒ 按用户要的风格给**正向加成 + 负向排除**（负向同样关键：要写实就得排掉 cartoon / 3d render）。
+_STYLE_PRESETS = (
+    (("写实", "真实", "照片", "摄影", "实拍", "photorealistic", "photograph", "realistic"),
+     "photorealistic, 35mm photograph, natural lighting, realistic surface texture, "
+     "fine detail, sharp focus, depth of field",
+     "cartoon, anime, illustration, painting, drawing, 3d render, cgi, plastic, "
+     "doll, oversaturated, lowres, blurry, deformed, watermark, text, extra limbs"),
+    (("插画", "手绘", "绘本", "水彩", "illustration", "storybook"),
+     "digital illustration, clean linework, harmonious palette, richly detailed drawing",
+     "photo, photorealistic, 3d render, cgi, lowres, blurry, watermark, text"),
+    (("卡通", "动漫", "二次元", "anime", "cartoon", "comic"),
+     "anime style, clean cel shading, vivid colors, expressive character design",
+     "photo, photorealistic, realistic, 3d render, lowres, blurry, watermark, text"),
+    (("3d", "三维", "渲染", "c4d", "blender", "octane"),
+     "3d render, soft global illumination, clean materials, high detail",
+     "flat, sketch, lowres, blurry, watermark, text"),
+    (("油画", "国画", "水墨", "壁画", "painting"),
+     "oil painting, visible brush strokes, rich texture, artistic composition",
+     "photo, 3d render, lowres, blurry, watermark, text"),
+    (("海报", "封面", "logo", "图标", "扁平", "poster"),
+     "graphic design, clean composition, strong visual hierarchy",
+     "cluttered, messy, lowres, blurry, watermark, text"),
+)
+
+
+def _style_for(text: str) -> tuple:
+    """看用户/模型写的内容里有没有风格线索 → 返回 (正向加成, 负向排除)。
+
+    中文需求与模型写的英文 prompt 都会扫一遍（英文 prompt 里通常带
+    photorealistic / illustration 这类词），两边都认不出来就返回空串，
+    由调用方退化成中性加成 —— **不要瞎猜风格**，猜错比不加更糟。
+    """
+    t = str(text or "").lower()
+    for keys, pos, neg in _STYLE_PRESETS:
+        for k in keys:
+            if k in t:
+                return pos, neg
+    return "", ""
 
 
 # ---------- 联网搜图（找现成的真实图片，区别于文生图）----------
@@ -1807,11 +1924,14 @@ def _do_generate_image(arguments, ui_events):
     prompt = (arguments.get("prompt") or "").strip()
     if not prompt:
         return "错误：未提供图片描述（prompt）。"
-    negative = (arguments.get("negative_prompt") or "").strip() or "low quality, blurry, watermark, text, deformed"
+    # ⚠️ 风格加成按**用户原话 + 模型写的英文 prompt**一起判（见 _STYLE_PRESETS 说明）：
+    #    要"写实"就加摄影系正向词、排掉 cartoon/3d；要"卡通"就别再硬塞"professional photography"。
+    style_pos, style_neg = _style_for(prompt)
+    user_neg = (arguments.get("negative_prompt") or "").strip()
+    negative = ", ".join(x for x in (user_neg, style_neg or _IMAGE_NEG_DEFAULT) if x)
     size = int(arguments.get("size") or 512)
     hd = bool(arguments.get("hd"))
-    # 提升 SD 对 prompt 的遵循度：追加质量词
-    boosted = prompt + ", " + _IMAGE_PROMPT_BOOST
+    boosted = ", ".join(x for x in (prompt, style_pos or _IMAGE_PROMPT_NEUTRAL) if x)
     t2i.unload()  # 确保显存空闲
     start = time.time()
     result = t2i.generate(boosted, negative_prompt=negative, steps=4,
@@ -1828,7 +1948,9 @@ def _do_generate_image(arguments, ui_events):
                     "origin": "gen"})     # ← 前端据此标注「AI 生成」
     real_size = result.get("size") or f"{size}x{size}"
     extra = f"（{result['hd_note']}）" if (hd and result.get("hd_note")) else ""
-    return (f"已生成图片（{real_size}，{result.get('device')}，用 {round(cost,1)} 秒）{extra}。"
+    style_note = "（已按「%s」风格加强）" % style_pos.split(",")[0] if style_pos else ""
+    return (f"已生成图片（{real_size}，{result.get('device')}，用 {round(cost,1)} 秒）"
+            f"{extra}{style_note}。"
             f"生成的图片已经展示给用户。若用户想调整，可再次明确修改描述。")
 
 
@@ -1840,7 +1962,10 @@ def _do_edit_image(arguments, ui_events, context):
         return "错误：未提供修改描述（prompt）。"
     negative = (arguments.get("negative_prompt") or "").strip() or \
         "low quality, blurry, watermark, distorted, deformed"
-    strength = max(0.0, min(1.0, float(arguments.get("strength") or 0.6)))
+    # ⚠️ 默认 0.45（原 0.6）：SD-Turbo 在 0.6 上**整幅重画**的成分太高，
+    #    用户报的"微改歪曲原图"与此有关。0.45 只改该改的地方，其余基本保持。
+    #    幅度要变大时由模型传 strength（见工具描述里的档位）。
+    strength = max(0.0, min(1.0, float(arguments.get("strength") or 0.5)))
     steps = int(arguments.get("steps") or 4)
     source = (arguments.get("source") or "").strip()
 
@@ -1864,8 +1989,14 @@ def _do_edit_image(arguments, ui_events, context):
         return ("错误：无法确定要修改的图片。请把要改的图片拖入对话（作为本轮附件）后再让我微改，"
                 "或通过 source 指定本地图片路径。")
 
-    # 2) 提示措辞：强化"保持其余不变"
-    boosted = prompt + ", keep the original layout and style, high detail"
+    # 2) 提示措辞：**第一位是"别动原图"** —— 用户报"微改歪曲原图"，
+    #    除了分辨率那条（已在 t2i 里修），措辞上也要把"保持构图/光线/其余不变"说死。
+    #    ⚠️ 注意别再追加通用摄影加成：微改的底图可能是插画，硬加"professional photography"
+    #    会把它往照片方向拽（那就是"没按用户要求改"）。
+    style_pos, style_neg = _style_for(prompt)
+    keep = "keep the original composition, lighting and everything else unchanged"
+    boosted = ", ".join(x for x in (prompt, keep, style_pos) if x)
+    negative = ", ".join(x for x in (negative, style_neg) if x)
     t2i.unload()
     start = time.time()
     result = t2i.edit_image(init_image, boosted, negative_prompt=negative,

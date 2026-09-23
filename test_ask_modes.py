@@ -48,7 +48,9 @@ CODE_TOOLS = "\n".join(l for l in SRC_TOOLS.splitlines() if not l.strip().starts
 HTML = open(os.path.join(ROOT, "frontend", "index.html"), encoding="utf-8").read()
 JS = open(os.path.join(ROOT, "frontend", "app.js"), encoding="utf-8").read()
 
-ASK_SCHEMA_DESC = T._ASK_USER_SCHEMA["function"]["description"]
+# ⚠️ 2026-09-23：ask_user 的描述改成**按询问模式生成**了（深度/快速给的数量不同），
+#    所以这里取的是「快速」模式那份（默认档），和以前的常量语义一致。
+ASK_SCHEMA_DESC = T._ask_user_schema("quick")["function"]["description"]
 ASK_Q_DESC = (T._ASK_USER_SCHEMA["function"]["parameters"]["properties"]["questions"]
               ["description"])
 
@@ -69,8 +71,14 @@ print("\n=== ① 两个模式：提示词要说清各自的「问到什么程度
 quick = M._ask_mode_line({"ask_mode": "quick"})
 deep = M._ask_mode_line({"ask_mode": "deep"})
 check("快速模式：只问最关键的几条", "1~3" in quick)
-check("深度模式：问题个数不限、可以分多轮",
-      "个数不限" in deep and "分多轮" in deep)
+# ⚠️ 2026-09-23 改：用户报「深度询问时没有多轮提问、单轮问题数也不够」。
+#    原来这里断言的是「个数不限、可以分多轮」，但**没有数字的许可对模型不起作用**，
+#    它照样只问 2~3 条就动手。现在深度模式给的是具体数量 + 具体轮次。
+check("深度模式：一轮给具体数量（5~7 个）", "5~7" in deep)
+check("深度模式：明确要**多轮**（2~3 轮 / 再问一轮）",
+      "2~3 轮" in deep and "再问一轮" in deep)
+check("深度模式：列了该覆盖的维度", "受众" in deep and "交付形式" in deep)
+check("⚠️ 深度模式也要有「问够就动手」的刹车（别无限追问）", "问够就动手" in deep)
 check("缺省（没配）按快速模式走", "1~3" in M._ask_mode_line({}))
 check("配了乱七八糟的值也按快速走", "1~3" in M._ask_mode_line({"ask_mode": "xxx"}))
 check("config 里有 ask_mode 且默认快速",

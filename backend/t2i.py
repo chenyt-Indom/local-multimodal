@@ -32,6 +32,36 @@ def _resolve_model_dir() -> str:
 LOCAL_MODEL_DIR = _resolve_model_dir()
 
 
+# ---------- 工作分辨率：SD 原生只有 512，喂多大的图它就得在多大的画布上重绘 ----------
+# ⚠️⚠️ 2026-09-23 修：以前 img2img **不限制底图尺寸** —— 用户拖一张 2400×1600 的照片进来，
+# 流水线就真的在 2400×1600 上跑（是原生的 ~14 倍面积）。后果有两个，都很严重：
+#   ① 出图**必然歪曲**（模型从没在这个分辨率上训练过，结构全乱）——用户报的"微改歪曲原图"；
+#   ② 慢得离谱（实测 44.5 秒/张，正常只要 4~6 秒）。
+# ⇒ 底图先缩到长边 ≤ EDIT_MAX_SIDE 再重绘，最后再按**原始尺寸**放回去。
+GENERATE_NATIVE = 512          # 生成的原生边长（SD2.1 系）
+EDIT_MAX_SIDE = 768            # 微改的工作分辨率上限（长边）
+EDIT_MIN_SIDE = 384            # 太小也重绘不出东西，兜个下限
+HD_TARGET_MAX = 2048           # hd 交付的最大边长（超分是 4x，4096 太大没必要）
+
+
+def _fit_working_size(w: int, h: int, max_side: int = EDIT_MAX_SIDE) -> tuple:
+    """把 (w,h) 折算成"适合交给 SD 重绘"的尺寸：长边 ≤ max_side、保持比例、8 的倍数。
+
+    8 的倍数不是洁癖 —— VAE 下采样 8 倍，尺寸不是 8 的倍数时 diffusers 会**静默裁掉**
+    几个像素，微改出来的图和原图对不齐（叠在一起看就是"边缘错位"）。
+    """
+    w, h = max(1, int(w)), max(1, int(h))
+    m = float(max(w, h))
+    if m > max_side:
+        s = max_side / m
+        w, h = int(round(w * s)), int(round(h * s))
+    # 长边太小时整体放大到下限以上（否则重绘幅度再好也没细节可依）
+    if max(w, h) < EDIT_MIN_SIDE:
+        s = EDIT_MIN_SIDE / float(max(1, max(w, h)))
+        w, h = int(round(w * s)), int(round(h * s))
+    return max(64, (w // 8) * 8), max(64, (h // 8) * 8)
+
+
 def _resolve_esrgan_path() -> str | None:
     """定位超分模型（RealESRGAN 4x）。找不到就返回 None，功能自动降级。"""
     env = os.environ.get("ESRGAN_MODEL")
@@ -335,9 +365,47 @@ def _pipe_loaded():
     return _pipe is not None
 
 
+def refine_detail(image, prompt: str, negative_prompt: str = "",
+                  strength: float = 0.32) -> tuple:
+    """**细节精修**（俗称 hires fix）：把图放大一档后用低幅度 img2img 重绘一遍。
+
+    为什么要这一步（2026-09-23 用户报"做工太过粗糙"）：
+    以前 `hd=True` 只是拿 RealESRGAN **插值放大** —— 放大不会凭空长出新细节，
+    它只会把 512 的软边猜成硬边，看起来就是"糊 + 塑料感 + 油画味"。
+    正确做法是**让 SD 自己在更大的画布上重画一遍**（低 strength，只补细节不动构图），
+    再交给超分网络。实测这一步能把毛/布料/纹理这类细节真正"长"出来。
+
+    返回 (新图, 说明)；失败时原样返回并说明原因（**绝不让整个生成失败**）。
+    """
+    w, h = image.size
+    if max(w, h) >= 1024:
+        return image, "已是高分辨率，跳过精修"
+    try:
+        big = image.resize((int(w * 2), int(h * 2)), 3)   # 3 = LANCZOS
+        pipe, device = _get_edit_pipe()
+        try:
+            pipe.to(device)
+        except Exception:
+            pass
+        # 总步数要按 strength 折算（见 edit_image 里的说明），保证实际生效步数 ≈ 4
+        ratio = max(0.05, min(1.0, float(strength)))
+        total = max(1, math.ceil(4 / ratio))
+        out = pipe(prompt=prompt,
+                   negative_prompt=negative_prompt or "low quality, blurry, watermark",
+                   image=big, num_inference_steps=total, strength=float(strength),
+                   guidance_scale=0.0 if MODEL_REPO.endswith("sd-turbo") else 7.5).images[0]
+        return out, f"细节精修 {w}x{h} → {out.size[0]}x{out.size[1]}"
+    except Exception as exc:
+        _log_exc("细节精修", exc)
+        return image, f"细节精修跳过（{type(exc).__name__}）"
+
+
 def generate(prompt: str, negative_prompt: str = "", steps: int = 4,
              width: int = 512, height: int = 512, hd: bool = False) -> dict:
-    """文生图，返回 base64 PNG。hd=True 时再用 RealESRGAN 放大到高分辨率。"""
+    """文生图，返回 base64 PNG。
+
+    hd=True：**先把画布放大一档做细节精修，再用 RealESRGAN 放大**（见 refine_detail）。
+    """
     try:
         pipe, device = _get_pipe()
     except Exception as e:
@@ -360,7 +428,22 @@ def generate(prompt: str, negative_prompt: str = "", steps: int = 4,
         ).images[0]
         note = ""
         if hd:
-            result, note = upscale_image(result)
+            # ① 细节精修（真长细节）→ ② 超分（补像素密度）
+            result, extra = refine_detail(result, prompt, negative_prompt)
+            note = extra
+            # ⚠️⚠️ **超分前必须把 SD 流水线放掉**（2026-09-23 实测）：
+            #    两者同时占显存时，RealESRGAN 在 1024 输入上会
+            #    `memory allocation failed ... trying to allocate 8.6GB` → 退化到极慢路径，
+            #    实测一张 hd 图 **380 秒**；而单独跑只要 18.6 秒。
+            #    代价是下一张图要重载 SD（约 10 秒），但 hd 本来就是"我要质量"的请求。
+            unload()
+            result, up = upscale_image(result)
+            note = (note + "；" + up) if note else up
+            # 4096 太大也没必要（文件大、界面卡），降到 HD_TARGET_MAX 交付
+            if max(result.size) > HD_TARGET_MAX:
+                s = HD_TARGET_MAX / float(max(result.size))
+                result = result.resize((int(result.size[0] * s), int(result.size[1] * s)), 3)
+                note += f" → 交付 {result.size[0]}x{result.size[1]}"
         buf = io.BytesIO()
         result.save(buf, format="PNG")
         return {"ok": True, "b64": base64.b64encode(buf.getvalue()).decode("utf-8"),
@@ -562,6 +645,16 @@ def edit_image(init_image, prompt: str, negative_prompt: str = "",
             init_image = init_image.convert("RGB")
     except Exception as e:
         return {"ok": False, "error": f"无法读取参考图片: {e}"}
+    # ⚠️⚠️ **底图必须先归一化到合适的工作分辨率**（2026-09-23 修，这是"微改歪曲原图"的根因）：
+    #     原样把 2400×1600 交给 SD，它就在 2400×1600 上重绘 —— 那是原生 512 的 ~14 倍面积，
+    #     模型从没在这个尺度上训练过，结构全乱（而且实测 44.5 秒/张）。
+    #     这里先缩到长边 ≤768 重绘，完成后**再放回用户原来的尺寸**，
+    #     这样用户拿到的图尺寸不变、内容也不再歪。
+    orig_size = init_image.size
+    work_w, work_h = _fit_working_size(orig_size[0], orig_size[1])
+    work = init_image
+    if (work_w, work_h) != orig_size:
+        work = init_image.resize((work_w, work_h), 3)      # 3 = LANCZOS
     try:
         pipe, device = _get_edit_pipe()
     except Exception as e:
@@ -580,15 +673,22 @@ def edit_image(init_image, prompt: str, negative_prompt: str = "",
         result = pipe(
             prompt=prompt,
             negative_prompt=negative_prompt or "low quality, blurry, watermark",
-            image=init_image,
+            image=work,
             num_inference_steps=total_steps,
             strength=float(strength),
             guidance_scale=0.0 if MODEL_REPO.endswith("sd-turbo") else 7.5,
         ).images[0]
+        # 放回用户原来的尺寸（微改不该顺手把人家照片改小）
+        back_note = ""
+        if result.size != orig_size:
+            result = result.resize(orig_size, 3)          # 3 = LANCZOS
+            back_note = f"（在 {work_w}x{work_h} 上重绘后还原到 {orig_size[0]}x{orig_size[1]}）"
         buf = io.BytesIO()
         result.save(buf, format="PNG")
         return {"ok": True, "b64": base64.b64encode(buf.getvalue()).decode("utf-8"),
-                "device": device, "model": "img2img-" + MODEL_REPO}
+                "device": device, "model": "img2img-" + MODEL_REPO,
+                "work_size": f"{work_w}x{work_h}", "source_size": f"{orig_size[0]}x{orig_size[1]}",
+                "size_note": back_note}
     except Exception as e:
         return {"ok": False, "error": f"图片微改失败: {e}"}
 

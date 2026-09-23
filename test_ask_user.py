@@ -67,7 +67,9 @@ SRC_MAIN_CODE = "\n".join(l for l in SRC_MAIN.splitlines()
 
 # ==========================================================================
 print("\n=== 1. 工具描述要覆盖各类产出任务（不能只写作文）===")
-desc = T._ASK_USER_SCHEMA["function"]["description"]
+# ⚠️ 2026-09-23：ask_user 的描述改成**按询问模式生成**了（深度/快速给的数量不同），
+#    所以这里取的是「快速」模式那份（默认档），和以前的常量语义一致。
+desc = T._ask_user_schema("quick")["function"]["description"]
 for kw in ("代码", "图片", "PPT", "表格", "文章"):
     check(f"描述里提到「{kw}」", kw in desc)
 check("描述里给了各类任务该问什么（≥4 个 · 段）", desc.count("·") >= 5,
