@@ -20,6 +20,11 @@ import base64
 import codecs
 import io
 import json
+# ⚠️ 必须显式导入 urllib.parse：只写 `import urllib` 是拿不到 .parse 的，
+#    而 `_fake_doclib_links()` 要靠它把链接里的 `%E4%BC%AA...` 还原成中文名。
+#    漏了这行的话，unquote 会抛 NameError 被 except 吞掉 →
+    #    每个**真的**中文名文件都会被误判成"并不存在"（假警报满天飞）。
+import urllib.parse
 import math
 import time
 import asyncio
@@ -2862,6 +2867,38 @@ def _looks_like_tool_block(lang: str, body: str) -> bool:
     return obj is not None and _as_tool_call_obj(obj) is not None
 
 
+def _fake_doclib_links(text: str) -> list:
+    """正文里引用的「生成文库文件」链接，哪些其实**并不存在**。
+
+    ⚠️ 2026-09-25 加（用户报「模型生成的 PPT 打不开」）：
+    模型会**凭空捏造产物和下载链接**。实测原话：
+        用户：「生成一份关于我的入团申请书的PPT」
+        模型：「✅ 已为您完成！…共 12 页」+
+              [立即下载完整版](/api/doclib/download?rel=陈宇桐同志入团申请报告.pptx)
+    可它**一个工具都没调**，文库目录里什么都没有。用户点开当然打不开；
+    回来问它"为什么打不开"，它又编出"组织部门审核保密""浏览器不兼容"
+    "图书馆系统维护"等一串假原因 —— 一路幻觉到底。
+    这里把"声称存在但实际没有"的链接挑出来，如实告诉用户。
+    """
+    out = []
+    for m in re.finditer(r"/api/doclib/download\?rel=([^)\s\"'>]+)", text or ""):
+        raw = m.group(1)
+        try:
+            rel = urllib.parse.unquote(raw)
+        except Exception:
+            rel = raw
+        rel = (rel or "").strip()
+        if not rel:
+            continue
+        try:
+            exists = os.path.isfile(doclib.file_path(rel))
+        except Exception:
+            exists = False
+        if not exists and rel not in out:
+            out.append(rel)
+    return out
+
+
 def _autosave_answer(text: str, user_text: str = "") -> str:
     """把模型写好的正文自动存进生成文库，返回相对路径（失败返回空串）。
 
@@ -4322,6 +4359,18 @@ async def chat(req: ChatRequest):
                                          "rel": _saved, "auto": True}}) + "\n"
                 yield json.dumps({"note": (
                     "模型没有真的执行保存，我已把正文自动存进生成文库：%s" % _saved)}) + "\n"
+
+        # ---- 幻觉产物：正文里声称的下载链接，文件其实不存在 ----
+        # 比"没保存"更坑：它给了个**看起来很真的链接和页数**，用户点开才发现是空的。
+        # 如实说清，并给出下一步（让它用真正的生成工具重做）。
+        _fake = _fake_doclib_links(final_text)
+        if _fake:
+            logger.warning("[fake-artifact] 正文声称的产物并不存在：%s", _fake[:3])
+            yield json.dumps({"note": (
+                "⚠️ 这些文件**其实没有生成**（只是写在正文里）：%s\n"
+                "想真正拿到文件，直接说一句「用工具生成」，"
+                "例如「用 make_pptx 做一份 XX 的 PPT」。"
+                % "、".join(_fake[:3]))}) + "\n"
 
         # 自动记忆：把本轮要点提炼进记忆（后台，且**等用户停手再做**，不跟聊天抢显卡）。
         # 每轮都安排，覆盖最近几轮内容；命中信号词（尤其"我做过/参加过"这类经历）则立即做。

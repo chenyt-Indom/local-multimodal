@@ -172,12 +172,34 @@ def _backup(full: str, rel: str) -> str:
         return ""
 
 
+# 二进制办公文件的扩展名：**禁止**用文本方式写入（详见 write_file 的说明）
+_OFFICE_TEXT_EXTS = (".pptx", ".docx", ".xlsx", ".ppt", ".doc", ".xls")
+
+
 def write_file(rel: str, text: str, mode: str = "overwrite") -> dict:
-    """写文本文件。mode=append 时追加。覆盖前自动备份。"""
+    """写文本文件。mode=append 时追加。覆盖前自动备份。
+
+    ⚠️⚠️ **办公文件（.pptx/.docx/.xlsx）一律拒绝**（2026-09-25 修）。
+    现象：用户拿到一个"打不开的 PPT" —— 文件只有 1.5KB，里面其实是
+    `<p style=...>…</table>` 这样的 **HTML**。
+    原因：模型把内容当文本写进了一个 .pptx 名字里，而这里对扩展名**毫不校验**，
+    于是静默成功；模型还据此宣称"已完成，共 12 页"（全是幻觉）。
+    真产物是**二进制**、必须走 `save_bytes`（见 tools.py 里 make_pptx/docx/xlsx）。
+    在这里一刀拦住，模型会收到明确指引，从而改用真正的生成工具。
+    """
     try:
         rel = _safe_rel(rel)
     except ValueError as e:
         return {"ok": False, "error": str(e)}
+    if str(rel).lower().endswith(_OFFICE_TEXT_EXTS):
+        return {"ok": False, "error": (
+            "「%s」是二进制办公文件，不能用文本方式写（写进去的文件打不开）。\n"
+            "要做 PPT / Word / Excel 请改用对应工具：\n"
+            "  · PPT   → make_pptx(title + slides)\n"
+            "  · Word  → make_docx(title + blocks)\n"
+            "  · Excel → make_xlsx(sheets)\n"
+            "这几个工具会生成真正能打开的文件并存进生成文库。"
+            % os.path.basename(str(rel)))}
     ensure_dir()
     full = _abs(rel)
     os.makedirs(os.path.dirname(full) or LIB_DIR, exist_ok=True)
