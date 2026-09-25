@@ -3534,6 +3534,12 @@ async def chat(req: ChatRequest):
             "再基于检索结果作答；不要在未检索的情况下凭记忆回答时效性内容。")})
 
     async def gen():
+        # ⚠️ 这两个是 chat() 作用域里的变量，但要在"思考吃光配额→重试"那条路上
+        #    **换掉**（重试时把工具砍到精简集腾窗口）。
+        #    不声明 nonlocal 的话，下面的赋值会让它们变成 gen() 的局部变量，
+        #    于是前面第一次 `client.chat(..., tools=tool_schemas)` 直接
+        #    UnboundLocalError: cannot access local variable（实测踩过）。
+        nonlocal tool_schemas, _native_tool_names
         # 每轮对话的本地工作消息序列 = system + 用户历史
         #
         # ⚠️ 较早对话摘要**必须并进第一条 system 消息**，不能再加一条 system。
@@ -3767,6 +3773,10 @@ async def chat(req: ChatRequest):
             # 孤儿文件就永远清不掉（实测正是这么漏的）。
             tool_calls = None
             done_reason = ""
+            # Ollama 报的"这个提示词实际占了多少 token"（见下面 done 的处理）。
+            # 判断"还剩多少额度能写正文"时，它是唯一权威的数字 ——
+            # 按字符估算会差得很远（工具 schema 那种 JSON 尤其不准）。
+            prompt_tokens = 0
             # 本轮是否需要"原样再来一次"（Ollama 解析工具调用失败的自动重试）
             _retry_round = False
             # 注意：必须用 _stream_lines（子线程读 + 队列），
@@ -3917,6 +3927,10 @@ async def chat(req: ChatRequest):
                 # 这是判断"回答是否被思考吃光"的**可靠信号**，比猜正文长不长准得多。
                 if obj.get("done"):
                     done_reason = obj.get("done_reason") or ""
+                    # 记下**提示词实测 token 数**：算"本轮还能写多少正文"要用它。
+                    # 实测（2026-09-25）：全开 38 个工具时这里会报 ~14700，
+                    # 而 num_ctx 只有 24576 —— 光提示词就吃掉 60% 的窗口。
+                    prompt_tokens = obj.get("prompt_eval_count") or 0
 
             if _retry_round:
                 # 这一轮整轮作废、原样重来。
@@ -3977,9 +3991,49 @@ async def chat(req: ChatRequest):
                 # 两轮内容会**拼在一起**（正文叠正文，最难看出是重复的那种）。
                 has_body = bool(round_msg["content"].strip())
                 if truncated and not has_body and retries_done < _MAX_EMPTY_RETRIES:
+                    # ---------- 重试之前，先把"窗口"腾出来 ----------
+                    # ⚠️ 2026-09-25 实测（这就是"重试了两轮还是没正文"的真因）：
+                    #   全开工具时 **光提示词就占 14706 token**（38 个工具，
+                    #   32280 字符），num_ctx 只有 24576 —— 固定开销吃掉 60%，
+                    #   留给"思考 + 正文"的不到 1 万。
+                    #   而原来的重试只把 max_tokens 从 8192 加到 16384，
+                    #   **早就超过剩余窗口了** → 必然再次被截断 → 白转两轮。
+                    # ⇒ 重试这一轮把工具砍到精简集：这一轮模型一个字正文都没写出来
+                    #   （全烧在思考上），说明它根本没在调工具，砍掉不损失能力，
+                    #   却能腾出**上万 token** 的窗口 —— 重试这才有可能成功。
+                    freed = 0
+                    if retries_done == 0:        # 只在第一次重试时砍，第二次沿用
+                        try:
+                            _before = _est_tokens(
+                                json.dumps(tool_schemas, ensure_ascii=False))
+                            tool_schemas = tools.make_schemas(
+                                cfg.get("web_enabled", False),
+                                cfg.get("rag_enabled", False),
+                                code_exec=False,
+                                writing=True,    # 精简集，见 tools.make_schemas
+                                ask_mode=str(cfg.get("ask_mode") or "quick"))
+                            freed = max(0, _before - _est_tokens(
+                                json.dumps(tool_schemas, ensure_ascii=False)))
+                            # 工具集变小了，白名单必须跟着换 ——
+                            # 否则模型把工具名写进正文时会被误判成"真的调过"
+                            _native_tool_names = {
+                                s.get("function", {}).get("name")
+                                for s in (tool_schemas or []) if isinstance(s, dict)}
+                            logger.warning("[retry] 为腾窗口精简工具：省下约 %d token",
+                                           freed)
+                        except Exception:
+                            logger.warning("[retry] 精简工具失败，按原样重试",
+                                           exc_info=True)
                     retries_done += 1
+                    # 这一轮**真实**还能写多少 = num_ctx − 提示词（扣掉刚腾出来的）
+                    room = MAX_TOKENS_CEILING
+                    if prompt_tokens:
+                        room = min(MAX_TOKENS_CEILING,
+                                   max(1024,
+                                       int(cfg.get("num_ctx") or 8192)
+                                       - max(0, int(prompt_tokens) - freed) - 512))
                     boosted = max(int(gen_params.get("max_tokens") or 2048) * 2, 4096)
-                    nxt = min(boosted, MAX_TOKENS_CEILING)
+                    nxt = min(boosted, room)
                     if nxt > int(gen_params.get("max_tokens") or 0):
                         gen_params["max_tokens"] = nxt
                         # ★ 上一轮的思考必须作废，并通知前端把面板清空。
@@ -3993,13 +4047,29 @@ async def chat(req: ChatRequest):
                         # 措辞别用"配额不足" —— 用户看到会以为是自己额度用完了，
                         # 其实是模型把输出空间花在"思考"上了（2026-09-15 用户反馈）
                         yield json.dumps({"note": (
-                            "模型思考占满了本次输出空间，正在自动加长输出上限重试…")}) + "\n"
+                            "模型思考占满了本次输出空间，正在腾出空间、加长上限重试…")}) + "\n"
                         continue
+                    # 连"再试一次"的空间都没有（提示词已经把窗口占满）→
+                    # 别让用户白等一轮，直接走下面的兜底
+                    logger.warning("[retry] 放弃重试：max_tokens=%s 已顶到可用上限 %d",
+                                   gen_params.get("max_tokens"), room)
                 if truncated and not round_msg["content"].strip():
-                    # 重试后仍被思考吃光：如实告知，避免用户看到空白一脸茫然
-                    yield json.dumps({"note": (
-                        "模型把输出空间都花在思考上了，没能写出正文。"
-                        "换个更具体的问法，或在设置里调大「最大生成长度」再试。")}) + "\n"
+                    # 重试也没救回来。**别再给用户一个空气泡 + 一句道歉** ——
+                    # 把它的思考原样交付（明确标注这不是正式回答）。
+                    # 「什么都没输出」和「输出的是半成品」相比，后者至少有信息量。
+                    if final_thinking.strip():
+                        _fb = ("（⚠️ 下面这段是模型的**思考过程**，不是正式回答 —— "
+                               "这一次它把输出空间全花在思考上了，没能写出答案。"
+                               "想让它答得更短，直接回一句「别想太多，直接给答案」"
+                               "再问一次。）\n\n" + final_thinking.strip())
+                        final_text += _fb
+                        yield json.dumps({"message": {"content": _fb}}) + "\n"
+                        yield json.dumps({"note": (
+                            "这次模型没写出正式回答，已把它的思考内容直接展示给你。")}) + "\n"
+                    else:
+                        yield json.dumps({"note": (
+                            "模型把输出空间都花在思考上了，没能写出正文。"
+                            "换个更具体的问法，或在设置里调大「最大生成长度」再试。")}) + "\n"
                 break  # 本轮无工具调用，得到最终答复
 
             # ---------- 执行工具（Agent loop）----------
