@@ -280,8 +280,29 @@ def _bullets_of(items):
     return out
 
 
-def _fit_size(n, hi=20, mid=18, lo=16, tiny=14):
+def _fit_size(n, hi=24, mid=21, lo=18, tiny=15):
     return hi if n <= 4 else mid if n <= 6 else lo if n <= 9 else tiny
+
+
+def _est_block_h(bs, size, w_in):
+    """估算一个要点块**实际**会占多高（英寸）。
+
+    ⚠️ 2026-09-25 修：原来是 `n × (size*1.62+9)/72`，比真实排版高估约 1.5 倍
+    （真实行距是 1.15 + 段前 9pt）。高估的后果是"明明装得下却被判成放不下"，
+    于是整块被顶在最上面、页面下方留一大片白 —— 用户说的"排版空"就是它。
+    现在按**下面真正用的排版参数**逐条累加，并估算折行数。
+    """
+    per_line = max(6.0, w_in * 72.0 / max(6.0, size))     # 一行大约放多少"字宽"
+    total = 0.0
+    for b in bs:
+        lvl = b["level"]
+        sz = float(b.get("size") or (size - (2 if lvl else 0)))
+        chars = 0.0
+        for ch in str(b.get("text") or ""):
+            chars += 0.55 if ord(ch) < 0x2E80 else 1.0
+        lines = max(1, int(chars / per_line) + (1 if chars % per_line else 0))
+        total += lines * sz * 1.15 / 72.0 + (4 if lvl else 9) / 72.0
+    return total
 
 
 def _put_bullets(slide, bs, x, y, w, h, th, st, base_size=None, font=None,
@@ -293,9 +314,14 @@ def _put_bullets(slide, bs, x, y, w, h, th, st, base_size=None, font=None,
     """
     n = len(bs)
     size = float(base_size or _fit_size(n))
-    line_h = (size * 1.62 + 9) / 72.0
-    est = max(1.0, n * line_h)
-    if valign == "top" or est >= h * 0.92:
+    est = _est_block_h(bs, size, w / 914400.0)
+    # 装不下就**逐档缩字号**（下限 12pt），绝不截断文字 ——
+    # 用户 2026-09-25 明确要求「取消所有篇幅限制」，宁可字小也不能丢内容。
+    while est > h and size > 12.0:
+        size -= 1.0
+        est = _est_block_h(bs, size, w / 914400.0)
+    # 阈值 0.99：只要装得下就整块垂直居中（原来 0.92 太严，内容明明不多也顶在上面）
+    if valign == "top" or est >= h * 0.99:
         top = y
     else:
         top = y + int((h - Emu(int(est * 914400))) / 2)
@@ -322,7 +348,7 @@ def _put_bullets(slide, bs, x, y, w, h, th, st, base_size=None, font=None,
             r0.text = mark
             _set_font(r0, sz, th["accent"] if not lvl else (st.get("muted") or th["muted"]), font=font)
         r = p.add_run()
-        r.text = b["text"][:200]
+        r.text = b["text"]          # 不截断：装不下靠下面的自适应字号解决
         _set_font(r, sz, col, bold=bool(b.get("bold")), font=font,
                   italic=bool(b.get("italic")))
         hl = b.get("hl") if b.get("hl") is not None else b.get("highlight")
@@ -399,7 +425,7 @@ def _badge(s, text, th, st):
     text = str(text or "").strip()
     if not text:
         return
-    text = text[:10]
+    # 不截断：标签宽度本来就按字数算（见下面的 w），截了反而丢信息
     w = Inches(0.34 + 0.17 * len(text))
     x = SLIDE_W - w - Inches(0.55)
     y = Inches(0.42)
@@ -424,7 +450,7 @@ def _slide_caption(s, text, th, st):
                   Inches(9.2), Inches(0.32))
     p = tf.paragraphs[0]
     r = p.add_run()
-    r.text = text[:110]
+    r.text = text          # 不截断（题注长了自己折行，但不丢字）
     _set_font(r, 10.5, st.get("muted") or th["muted"], font=st.get("font"))
 
 
@@ -453,20 +479,66 @@ def _page_base(s, th, st, sl, page_no):
         _slide_caption(s, sl.get("caption"), th, st)
 
 
+def _title_font(txt, st):
+    """按标题长度自动选字号：长标题自动变小，尽量少换行。"""
+    base = float(st.get("title_size") or 0)
+    if base:
+        return base
+    n = len(str(txt or ""))
+    if n <= 26:
+        return 30.0
+    if n <= 40:
+        return 26.0
+    if n <= 64:
+        return 22.0
+    return 19.0
+
+
+def _text_lines(txt, size_pt, width_in):
+    """粗估文字在给定宽度下占几行（中文按 1 个字宽、其他按 0.55）。
+
+    只需要判断"一行还是两行"，不追求像素级准确。
+    """
+    if not txt:
+        return 1
+    per_line = max(4.0, width_in * 72.0 / (size_pt * 0.98))
+    total = 0.0
+    for ch in str(txt):
+        total += 0.55 if ord(ch) < 0x2E80 else 1.0
+    return max(1, int(total / per_line) + (1 if total % per_line else 0))
+
+
 def _title_bar(slide, title, th, st, y=Inches(0.5), rule=True):
-    """统一的内页标题：标题 + 下方强调短横线。"""
-    tf = _textbox(slide, Inches(0.85), y, Inches(11.7), Inches(0.9))
+    """统一的内页标题：标题 + 下方强调短横线。
+
+    ⚠️ 2026-09-25 改成**自适应**（用户报：标题换行后压在横线上、只有一行时又离正文很远）。
+      旧实现把标题框高、字号、横线位置、返回值**全写死**
+      （0.9 英寸 / 28pt / y+0.92 / y+1.15）：
+        · 标题一换行 → 第二行压到横线和正文上（看起来像排版坏了）；
+        · 标题只有一行 → 标题底到正文顶空出 0.7 英寸，正文下面又留一大片白。
+      现在：字号按长度自动选 → 按宽度估算行数 → 横线与返回值**都跟着实际行数走**。
+      标题也不再 `[:60]` 截断 —— 长标题缩字号换行，一个字都不丢。
+    """
+    txt = str(title or "").strip() or " "
+    size = _title_font(txt, st)
+    width_in = 11.7
+    lines = _text_lines(txt, size, width_in)
+    box_h = Inches(size * 1.2 * lines / 72.0 + 0.14)
+    tf = _textbox(slide, Inches(0.85), y, Inches(width_in), box_h)
     p = tf.paragraphs[0]
+    p.line_spacing = 1.08
     if st.get("title_align"):
         p.alignment = _ALIGN.get(st["title_align"], PP_ALIGN.LEFT)
     r = p.add_run()
-    r.text = (title or " ")[:60]
-    _set_font(r, float(st.get("title_size") or 28),
-              st.get("title_color") or th["body"], bold=True, font=st.get("font"))
+    r.text = txt
+    _set_font(r, size, st.get("title_color") or th["body"], bold=True,
+              font=st.get("font"))
     if rule:
-        _rect(slide, Inches(0.88), y + Inches(0.92), Inches(1.5), Inches(0.07),
+        rule_y = y + box_h + Inches(0.08)
+        _rect(slide, Inches(0.88), rule_y, Inches(1.5), Inches(0.07),
               fill=st.get("accent") or th["accent"])
-    return y + Inches(1.15)
+        return rule_y + Inches(0.30)
+    return y + box_h + Inches(0.24)
 
 
 # --------------------------------------------------------------------------
@@ -485,7 +557,7 @@ def _add_cover(prs, th, st, title, subtitle, author, cover_img=""):
     p = tf.paragraphs[0]
     p.alignment = PP_ALIGN.CENTER if st.get("title_align") == "center" else PP_ALIGN.LEFT
     r = p.add_run()
-    r.text = title[:80]
+    r.text = title
     _set_font(r, 40 if len(title) <= 18 else 32, th["cover_fg"], bold=True,
               font=st.get("font"))
     if subtitle:
@@ -493,14 +565,14 @@ def _add_cover(prs, th, st, title, subtitle, author, cover_img=""):
         p2.alignment = p.alignment
         p2.space_before = Pt(16)
         r2 = p2.add_run()
-        r2.text = subtitle[:60]
+        r2.text = subtitle
         _set_font(r2, 18, _tint(th["cover_fg"], 0.22), font=st.get("font"))
     if author:
         tf2 = _textbox(s, Inches(0.9), Inches(6.25), Inches(11.5), Inches(0.7))
         p3 = tf2.paragraphs[0]
         p3.alignment = p.alignment
         r3 = p3.add_run()
-        r3.text = author[:60]
+        r3.text = author
         _set_font(r3, 13, _tint(th["cover_fg"], 0.3), font=st.get("font"))
     return s
 
@@ -521,7 +593,7 @@ def _add_section(prs, th, st, text, index, page_no):
     _set_font(r, 40, st.get("accent") or th["accent"], bold=True, font=st.get("font"))
     p2 = tf.add_paragraph()
     r2 = p2.add_run()
-    r2.text = text[:60]
+    r2.text = text
     _set_font(r2, 30, st.get("title_color") or th["body"], bold=True,
               font=st.get("font"))
     return s
@@ -557,8 +629,8 @@ def _add_content(prs, th, st, sl, page_no):
     _page_base(s, th, st, sl, page_no)
     y = _title_bar(s, sl.get("title"), th, st, rule=bool(st.get("rule", True)))
     bs = _bullets_of(sl.get("bullets"))
-    _put_bullets(s, bs, Inches(0.95), y + Inches(0.4), Inches(11.45),
-                 SLIDE_H - y - Inches(0.9), th, st,
+    _put_bullets(s, bs, Inches(0.95), y + Inches(0.10), Inches(11.45),
+                 SLIDE_H - y - Inches(0.75), th, st,
                  base_size=st.get("body_size"), font=st.get("font"),
                  centered=st.get("body_align") == "center")
     if sl.get("notes"):
@@ -575,14 +647,23 @@ def _add_two_col(prs, th, st, sl, page_no):
     lh = str(sl.get("left_title") or "").strip()
     rh = str(sl.get("right_title") or "").strip()
     colw, gap = Inches(5.55), Inches(0.4)
+    # 两栏**共用同一个起点**：先取两栏的高度，再把这一对内容整体垂直居中。
+    # 2026-09-25：原来各栏从 y+0.35 顶对齐，3 条要点的页面下面空掉 3 英寸。
+    def _est_col(items):
+        _bs = _bullets_of(items)
+        _sz = float((st.get("body_size") or 0) or _fit_size(len(_bs)))
+        return Inches(_est_block_h(_bs, _sz, 5.55) + 0.3)
+    _pair_h = min(max(_est_col(left), _est_col(right)), Inches(4.6))
+    _content_h = SLIDE_H - y - Inches(0.7)
+    _block_top = y + Inches(0.10) + Emu(int(max(0, (_content_h - _pair_h) / 2)))
     for i, (cx, head, items) in enumerate((
             (Inches(0.9), lh, left), (Inches(0.9) + colw + gap, rh, right))):
-        top = y + Inches(0.35)
+        top = _block_top
         if head:
             tfh = _textbox(s, cx, top, colw, Inches(0.5))
             ph = tfh.paragraphs[0]
             rh2 = ph.add_run()
-            rh2.text = head[:30]
+            rh2.text = head
             _set_font(rh2, 17, st.get("accent") or th["accent"], bold=True,
                       font=st.get("font"))
             _rect(s, cx, top + Inches(0.48), Inches(0.9), Inches(0.05),
@@ -593,10 +674,12 @@ def _add_two_col(prs, th, st, sl, page_no):
                      base_size=(st.get("body_size") or 0) or 17, font=st.get("font"),
                      valign="top")
         if i == 0:
-            # 竖向分隔线：**只跟到内容底部**，拉到底会显得左栏"没写完"
-            dv_h = min(Inches(3.3), SLIDE_H - y - Inches(1.4))
-            _rect(s, Inches(0.9) + colw + Inches(0.18), y + Inches(0.4),
-                  Inches(0.02), dv_h, fill=_tint(th["accent"], 0.75))
+            # 竖向分隔线**跟着内容块走**：原来从 y+0.4 起、固定 3.3 英寸高，
+            # 内容一居中就对不上（线飘在内容上方）。
+            _rect(s, Inches(0.9) + colw + Inches(0.18),
+                  _block_top - Inches(0.06), Inches(0.02),
+                  Emu(max(int(Inches(0.6)), int(_pair_h))),
+                  fill=_tint(th["accent"], 0.75))
     if sl.get("notes"):
         s.notes_slide.notes_text_frame.text = str(sl["notes"])[:2000]
     return s
@@ -635,7 +718,7 @@ def _add_image_side(prs, th, st, sl, page_no, side="right"):
         pc = tfc.paragraphs[0]
         pc.alignment = PP_ALIGN.CENTER
         rc = pc.add_run()
-        rc.text = cap[:60]
+        rc.text = cap
         _set_font(rc, 11, st.get("muted") or th["muted"], font=st.get("font"))
     if sl.get("notes"):
         s.notes_slide.notes_text_frame.text = str(sl["notes"])[:2000]
@@ -659,7 +742,7 @@ def _add_image_full(prs, th, st, sl, page_no):
     tf = _textbox(s, Inches(0.85), Inches(0.42), Inches(11.6), Inches(0.75))
     p = tf.paragraphs[0]
     r = p.add_run()
-    r.text = (sl.get("title") or " ")[:60]
+    r.text = (sl.get("title") or " ")
     _set_font(r, 30, th["cover_fg"], bold=True, font=st.get("font"))
     if sl.get("notes"):
         s.notes_slide.notes_text_frame.text = str(sl["notes"])[:2000]
@@ -680,13 +763,34 @@ def _add_table(prs, th, st, sl, page_no):
     acc = st.get("accent") or th["accent"]
     size = float(st.get("body_size") or (16 if ncol <= 4 else 14 if ncol <= 6 else 12))
     avail_h = SLIDE_H - y - Inches(1.0)
-    row_h = min(Inches(0.62), max(Inches(0.36), avail_h // max(1, nrow)))
-    gf = s.shapes.add_table(nrow, ncol, Inches(0.9), y + Inches(0.4),
+    # 行高上限从 0.62 放宽到 0.9：行少的表（3~4 行）原来只有 2.5 英寸高，
+    # 顶在上面、下面空一大片（用户说的"做工不够"）。放宽后自然撑起来。
+    row_h = min(Inches(0.9), max(Inches(0.42), avail_h // max(1, nrow)))
+    # 表格**整体垂直居中**（原来固定 y+0.4 顶对齐）
+    est_h = int(row_h) * nrow
+    content_h = SLIDE_H - y - Inches(0.85)
+    _tbl_top = y + Inches(0.15)
+    if est_h < content_h:
+        _tbl_top = y + Inches(0.15) + Emu(int((content_h - est_h) / 2))
+    gf = s.shapes.add_table(nrow, ncol, Inches(0.9), _tbl_top,
                             Inches(11.5), row_h * nrow)
     tb = gf.table
     _no_table_style(tb)
+    # 列宽**按内容长度分配**，不再等分 ——
+    # 等分会让「主要任务」这种长文本列挤成三行、而「年度」这种短列空一截。
+    # ⚠️ 宽度要**分中英文**算（中文一个字 ≈ 英文 1.8 个字符宽），
+    #   否则「预算（万元）」会被判得太窄、表头被迫折成两行（实测踩到）。
+    def _w_of(s):
+        return sum(0.55 if ord(c) < 0x2E80 else 1.0 for c in str(s))
+    _wts = []
+    for _ci in range(ncol):
+        _h = header[_ci] if _ci < len(header) else ""
+        _body = [r[_ci] if _ci < len(r) else "" for r in rows]
+        _wts.append(max(_w_of(_h) * 1.25,               # 表头保底：不折行
+                        max([_w_of(x) for x in _body] or [1.0]), 4.0))
+    _tot = float(sum(_wts)) or 1.0
     for i in range(ncol):
-        tb.columns[i].width = int(Inches(11.5) / ncol)
+        tb.columns[i].width = int(Inches(11.5) * _wts[i] / _tot)
     ri = 0
     if header:
         for ci in range(ncol):
@@ -700,7 +804,7 @@ def _add_table(prs, th, st, sl, page_no):
             p = tf.paragraphs[0]
             p.alignment = PP_ALIGN.CENTER
             r = p.add_run()
-            r.text = (header[ci] if ci < len(header) else "")[:40]
+            r.text = (header[ci] if ci < len(header) else "")
             _set_font(r, size, "FFFFFF", bold=True, font=st.get("font"))
         ri = 1
     for k, row in enumerate(rows):
@@ -715,7 +819,7 @@ def _add_table(prs, th, st, sl, page_no):
             tf.word_wrap = True
             p = tf.paragraphs[0]
             r = p.add_run()
-            r.text = (row[ci] if ci < len(row) else "")[:60]
+            r.text = (row[ci] if ci < len(row) else "")
             _set_font(r, size, th["body"], font=st.get("font"))
         tb.rows[ri + k].height = row_h
     if sl.get("notes"):
@@ -768,14 +872,14 @@ def _add_chart(prs, th, st, sl, page_no):
     from pptx.chart.data import CategoryChartData
     data = CategoryChartData()
     data.categories = cats
-    for sx in series[:4]:
+    for sx in series:
         vals = []
         for v in (sx.get("values") or []):
             try:
                 vals.append(float(v))
             except Exception:
                 vals.append(0.0)
-        data.add_series(str(sx.get("name") or "系列")[:20], vals)
+        data.add_series(str(sx.get("name") or "系列"), vals)
 
     left, top = Inches(0.9), y + Inches(0.45)
     width = Inches(11.5)
@@ -791,7 +895,7 @@ def _add_chart(prs, th, st, sl, page_no):
     if spec.get("title"):
         ch.has_title = True
         try:
-            ch.chart_title.text_frame.text = str(spec["title"])[:40]
+            ch.chart_title.text_frame.text = str(spec["title"])
         except Exception:
             pass
     ch.has_legend = bool(spec.get("legend", len(series) > 1))
@@ -840,7 +944,7 @@ def _add_cards(prs, th, st, sl, page_no):
     s = _blank(prs)
     _page_base(s, th, st, sl, page_no)
     y = _title_bar(s, sl.get("title"), th, st)
-    cards = [c for c in (sl.get("cards") or []) if isinstance(c, dict)][:4]
+    cards = [c for c in (sl.get("cards") or []) if isinstance(c, dict)]
     if not cards:
         return _fallback_content(s, th, st, sl, y)
     acc = st.get("accent") or th["accent"]
@@ -868,13 +972,13 @@ def _add_cards(prs, th, st, sl, page_no):
         pt = tf.add_paragraph()
         pt.space_before = Pt(6)
         rt = pt.add_run()
-        rt.text = str(c.get("title") or "")[:24]
+        rt.text = str(c.get("title") or "")
         _set_font(rt, 17, th["body"], bold=True, font=st.get("font"))
         pb = tf.add_paragraph()
         pb.space_before = Pt(8)
         pb.line_spacing = 1.3
         rb = pb.add_run()
-        rb.text = str(c.get("text") or "")[:180]
+        rb.text = str(c.get("text") or "")
         _set_font(rb, 13, st.get("muted") or th["muted"], font=st.get("font"))
     if sl.get("notes"):
         s.notes_slide.notes_text_frame.text = str(sl["notes"])[:2000]
@@ -885,7 +989,7 @@ def _add_stats(prs, th, st, sl, page_no):
     s = _blank(prs)
     _page_base(s, th, st, sl, page_no)
     y = _title_bar(s, sl.get("title"), th, st)
-    items = [x for x in (sl.get("stats") or []) if isinstance(x, dict)][:4]
+    items = [x for x in (sl.get("stats") or []) if isinstance(x, dict)]
     if not items:
         return _fallback_content(s, th, st, sl, y)
     acc = st.get("accent") or th["accent"]
@@ -899,13 +1003,13 @@ def _add_stats(prs, th, st, sl, page_no):
         pv = tfv.paragraphs[0]
         pv.alignment = PP_ALIGN.CENTER
         rv = pv.add_run()
-        rv.text = str(it.get("value") or "")[:12]
+        rv.text = str(it.get("value") or "")
         _set_font(rv, 46 if len(str(it.get("value") or "")) <= 5 else 34,
                   acc, bold=True, font=st.get("font"))
         unit = str(it.get("unit") or "").strip()     # 单位跟着数字走，小一号
         if unit:
             ru = pv.add_run()
-            ru.text = unit[:4]
+            ru.text = unit
             _set_font(ru, 18, acc, bold=True, font=st.get("font"))
         _rect(s, cx + int(cw * 0.32), top + Inches(1.45), int(cw * 0.36),
               Inches(0.05), fill=_tint(acc, 0.5))
@@ -914,7 +1018,7 @@ def _add_stats(prs, th, st, sl, page_no):
         pl.alignment = PP_ALIGN.CENTER
         pl.line_spacing = 1.25
         rl = pl.add_run()
-        rl.text = str(it.get("label") or "")[:40]
+        rl.text = str(it.get("label") or "")
         _set_font(rl, 14, st.get("muted") or th["muted"], font=st.get("font"))
     if sl.get("notes"):
         s.notes_slide.notes_text_frame.text = str(sl["notes"])[:2000]
@@ -925,7 +1029,7 @@ def _add_steps(prs, th, st, sl, page_no):
     s = _blank(prs)
     _page_base(s, th, st, sl, page_no)
     y = _title_bar(s, sl.get("title"), th, st)
-    items = [x for x in (sl.get("steps") or []) if isinstance(x, dict)][:5]
+    items = [x for x in (sl.get("steps") or []) if isinstance(x, dict)]
     if not items:
         return _fallback_content(s, th, st, sl, y)
     acc = st.get("accent") or th["accent"]
@@ -955,14 +1059,14 @@ def _add_steps(prs, th, st, sl, page_no):
         pt = tfb.paragraphs[0]
         pt.alignment = PP_ALIGN.CENTER
         rt = pt.add_run()
-        rt.text = str(it.get("title") or "")[:20]
+        rt.text = str(it.get("title") or "")
         _set_font(rt, 16, th["body"], bold=True, font=st.get("font"))
         pb = tfb.add_paragraph()
         pb.alignment = PP_ALIGN.CENTER
         pb.space_before = Pt(9)
         pb.line_spacing = 1.3
         rb = pb.add_run()
-        rb.text = str(it.get("text") or "")[:160]
+        rb.text = str(it.get("text") or "")
         _set_font(rb, 12.5, st.get("muted") or th["muted"], font=st.get("font"))
         if i < n - 1:
             _rect(s, cx + cw + Inches(0.03), top + card_h / 2 - Inches(0.1),
@@ -979,7 +1083,7 @@ def _add_timeline(prs, th, st, sl, page_no):
     y = _title_bar(s, sl.get("title"), th, st)
     # 模型写时间线时，字段名五花八门：items / timeline / steps 都认
     raw = sl.get("items") or sl.get("timeline") or sl.get("steps") or []
-    items = [x for x in raw if isinstance(x, dict)][:5]
+    items = [x for x in raw if isinstance(x, dict)]
     if not items:
         return _fallback_content(s, th, st, sl, y)
     acc = st.get("accent") or th["accent"]
@@ -998,7 +1102,7 @@ def _add_timeline(prs, th, st, sl, page_no):
         pd.alignment = PP_ALIGN.CENTER
         rd = pd.add_run()
         rd.text = str(it.get("title") or it.get("time")
-                      or it.get("label") or "")[:16]
+                      or it.get("label") or "")
         _set_font(rd, 14, acc, bold=True, font=st.get("font"))
         tfb = _textbox(s, cx - Inches(1.0), axis_y + Inches(0.32), Inches(2.0),
                        Inches(1.8))
@@ -1006,7 +1110,7 @@ def _add_timeline(prs, th, st, sl, page_no):
         pb.alignment = PP_ALIGN.CENTER
         pb.line_spacing = 1.3
         rb = pb.add_run()
-        rb.text = str(it.get("text") or "")[:150]
+        rb.text = str(it.get("text") or "")
         _set_font(rb, 12, st.get("muted") or th["muted"], font=st.get("font"))
     if sl.get("notes"):
         s.notes_slide.notes_text_frame.text = str(sl["notes"])[:2000]
@@ -1023,9 +1127,19 @@ def _add_quote(prs, th, st, sl, page_no):
         _grad_bg(s, st.get("bg") or th["cover_bg"], acc, 45)
     _add_logo(s, st.get("_logo_path") or "", st.get("logo_pos") or "tr",
               float(st.get("logo_size") or 0.5))
-    q = sl.get("quote") or {}
+    # ⚠️ 2026-09-25：这一页以前只认 sl["quote"]，模型写 {layout:"quote", text:"..."}
+    #    时**正文会被整段丢掉**，页面上只剩 title（实测就是这么翻车的：
+    #    模型给了 title+text，渲染出来只有"理念"两个字，引用句一个字都没显示）。
+    #    现在三种写法都认：quote 是对象 / quote 是字符串 / 直接给 text。
+    q = sl.get("quote")
+    if isinstance(q, str):
+        q = {"text": q}
+    elif not isinstance(q, dict):
+        q = {}
+    if not q and sl.get("text"):
+        q = {"text": sl.get("text")}
     text = str(q.get("text") or sl.get("title") or "").strip()
-    src = str(q.get("from") or "")
+    src = str(q.get("from") or q.get("author") or "")
     _mark = _textbox(s, Inches(1.3), Inches(1.35), Inches(3.0), Inches(1.4))
     rm = _mark.paragraphs[0].add_run()
     rm.text = "“"
@@ -1036,7 +1150,7 @@ def _add_quote(prs, th, st, sl, page_no):
     p.alignment = PP_ALIGN.CENTER
     p.line_spacing = 1.35
     r = p.add_run()
-    r.text = text[:160]
+    r.text = text
     _set_font(r, 30 if len(text) <= 40 else 24, th["cover_fg"], bold=True,
               font=st.get("font"))
     if src:
@@ -1044,7 +1158,7 @@ def _add_quote(prs, th, st, sl, page_no):
         p2.alignment = PP_ALIGN.CENTER
         p2.space_before = Pt(20)
         r2 = p2.add_run()
-        r2.text = "—— " + src[:40]
+        r2.text = "—— " + src
         _set_font(r2, 15, _tint(th["cover_fg"], 0.3), font=st.get("font"))
     if sl.get("notes"):
         s.notes_slide.notes_text_frame.text = str(sl["notes"])[:2000]
@@ -1081,7 +1195,7 @@ def _add_toc(prs, th, st, sl, page_no):
                            anchor=MSO_ANCHOR.MIDDLE)
             pl = tfl.paragraphs[0]
             rl = pl.add_run()
-            rl.text = b["text"][:34]
+            rl.text = b["text"]
             _set_font(rl, 16, th["body"], bold=not b["level"], font=st.get("font"))
     if sl.get("notes"):
         s.notes_slide.notes_text_frame.text = str(sl["notes"])[:2000]
@@ -1105,7 +1219,7 @@ def _add_end(prs, th, st, text):
     p = tf.paragraphs[0]
     p.alignment = PP_ALIGN.CENTER
     r = p.add_run()
-    r.text = (text or "谢谢观看")[:40]
+    r.text = (text or "谢谢观看")
     _set_font(r, 36, th["cover_fg"], bold=True, font=st.get("font"))
     _rect(s, SLIDE_W / 2 - Inches(0.75), Inches(4.55), Inches(1.5), Inches(0.06),
           fill=th["cover_fg"])

@@ -312,7 +312,7 @@ WEB_MAX_TOKENS = 8192
 # 长文创作（作文/方案/报告）的输出上限。
 # 这类任务要真写出几百上千字，还要留足"思考"的额度 —— 4096 实测经常写不完，
 # 而且这一轮已经把用不到的工具 schema 砍掉了，腾出的空间正好给它。
-WRITING_MAX_TOKENS = 12288
+WRITING_MAX_TOKENS = 16384
 
 # 「写代码 / 做项目」这一轮的输出上限。
 # 实测踩过：用默认额度（2048）让模型写一个完整文件时，输出**中途被截断** ——
@@ -322,7 +322,7 @@ CODE_MAX_TOKENS = 8192
 
 # 输出长度天花板：空回答重试时加倍，但不能无限涨
 # （上下文窗口还要留给提示词与历史，超出只会让 Ollama 截断提示词）
-MAX_TOKENS_CEILING = 16384
+MAX_TOKENS_CEILING = 24576
 
 # 送入模型的历史消息上限（约 60 轮）。
 # 之前是 40 条（20 轮），实测**玩"成语接龙"这种多轮小游戏时不够**：
@@ -1718,8 +1718,33 @@ _WRITING_HINTS = (
     "帮我写", "替我写", "拟一篇", "拟一份", "起草",
 )
 
-_model_tags_cache = {"t": 0.0, "names": set()}
+# 「要能打开的办公产物」线索：PPT / Word / Excel。
+# ⚠️⚠️ 2026-09-25 加（用户报"复杂内容的 PPT 做不出来、做工也不对"）：
+#   用户的请求经常**同时**命中"写作"和"办公产物"，例如
+#     「帮我做一份建设**方案**PPT」—— "方案" 在 _WRITING_HINTS 里，
+#   于是被判成"纯写作"→ 工具集被砍到只剩 3 个 → **make_pptx 直接没了** →
+#   模型只能把内容写成一大段文字，用户拿不到 PPT。
+#   所以命中办公产物时走 **office 模式**：保住生成工具 + 给足输出额度。
+_OFFICE_HINTS = (
+    "ppt", "PPT", "幻灯片", "演示文稿", "演示稿", "演示", "课件",
+    "word", "Word", "word文档", "文档", "文稿",
+    "excel", "Excel", "表格", "台账", "报表", "统计表", "数据表", "汇总表",
+    "xlsx", "docx", "pptx",
+)
 
+
+def _is_office_task(text: str) -> bool:
+    """用户要的是"能点开的办公文件"（PPT / Word / Excel）吗。
+
+    这类请求必须**保住生成工具**，见 _OFFICE_HINTS 上面的说明。
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    return any(k in t for k in _OFFICE_HINTS)
+
+
+_model_tags_cache = {"t": 0.0, "names": set()}
 
 def _installed_models() -> set:
     """本机已下载的 Ollama 模型名（缓存 60 秒，别每轮都去问一次）。"""
@@ -3475,17 +3500,27 @@ async def chat(req: ChatRequest):
     # 其余 schema 全砍掉，把省下的额度让给正文；同时把输出上限提上去。
     # 为什么要这么绕：默认模型是思考型的，18 个工具的 schema（约 5800 token）
     # 加上思考，会把 num_ctx 挤到写不下几百字的正文，表现就是"想完什么都没写"。
+    # 「要的是能点开的产物」（PPT / Word / Excel）**优先判定**，命中走 office 模式：
+    # 见 _OFFICE_HINTS 的说明 —— 否则「做一份方案PPT」会被"方案"判成纯写作、
+    # 生成工具被砍，用户最后只拿到一大段文字。
+    office_mode = _is_office_task(last_user) and not _is_code_task(last_user)
     writing_mode = (bool(_is_writing_task(last_user))
                     # ⚠️ 「帮我写一段代码」同时命中写代码与长文创作，必须排除 ——
                     # 否则会被当成"作文"砍掉工具、又切到代码模型，两头不讨好。
                     and not _is_code_task(last_user)
+                    # ⚠️ 命中办公产物时不走"纯写作"（那会把 make_pptx 等砍掉）
+                    and not office_mode
                     and not images and not prev_img)
-    if writing_mode:
+    if writing_mode or office_mode:
+        # 长产物的**工具调用 JSON 本身就很长**（一份 15 页 PPT 的内容都在
+        # tool_calls 的参数里），额度给小了会被截断 → 生成失败或只剩半份。
+        # 用户 2026-09-25 明确要求「取消所有篇幅限制」，这里统一给足。
         cfg["max_tokens"] = max(int(cfg.get("max_tokens") or 2048), WRITING_MAX_TOKENS)
     tool_schemas = tools.make_schemas(cfg.get("web_enabled", False),
                                       cfg.get("rag_enabled", False),
                                       cfg.get("code_exec_enabled", False),
                                       writing=writing_mode,
+                                      office=office_mode,
                                       # ⚠️ 询问模式要传进去：ask_user 的**工具描述**会据此
                                       # 写清"这一轮该问几条、要不要再多问一轮"。
                                       # 只写在系统提示里不够 —— 模型挑工具时先看 schema。

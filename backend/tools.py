@@ -683,7 +683,7 @@ _WS_PROJECT_SCHEMAS = [
 
 def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
                  code_exec: bool = False, writing: bool = False,
-                 ask_mode: str = "quick") -> list:
+                 ask_mode: str = "quick", office: bool = False) -> list:
     """返回工具 schema 列表。
 
     web_enabled=True 时才暴露联网搜索工具——保证"开关不开不联网"的约定：
@@ -692,10 +692,12 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
     code_exec 同理：关着就不给"本地跑代码"的工具（默认关，避免模型擅自执行代码）。
 
     writing=True 是**长文创作**场景，只给最必要的几个工具（见下面）。
+    **office=True 是"要能打开的办公产物"场景**（PPT / Word / Excel）——
+    必须**保留生成工具**，详见下面那段注释。
     ask_mode 会写进 ask_user 的**工具描述**（模型挑工具时先看它）：
     深度模式要求一轮问 5~7 条、不够再问下一轮 —— 只写在系统提示里不够。
     """
-    if writing:
+    if writing and not office:
         # 写作文/方案这类任务只需要「问细节」和「存文件」，
         # 其余工具（画图、搜图、文件系统、跑代码…）这轮根本用不上。
         # 砍掉它们的收益很实在：18 个工具的 schema ≈ 5800 token，
@@ -704,6 +706,19 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
         if kb_enabled:
             picked.insert(0, _KB_SCHEMA)      # 写东西时查用户资料是常见需求
         return picked
+    # ⚠️⚠️ office=True 必须**绕过上面那个精简分支**（2026-09-25 修）。
+    #   用户的请求常常同时命中"写作"和"办公产物"：
+    #     「帮我做一份建设**方案**PPT」——"方案"在 _WRITING_HINTS 里，
+    #     于是被判成"纯写作"→ 工具砍到只剩 3 个 → **make_pptx 没了** →
+    #     模型只能把内容写成一大段文字，用户根本拿不到 PPT。
+    #   这是"复杂内容的 PPT 做不出来"的直接原因，所以这里要**优先保住生成工具**：
+    #     留 make_pptx / make_docx / make_xlsx / edit_office + 文库 + 问细节，
+    #     其余（画图、地图、文件系统、跑代码、联网…）照旧砍掉，省下的额度给长输出。
+    if office:
+        _keep = {"make_pptx", "make_docx", "make_xlsx", "edit_office",
+                 "library", "ask_user"}
+        if kb_enabled:
+            _keep.add("search_knowledge")
     schemas = [
         {
             "type": "function",
@@ -1005,6 +1020,12 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
                    if s["function"]["name"] != "web_image_search"]
     # 上传到代码托管平台：属于"对外发布"，始终暴露但执行前必须问用户
     schemas.append(_GITHUB_PUSH_SCHEMA)
+    if office:
+        # 只留"能产出办公文件"的那几个（见函数开头 office 的说明）。
+        # 放在最后统一过滤：前面的 web/kb/code_exec 开关逻辑照旧，
+        # 这样既不用把整张大表复制一遍，也不会漏掉任何新加的工具。
+        schemas = [s for s in schemas
+                   if s.get("function", {}).get("name") in _keep]
     return schemas
 
 
@@ -2738,7 +2759,7 @@ def _do_make_pptx(arguments=None, ui_events=None) -> str:
         # 同上：模型忘给 title 时，用第一页的标题兜底，别让它反复重试
         for sl in slides:
             if str(sl.get("title") or "").strip():
-                title = str(sl["title"]).strip()[:60]
+                title = str(sl["title"]).strip()
                 break
         if not title:
             title = str(a.get("filename") or "").strip() or "演示文稿"

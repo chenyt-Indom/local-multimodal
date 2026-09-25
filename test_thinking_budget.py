@@ -137,8 +137,15 @@ check("A5 发出了 thinking_reset（清掉上一轮思考）", len(resets) >= 1
 check("A6 最坏情况不给空白：正文非空", bool((done.get("text") or "").strip()),
       "正文 %d 字" % len((done.get("text") or "")))
 check("A7 兜底内容有明确标注", "思考过程" in (done.get("text") or ""))
-check("A8 不浪费第三轮：额度到顶后就不再试（共 2 次调用）", state["n"] == 2,
-      "调用次数=%d  max_tokens=%s" % (state["n"], state["max_tokens"]))
+# 2026-09-25：天花板从 16384 提到 24576（用户要求"取消篇幅限制"）之后，
+# 重试**能再涨一轮**（16384 → 21064），所以第二次重试不再被跳过 —— 这是要的效果。
+# 断言改成：额度只涨不超窗、且最多重试 _MAX_EMPTY_RETRIES 次。
+_room_A = max(1024, NUM_CTX - pt2 - SAFETY)
+check("A8 每次加大的额度都不超过真实剩余窗口",
+      all(mt <= _room_A for mt in state["max_tokens"][1:]),
+      "max_tokens=%s  可用=%d" % (state["max_tokens"], _room_A))
+check("A9 最多重试 2 次（共 3 次调用），不会无限重试",
+      state["n"] == 3, "调用次数=%d" % state["n"])
 
 # ---------------- 场景 B：连历史都很大 → 砍完工具仍腾不出多少，别白试 ----------------
 # 第一次：prompt=24000；砍掉工具后（省 10782）→ 13218，所以第一次重试仍然有意义。
