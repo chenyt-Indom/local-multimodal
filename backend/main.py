@@ -1393,6 +1393,18 @@ _TOOLPARSE_MARKS = (
     "looking for beginning of value",
     "unexpected end of JSON input",
     "tool call parsing failed",
+    # ⚠️ 2026-09-25 补：Go 的 JSON 解析器报"某个字符串里有非法字符"是**同一族**。
+    # 用户当天报的那次，Ollama 日志里的真身是：
+    #   source=qwen3vl.go:90 msg="qwen tool call parsing failed"
+    #     error="invalid character '\n' in string literal"
+    # ——模型把工具调用参数里的换行写成了**裸换行**（没转义）。
+    # 这一族的**前缀**都是 `invalid character`，后面跟具体字符和位置，形形色色：
+    #     invalid character '\n' in string literal
+    #     invalid character 'ä' after object key:value pair
+    #     invalid character 'æ' looking for beginning of value
+    # ⇒ 按前缀一次覆盖全。**别再按后缀枚举** —— 旧名单就漏了其中两个，
+    #   用户拿到的是一句看不懂的英文（前端还会跟一句"可能内存不足"，指错方向）。
+    "invalid character",
 )
 
 
@@ -1546,7 +1558,7 @@ def _friendly_ollama_error(msg) -> str:
     """
     m = str(msg or "").strip()
     if _is_toolparse_err(m):
-        return ("模型这一次生成的**工具调用格式不对**（JSON 引号写错了），"
+        return ("模型这一次生成的**工具调用写坏了**（JSON 里的引号或换行没转义），"
                 "所以这一轮没执行成功。\n"
                 "**这不是你的操作问题，也不是内存/显存不够** —— "
                 "直接**把刚才那句话再发一次**通常就好了。\n"
