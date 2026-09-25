@@ -75,7 +75,7 @@ sch = T.make_schemas(True, True, True, writing=False)
 
 print("=" * 68)
 print("① 失忆：历史不能再被「输出预留」挤成 2 条")
-kept, dropped = M._trim_history_to_budget(fake_history(30), sysp, sch, CFG)
+kept, dropped, _cl0 = M._trim_history_to_budget(fake_history(30), sysp, sch, CFG)
 check("30 条历史至少保留 10 条（改前只有 2 条）", len(kept) >= 10,
       "保留 %d 条 / 丢掉 %d 条" % (len(kept), len(dropped)))
 check("常量 MIN_HISTORY_TOKENS 存在且 > 1500",
@@ -85,7 +85,7 @@ check("摘要预留也算进预算（DIGEST_RESERVE）", getattr(M, "DIGEST_RESE
 # 极端配置（把输出预留调到最大）也不许把历史挤没
 _c = dict(CFG)
 _c["max_tokens"] = 16384
-kept2, _ = M._trim_history_to_budget(fake_history(30), sysp, sch, _c)
+kept2, _d2, _cl2 = M._trim_history_to_budget(fake_history(30), sysp, sch, _c)
 check("把 max_tokens 拉到 16384 仍保留 ≥5 条（宁可少留输出、也不能没记忆）",
       len(kept2) >= 5, "保留 %d 条" % len(kept2))
 
@@ -122,8 +122,8 @@ check("不是图片的项原样保留（宁可多占也别丢）",
 print()
 print("=" * 68)
 print("④ 预算里要真的把图片算进去")
-kept3, _ = M._trim_history_to_budget(fake_history(30), sysp, sch, CFG,
-                                     images_b64=[png_b64(2048, 2048)])
+kept3, _d3, _cl3 = M._trim_history_to_budget(fake_history(30), sysp, sch, CFG,
+                                           images_b64=[png_b64(2048, 2048)])
 check("同一段历史 + 一张大图 → 保留条数变少（说明图占了额度）",
       len(kept3) <= len(kept), "%d → %d" % (len(kept), len(kept3)))
 
@@ -160,13 +160,47 @@ M._LAST_IMAGE["b64"] = None
 
 print()
 print("=" * 68)
-print("⑦ 属性：微改出来的图要标成「AI 微改」（原来显示成「图片」）")
+print("⑦ ★ 用户**自己粘贴的长文**也要装得下（改前会直接把窗口顶爆）")
+# ⚠️ 实测的缺口（2026-09-26）：裁剪原来只丢**历史**，而"用户这一条"永远保留 ——
+#    粘贴一篇 4 万字的文档时，提示词 = 3.1 万(输入) + 1.7 万(系统提示+工具)
+#    = 4.8 万 > num_ctx 24576，Ollama 直接回 400，用户只拿到一句报错。
+#    修法：单条消息也截断（保头保尾），并把截断事实**告诉用户**。
+_HUGE = "这是一段很长的资料，用来测试超长输入。" * 2000        # 约 4 万字
+_keptH, _dropH, _clH = M._trim_history_to_budget(
+    [{"role": "user", "content": _HUGE}], sysp, sch, CFG)
+_overhead = (M._est_tokens(sysp)
+             + M._est_tokens(json.dumps(sch, ensure_ascii=False)))
+_total = _overhead + sum(M._est_tokens(m.get("content") or "") for m in _keptH)
+_ctx = int(CFG.get("num_ctx") or 8192)
+check("超长输入被截断（不再原样顶爆窗口）",
+      len(_keptH[0]["content"]) < len(_HUGE),
+      "%d 字 → %d 字" % (len(_HUGE), len(_keptH[0]["content"])))
+check("截断后提示词**不再超窗**", _total <= _ctx,
+      "约 %d token / num_ctx=%d" % (_total, _ctx))
+check("返回了截断信息（调用方据此告知用户）", bool(_clH) and _clH.get("cut", 0) > 0,
+      str(_clH))
+check("保头保尾（开头和结尾都在）",
+      _HUGE[:12] in _keptH[0]["content"] and _HUGE[-12:] in _keptH[0]["content"])
+check("截断处有明确标记（写明省略了多少字）", "省略" in _keptH[0]["content"])
+_keptS, _dS, _clS = M._trim_history_to_budget(
+    [{"role": "user", "content": "帮我做份 PPT"}], sysp, sch, CFG)
+check("⚠️ 正常长度的消息**一个字都不动**",
+      _keptS[0]["content"] == "帮我做份 PPT" and _clS is None, str(_clS))
+check("图片超过 6 张也要全算进预算（改前只算前 6 张）",
+      M._image_tokens(["x"] * 12) > M._image_tokens(["x"] * 6) > 0,
+      "%d → %d" % (M._image_tokens(["x"] * 6), M._image_tokens(["x"] * 12)))
+check("源码里有「告知用户输入被截断」的分支",
+      "_clamped[" in SRC_MAIN or "_clamped" in SRC_MAIN)
+
+print()
+print("=" * 68)
+print("⑧ 属性：微改出来的图要标成「AI 微改」（原来显示成「图片」）")
 check("edit_image 的 ui 事件带 origin=edit", '"origin": "edit"' in SRC_TOOLS)
 check("前端认这个 origin", 'ui.origin === "edit"' in JS and "AI 微改" in JS)
 
 print()
 print("=" * 68)
-print("⑧ 附件去重：拖一张别贴成两张")
+print("⑨ 附件去重：拖一张别贴成两张")
 check("同一批按 名字+大小+修改时间 去重",
       "f.name || \"\"" in JS and "f.size || 0" in JS and "seen.has(key)" in JS)
 check("跨批次按内容（dataURL）去重", "images.indexOf(src) >= 0" in JS)
@@ -175,7 +209,7 @@ check("重复时给用户一句提示（别静默吞掉）",
 
 print()
 print("=" * 68)
-print("⑨ 工具别抢活：搜图不许顶替生图/微改")
+print("⑩ 工具别抢活：搜图不许顶替生图/微改")
 wsch = [s for s in sch if s["function"]["name"] == "web_image_search"][0]["function"]["description"]
 esch = [s for s in sch if s["function"]["name"] == "edit_image"][0]["function"]["description"]
 check("搜图描述里有「不许抢活」的硬约束", "不许抢 edit_image" in wsch)
@@ -188,6 +222,41 @@ check("微改描述里说清「不用重拖、也不用填 source」",
 check("微改描述里明确「不要改用搜图」", "不要改用搜图" in esch)
 
 shutil.rmtree(TMP, ignore_errors=True)
+print()
+print("=" * 68)
+print("⑪ ★ 工具轮之间要再核一次预算（越跑越长会顶爆窗口）")
+# ⚠️ 实测的缺口（2026-09-26）：只在整轮开始前裁过一次历史和输入，但**工具轮越跑越长** ——
+#    每轮都把工具结果追加进 working（web_read 一篇网页 9000 字 ≈ 6700 token），
+#    多跑两轮必然顶爆窗口；顶爆后的兜底是"砍到只剩最后两条"，等于把刚查到的材料全丢了，
+#    用户体感就是"查了却没回答"。
+_wsys = {"role": "system", "content": "x" * 9000}
+_working = [_wsys,
+            {"role": "user", "content": "帮我查一下"},
+            {"role": "assistant", "content": "我查一下"},
+            {"role": "tool", "content": "网页正文。" * 3000, "tool_name": "web_read"},
+            {"role": "assistant", "content": "再查一篇"},
+            {"role": "tool", "content": "网页正文。" * 3000, "tool_name": "web_read"}]
+_ctx = int(CFG.get("num_ctx") or 8192)
+_over = (M._est_tokens(json.dumps(sch, ensure_ascii=False))
+         + sum(M._est_tokens(m.get("content") or "") for m in _working))
+check("造出来的场景**确实超窗**（否则这条测试没意义）", _over > _ctx,
+      "约 %d / %d" % (_over, _ctx))
+_after = M._shrink_round_prompt(_working, CFG, sch)
+_after_all = _after + M._est_tokens(json.dumps(sch, ensure_ascii=False))
+check("压缩后不再超窗", _after_all <= _ctx, "约 %d / %d" % (_after_all, _ctx))
+check("system 消息**永不丢**（它是唯一的规则来源）",
+      any(m.get("role") == "system" for m in _working))
+check("长工具结果被截断（而不是整条丢掉）",
+      any(m.get("role") == "tool" for m in _working)
+      and max(len(m.get("content") or "") for m in _working) < 17999,
+      "最长 %d 字" % max(len(m.get("content") or "") for m in _working))
+check("至少留下 3 条（别把本轮也丢光）", len(_working) >= 3, "%d 条" % len(_working))
+check("常量 ROUND_MSG_MAX_TOKENS 存在且合理",
+      1000 <= getattr(M, "ROUND_MSG_MAX_TOKENS", 0) <= 8000,
+      getattr(M, "ROUND_MSG_MAX_TOKENS", None))
+check("循环里每轮真的调了它（不是写了没用）",
+      "_shrink_round_prompt(working" in SRC_MAIN)
+
 print()
 print("=" * 68)
 print("通过 %d 项，失败 %d 项" % (PASS, len(FAIL)))

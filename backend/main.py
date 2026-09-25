@@ -424,17 +424,60 @@ def _image_tokens(images_b64: list) -> int:
     ⚠️ 宁可**高估**：多留一点空间只是少带两条历史，估少了就是直接报错。
     """
     total = 0
-    for b64 in (images_b64 or [])[:6]:          # 超过 6 张按同样大小累加即可
+    _imgs = list(images_b64 or [])
+    for idx, b64 in enumerate(_imgs):
         w = h = 1024
-        try:
-            from PIL import Image as _PILImage      # 懒导入：没装 PIL 也能跑（退化成按 1024 估）
-            raw = base64.b64decode(str(b64).split(",")[-1], validate=False)
-            with _PILImage.open(io.BytesIO(raw)) as im:
-                w, h = im.size
-        except Exception:
-            pass
+        # 前 6 张真的解码量尺寸；再多的按 1024×1024 估（够保守，也不拖慢）
+        # ⚠️ 以前写的是 `(_imgs)[:6]` 却注释"超过 6 张按同样大小累加" ——
+        #    实际**根本没累加**，第 7 张起等于没算，预算就会低估、提示词被顶爆。
+        if idx < 6:
+            try:
+                from PIL import Image as _PILImage  # 懒导入：没装 PIL 也能跑（退化成按 1024 估）
+                raw = base64.b64decode(str(b64).split(",")[-1], validate=False)
+                with _PILImage.open(io.BytesIO(raw)) as im:
+                    w, h = im.size
+            except Exception:
+                pass
         total += int(math.ceil(w / 28.0) * math.ceil(h / 28.0) / 4) + 8
     return total
+
+
+def _clamp_message_text(text: str, max_tokens: int) -> tuple:
+    """把过长的**单条**消息截到 max_tokens 以内（**保头保尾**）。
+
+    返回 (新文本, 原字数, 保留字数)。
+
+    ⚠️⚠️ 2026-09-26 补，实测的缺口：裁剪逻辑原来只丢**历史**，而"用户这一条"
+    永远保留 —— 于是用户**粘贴一篇几万字的文档**时，提示词会直接顶爆窗口
+    （实测：4 万字输入 ≈ 3.1 万 token，加系统提示与工具定义共 4.8 万 > num_ctx 24576），
+    Ollama 回 400，用户只拿到一句"内容超出长度"。**这是我们的缺口，不是模型装不下。**
+
+    保头保尾而不是只保头：结尾常常才是真正的诉求
+    （「……以上是全部材料，请帮我写一份总结」），只留开头会把它丢掉。
+    用二分找"截到多少字刚好装得下"，比按比例硬猜准（中英文 token 密度差很多）。
+    """
+    s = str(text or "")
+    if max_tokens <= 0 or not s:
+        return s, len(s), len(s)
+    if _est_tokens(s) <= max_tokens:
+        return s, len(s), len(s)
+    head_ratio = 0.55
+    best = ""
+    lo, hi = 0, len(s)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        h = int(mid * head_ratio)
+        t = mid - h
+        mark = "\n\n…（中间省略 %d 字）…\n\n" % max(0, len(s) - mid)
+        cand = s[:h] + mark + (s[len(s) - t:] if t else "")
+        if _est_tokens(cand) <= max_tokens:
+            best = cand
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if not best:                      # 极端情况：连一小段都装不下
+        best = s[: max(1, int(len(s) * 0.1))]
+    return best, len(s), len(best)
 
 
 def _trim_history_to_budget(messages: list, sys_prompt: str, tool_schemas: list,
@@ -451,9 +494,11 @@ def _trim_history_to_budget(messages: list, sys_prompt: str, tool_schemas: list,
     用户体感就是"**模型老是失忆**"。
     修法：输出预留只当**上限**，并且历史至少要能拿到 MIN_HISTORY_TOKENS。
 
-    **返回 (保留的历史, 被丢掉的历史)**。
+    **返回 (保留的历史, 被丢掉的历史, 截断信息)**。
     丢掉的那部分不是直接扔 —— 调用方会把它压成「较早对话摘要」注入，
     否则用户回头问"开头聊了什么"，模型会一脸茫然（实测踩过）。
+    截断信息是 dict（{"orig","kept","cut"）或 None：只有"单条消息本身太长、
+    被截断"时才有值，用来**如实告诉用户**他粘贴的内容被裁了（见 _clamp_message_text）。
     """
     try:
         ctx_limit = int(cfg.get("num_ctx") or 8192)
@@ -470,15 +515,34 @@ def _trim_history_to_budget(messages: list, sys_prompt: str, tool_schemas: list,
     search_reserve = 3800 if cfg.get("web_enabled") else 0
     img_tokens = _image_tokens(images_b64)
     room = ctx_limit - overhead - search_reserve - img_tokens - DIGEST_RESERVE - 512
+
+    def _clamp_all(kept_list: list, budget_tokens: int):
+        """把 kept 里**装不下的单条消息**截断（保头保尾）。返回截断信息或 None。"""
+        info = None
+        per_msg = max(512, int(budget_tokens))
+        for i, m in enumerate(kept_list):
+            t = m.get("content") or ""
+            if not isinstance(t, str) or _est_tokens(t) <= per_msg:
+                continue
+            new_t, orig, keptc = _clamp_message_text(t, per_msg)
+            if keptc < orig:
+                m2 = dict(m)
+                m2["content"] = new_t
+                kept_list[i] = m2
+                info = {"orig": orig, "kept": keptc, "cut": orig - keptc}
+        return info
+
     if room <= 512:
         # 连固定开销都快占满了：只带最近 2 条，别把提示词撑爆
-        return messages[-2:], messages[:-2]
+        tail = messages[-2:]
+        return tail, messages[:-2], _clamp_all(tail, max(256, room))
 
     # 输出愿留多少就留多少，但**不许把历史挤没**（见函数说明）
     reserve_out = min(reserve_out_cfg, max(512, room - MIN_HISTORY_TOKENS))
     budget = room - reserve_out
     if budget <= 0:
-        return messages[-2:], messages[:-2]
+        tail = messages[-2:]
+        return tail, messages[:-2], _clamp_all(tail, max(256, room))
 
     kept, used = [], 0
     for i, m in enumerate(reversed(messages)):
@@ -491,7 +555,93 @@ def _trim_history_to_budget(messages: list, sys_prompt: str, tool_schemas: list,
         used += t
     kept.reverse()
     dropped = messages[: len(messages) - len(kept)]
-    return kept, dropped
+    # ⚠️ 最后一步：**单条消息自己也得装得下**（用户粘贴几万字文档的场景，见上面的说明）
+    return kept, dropped, _clamp_all(kept, budget)
+
+
+# 工具轮里单条消息的上限。工具结果动辄上万字（网页正文 9000 字 ≈ 6700 token），
+# 一条就能吃掉四分之一窗口。超过就**截断**（保头保尾）而不是整条丢掉 ——
+# 丢掉会让模型以为"没查到"，截断至少保住主要信息。
+ROUND_MSG_MAX_TOKENS = 4000
+
+
+def _shrink_round_prompt(working: list, cfg: dict, tool_schemas: list) -> int:
+    """工具轮之间再核一次预算：装不下就先压大的、再丢最旧的。返回估算 token 数。
+
+    ⚠️⚠️ 2026-09-26 补。整轮开始前只裁过一次历史和用户输入，但**工具轮是越跑越长的**：
+    每一轮都会把工具结果追加进 working（web_read 一篇网页 9000 字 ≈ 6700 token），
+    多跑两轮必然顶爆窗口。顶爆后的兜底是"砍到只剩最后两条消息"——
+    那等于**把刚查到的材料全丢了**，用户看到的就是"查了却没回答"。
+    所以在每轮真正发请求前压一次：先截断超长的单条，仍然超再从最旧的丢
+    （system 永不丢，它是唯一的规则来源；至少留 3 条，别把本轮也丢掉）。
+    """
+    import json as _json
+    try:
+        ctx = int(cfg.get("num_ctx") or 8192)
+    except Exception:
+        ctx = 8192
+    overhead = _est_tokens(_json.dumps(tool_schemas or [], ensure_ascii=False))
+    room = ctx - overhead - DIGEST_RESERVE - 512
+
+    def _total():
+        return sum(_est_tokens(m.get("content") or "")
+                   for m in working if isinstance(m, dict))
+
+    for i, m in enumerate(working):
+        if not isinstance(m, dict) or m.get("role") == "system":
+            continue
+        t = m.get("content") or ""
+        if isinstance(t, str) and _est_tokens(t) > ROUND_MSG_MAX_TOKENS:
+            new_t, _o, _k = _clamp_message_text(t, ROUND_MSG_MAX_TOKENS)
+            m2 = dict(m)
+            m2["content"] = new_t
+            working[i] = m2
+
+    # ② 还装不下 → 从最旧的**非 system** 消息开始丢。
+    #    ⚠️ 三样东西**永不丢**：system（唯一的规则来源）、最后一条（当前进展）、
+    #    **最近一条 user 消息**（那是用户的诉求本身 —— 丢了它就等于答非所问，
+    #    而它前面那些"更旧的"才是该先牺牲的）。
+    def _protected():
+        keep = set()
+        for i, m in enumerate(working):
+            if isinstance(m, dict) and m.get("role") == "system":
+                keep.add(i)
+        if working:
+            keep.add(len(working) - 1)
+        for i in range(len(working) - 1, -1, -1):
+            if isinstance(working[i], dict) and working[i].get("role") == "user":
+                keep.add(i)
+                break
+        return keep
+
+    while _total() > room:
+        prot = _protected()
+        idx = next((i for i, m in enumerate(working)
+                    if isinstance(m, dict) and i not in prot), None)
+        if idx is None:
+            break                     # 只剩受保护的那些，不能再丢了
+        working.pop(idx)
+
+    # ③ 丢到只剩受保护的**还装不下**（提示词 + 工具定义本身就快占满窗口）→
+    #    把最大的那条再压一压（通常就是工具结果/长材料）。
+    #    宁可这一轮材料少一点，也不能让请求直接 400 —— 那连回答都没有。
+    _guard = 0
+    while _total() > room and _guard < 6:
+        _guard += 1
+        cand = [(len(m.get("content") or ""), i) for i, m in enumerate(working)
+                if isinstance(m, dict) and m.get("role") != "system"
+                and isinstance(m.get("content"), str) and m.get("content")]
+        if not cand:
+            break
+        _ln, _i = max(cand)
+        _room_it = max(256, _est_tokens(working[_i]["content"]) - (_total() - room))
+        _new_t, _o, _k = _clamp_message_text(working[_i]["content"], _room_it)
+        if _k >= _ln:
+            break
+        _m2 = dict(working[_i])
+        _m2["content"] = _new_t
+        working[_i] = _m2
+    return _total()
 
 
 # 触发自动记忆的信号词：出现这些词说明用户可能透露了值得长期记住的信息。
@@ -1593,7 +1743,10 @@ def _friendly_ollama_error(msg) -> str:
                 "**下一步（任选其一即可）**：\n"
                 "· 少附几张图 / 少拖几个文件再问一次；\n"
                 "· 或者**新开一个对话**（旧对话的历史太长）；\n"
-                "· 或者到设置里把「上下文长度 num_ctx」调大（比如 24576 → 32768）。\n"
+                "· 长文建议**存成文件**再拖进来让我读（这样不占对话窗口）；\n"
+                "· 或者到设置里把「上下文长度 num_ctx」调大 —— "
+                "⚠️ **前提是显存装得下**：超了会有一部分算到 CPU 上，明显变慢\n"
+                "  （实测 12GB 卡：24576 是 100% 在显卡上的上限；调到 32768 会有约 1GB 落到内存）。\n"
                 "**这不是内存或显存坏了**，纯粹是这一轮带的内容太长。\n`%s`" % m)
     return m
 
@@ -3634,8 +3787,8 @@ async def chat(req: ChatRequest):
     budget_sys = sys_prompt + "\n\n" + mem_ctx + "\n\n" + rag_ctx
     # ⚠️ 附件图片也要占上下文（挂在最后一条 user 消息上发给 Ollama）——
     #    以前没算，拖一张大图进来就会撑爆窗口、Ollama 直接回 400。
-    messages, dropped = _trim_history_to_budget(messages, budget_sys, tool_schemas, cfg,
-                                                images_b64=model_images)
+    messages, dropped, _clamped = _trim_history_to_budget(
+        messages, budget_sys, tool_schemas, cfg, images_b64=model_images)
     digest = _history_digest(dropped)
 
     # 联网搜索：以前这里会**预先**跑一次搜索并把结果塞进上下文，
@@ -3663,6 +3816,17 @@ async def chat(req: ChatRequest):
         # 工具执行期间要能**实时**把弹窗推给前端，所以单独开一个队列
         loop = asyncio.get_running_loop()
         live_ui: asyncio.Queue = asyncio.Queue()
+        # ⚠️ 用户**自己这一轮**发的内容太长时（粘贴了一篇几万字的文档），
+        #    _trim_history_to_budget 会把它截断到装得下 —— 截了就必须**如实说**，
+        #    不能偷偷丢掉他粘贴的内容（他以为模型读过全文，实际没有，会得出错误结论）。
+        if _clamped:
+            yield json.dumps({"note": (
+                "你这一轮发的内容偏长（约 %d 字），**超出了模型单次能装下的长度** —— "
+                "已保留**开头和结尾**共约 %d 字（中间省略约 %d 字）。\n"
+                "· 想让我**完整**读完，建议把它**存成文件**拖进来让我读（文件不占对话窗口）；\n"
+                "· 或者到设置里把「上下文长度 num_ctx」调大 —— "
+                "⚠️ 前提是显存装得下，超了会有一部分算到 CPU 上、明显变慢。"
+                % (_clamped["orig"], _clamped["kept"], _clamped["cut"]))}) + "\n"
         # ⚠️ 历史摘要**不能并进系统提示** —— 它会随上下文裁剪而变，
         #    同样会把它后面的工具定义一起废掉（见 _attach_live_ctx 的说明）。
         full_sys = sys_prompt
@@ -3866,6 +4030,17 @@ async def chat(req: ChatRequest):
         for _round in range(MAX_TOOL_ROUNDS):
             # 工具调用中间轮不再重复附图片
             attach_images = model_images if _round == 0 else None
+            # ⚠️ 每轮发请求前**再核一次预算**：整轮开始前只裁过一次历史，
+            #    但工具轮是"越跑越长"的 —— 每轮都会把工具结果追加进 working
+            #    （网页正文一条就 9000 字 ≈ 6700 token），多跑两轮必然顶爆窗口。
+            #    顶爆后的兜底是"砍到只剩最后两条"，等于**把工具查到的材料全丢了**，
+            #    任务半途而废（用户看到的是"查了却没回答"）。这里先把大的压下去。
+            if _round > 0:
+                try:
+                    _pt = _shrink_round_prompt(working, cfg, tool_schemas)
+                    logger.debug("[round] 第 %d 轮提示词约 %d token", _round, _pt)
+                except Exception:
+                    logger.warning("工具轮预算压缩失败（按原样继续）", exc_info=True)
             try:
                 resp = client.chat(working, model=model, stream=True,
                                    images_base64=attach_images, params=gen_params,
