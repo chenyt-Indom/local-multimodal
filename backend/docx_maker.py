@@ -578,10 +578,15 @@ def _apply_header_footer(doc, ctx, text, skip_first=False, logo=""):
                    color=ctx["th"]["muted"], font=ctx["body_font"])
 
 
-def make_ctx(theme=DEFAULT_THEME, font=DEFAULT_FONT, bases=None, body_size=11.0):
+def make_ctx(theme=DEFAULT_THEME, font=DEFAULT_FONT, bases=None, body_size=11.0,
+             colors=None):
     """构造渲染上下文。office_edit 往已有文档里追加内容时要用同一个。"""
+    # 支持自定义配色（见 pptx_maker.apply_colors 的说明）
+    from backend.pptx_maker import apply_colors
     return {
-        "th": THEMES.get(str(theme or "").strip().lower(), THEMES[DEFAULT_THEME]),
+        "th": apply_colors(
+            THEMES.get(str(theme or "").strip().lower(), THEMES[DEFAULT_THEME]),
+            colors),
         "body_font": FONT_SETS.get(str(font or "").strip().lower(),
                                    FONT_SETS[DEFAULT_FONT])[0],
         "head_font": FONT_SETS.get(str(font or "").strip().lower(),
@@ -761,7 +766,8 @@ def build_docx_text(path, title, text, **kw):
 
 def build_docx(path, title, blocks, subtitle="", author="", date_text="",
                theme=DEFAULT_THEME, font=DEFAULT_FONT, cover=False,
-               header="", toc=False, margins=2.5, bases=None, logo=""):
+               header="", toc=False, margins=2.5, bases=None, logo="",
+               colors=None):
     """把结构化内容生成 docx，返回 {'ok','path','blocks','pages','warnings','error'}。
 
     blocks 每项：{'type': ..., 其余字段见模块 docstring}
@@ -769,7 +775,7 @@ def build_docx(path, title, blocks, subtitle="", author="", date_text="",
     bg / line / before / after / width(图片，cm)
     """
     try:
-        ctx = make_ctx(theme, font, bases)
+        ctx = make_ctx(theme, font, bases, colors=colors)
         warnings = ctx["warnings"]
         th = ctx["th"]
         body_font = ctx["body_font"]

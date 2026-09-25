@@ -64,6 +64,11 @@ _MAKE_PPTX_SCHEMA = {
             "⚠️ 标题和内容**必须严格按用户这一轮说的主题**写，别被记忆或前文里的别的主题带跑。\n"
             "⚠️ 生成后只把**下载链接**给用户，**不要描述界面操作步骤**（没有那些按钮）。\n"
             "**你只管想内容**，排版由工具完成，不用写代码。\n"
+            "⚠️⚠️ **内容必须充实，这是最容易做砸的地方**（用户 2026-09-26 明确要求）：\n"
+            "  · 页数给够：常规主题 **8~15 页**（封面/结尾不算），别只给 3~4 页就交差；\n"
+            "  · **每页要点 3~6 条，每条写 15~40 字的完整句子** —— 要有信息量、有数据、有结论，不要只写「背景」「目标」这种两三个字的标签（那样出来的是空壳）；\n"
+            "  · 该上表格/图表/数据的地方就上（预算是表格、趋势是图表、指标是 stats），别把全是文字塞成流水账；\n"
+            "  · 用户给了素材（知识库、前文、附件）就**照着素材写实**，别自己编数字。\n"
             "· 每页用 layout 选版式（不写就按内容自动判断）：\n"
             "  content 标题+要点(默认) / two_col 左右两栏(用 left/right，可配 left_title/right_title)\n"
             "  / image_right|image_left 图文并排 / image_full 整页大图\n"
@@ -97,7 +102,10 @@ _MAKE_PPTX_SCHEMA = {
                 "subtitle": {"type": "string", "description": "封面副标题，可选，一句话点题"},
                 "author": {"type": "string", "description": "封面落款，如「姓名 · 单位 · 日期」，可选"},
                 "theme": {"type": "string",
-                          "description": "配色：blue(默认) / green / warm / purple / mono / red"},
+                          "description": "配色预设：blue(默认) / green / warm / purple / mono / red"},
+                "colors": {"type": "object",
+                           "description": "**自定义配色**（覆盖预设）。用户提到具体颜色就用它：「红金色系」「企业蓝」「莫兰迪色」「我们 VI 是 #0B5FA5」。键可只给一部分，其余走 theme 预设；值写十六进制，# 可带可不带。可用键：accent 主色（标题短横线/要点符号/表头底色）、cover_bg 封面与章节页底色、cover_fg 封面文字色、bg 内页底色、body 正文色、muted 次要文字色、card 卡片与斑马纹底。例：accent 给 #B8860B、cover_bg 给 #8B0000 就是红金配色。",
+                           "additionalProperties": {"type": "string"}},
                 "filename": {"type": "string",
                              "description": "保存的文件名，不用带 .pptx 后缀；不给就用标题"},
                 "end_text": {"type": "string", "description": "结尾页文字，默认「谢谢观看」"},
@@ -118,7 +126,11 @@ _MAKE_PPTX_SCHEMA = {
                                        "description": "版式，见工具说明；不写按内容自动判断"},
                             "bullets": {
                                 "type": "array",
-                                "description": "要点列表；字符串，或 {text,bold,color,size} 对象",
+                                "description": (
+                                    "要点列表；字符串，或 {text,bold,color,size,hl} 对象。"
+                                    "文字里可以用 **加粗** 和 ==高亮== 标重点"
+                                    "（会自动渲染，不会把符号印出来）；"
+                                    "以「- 」开头的字符串算二级要点。"),
                                 "items": {"type": "string"},
                             },
                             "left": {"type": "array", "items": {"type": "string"},
@@ -291,6 +303,7 @@ _MAKE_XLSX_SCHEMA = {
             "或给了你一堆数据要整理时，用它。\n"
             "**你只填数据，不用写代码。** 排版（表头配色、隔行底纹、冻结首行、筛选、合计行、"
             "数字/货币/百分比格式、数据条、图表）都由工具做。\n"
+            "⚠️⚠️ **数据要给够**（用户 2026-09-26 明确要求）：明细表通常 **8~30 行**（用户给多少写多少，没给就该按主题把该有的行补全，别只写 2~3 行显得敷衍）；该汇总的给一张汇总表，该画的给 chart。\n"
             "· 一个工作簿可放多张表：给 sheets 数组，每张表一个 name。\n"
             "· 每张表：header（表头）+ rows（二维数组）。数字就写数字（别加千分位或￥符号）。\n"
             "· formats：每列的格式关键字 —— text / int / number / money / percent / date；"
@@ -311,7 +324,10 @@ _MAKE_XLSX_SCHEMA = {
                 "filename": {"type": "string",
                              "description": "保存的文件名，不用带 .xlsx；不给就用 title"},
                 "theme": {"type": "string",
-                          "description": "配色：blue(默认) / green / warm / purple / mono / red"},
+                          "description": "配色预设：blue(默认) / green / warm / purple / mono / red"},
+                "colors": {"type": "object",
+                           "description": "**自定义配色**（覆盖预设）。用户提到具体颜色就用它：「红金色系」「企业蓝」「莫兰迪色」「我们 VI 是 #0B5FA5」。键可只给一部分，其余走 theme 预设；值写十六进制，# 可带可不带。可用键：accent 主色（标题短横线/要点符号/表头底色）、cover_bg 封面与章节页底色、cover_fg 封面文字色、bg 内页底色、body 正文色、muted 次要文字色、card 卡片与斑马纹底。例：accent 给 #B8860B、cover_bg 给 #8B0000 就是红金配色。",
+                           "additionalProperties": {"type": "string"}},
                 "sheets": {
                     "type": "array",
                     "description": "一个工作表一项，按顺序排。先给明细表、再给汇总表（可选）。",
@@ -368,6 +384,11 @@ _MAKE_DOCX_SCHEMA = {
             "⚠️ 不要用 `library` 先写 .md 再让用户自己导出 —— 本工具一次成型，直接给成品。\n"
             "⚠️ 生成后只把**下载链接**给用户，**不要描述界面操作步骤**（没有那些按钮）。\n"
             "**你只管想内容**，排版由工具完成，不用写代码。\n"
+            "⚠️⚠️ **内容必须写满，这是最容易做砸的地方**（用户 2026-09-26 明确要求）：\n"
+            "  · 一篇正经文档通常要 **8~20 个内容块**，别只给三四块就交差；\n"
+            "  · 每个 para **3~6 句、150~400 字**，讲清是什么/为什么/怎么做，不要只写一两句空话；\n"
+            "  · 需要分层时用 heading（1~4 级）+ bullet/number，结构清楚但不啰嗦；\n"
+            "  · 用户给了素材（知识库、前文、附件）就**照着素材写实**，别自己编数字。\n"
             "blocks 是内容块列表，按顺序排，每块一个 type：\n"
             "  heading 标题（配 level 1~4）/ para 段落（text）\n"
             "  bullet 无序列表（items 数组）/ number 有序列表（items）\n"
@@ -391,7 +412,10 @@ _MAKE_DOCX_SCHEMA = {
                 "author": {"type": "string", "description": "署名，如「姓名 · 单位」"},
                 "date_text": {"type": "string", "description": "落款日期文字，如「2026 年 9 月」"},
                 "theme": {"type": "string",
-                          "description": "配色：blue(默认) / green / warm / purple / mono / red"},
+                          "description": "配色预设：blue(默认) / green / warm / purple / mono / red"},
+                "colors": {"type": "object",
+                           "description": "**自定义配色**（覆盖预设）。用户提到具体颜色就用它：「红金色系」「企业蓝」「莫兰迪色」「我们 VI 是 #0B5FA5」。键可只给一部分，其余走 theme 预设；值写十六进制，# 可带可不带。可用键：accent 主色（标题短横线/要点符号/表头底色）、cover_bg 封面与章节页底色、cover_fg 封面文字色、bg 内页底色、body 正文色、muted 次要文字色、card 卡片与斑马纹底。例：accent 给 #B8860B、cover_bg 给 #8B0000 就是红金配色。",
+                           "additionalProperties": {"type": "string"}},
                 "font": {"type": "string",
                          "description": "字体：yahei 雅黑(默认) / song 宋体正文+黑体标题 / kai 楷体"},
                 "filename": {"type": "string", "description": "文件名，不用带 .docx 后缀"},
@@ -435,6 +459,10 @@ _EDIT_OFFICE_SCHEMA = {
             "  {\"op\":\"add_shape\",\"slide\":3,\"kind\":\"rect|round|oval\",\"x\":1,\"y\":1,\"w\":2,\"h\":1,\"fill\":\"2E75B6\"}\n"
             "  {\"op\":\"delete_shape\",\"slide\":3,\"shape\":2} / {\"op\":\"set_bg\",\"slide\":3,\"color\":\"FFF7E6\"}\n"
             "  {\"op\":\"set_notes\",\"slide\":3,\"text\":\"备注\"} / {\"op\":\"set_theme\",\"theme\":\"green\"} 整份换配色\n"
+            "     ⚠️ 用户说「换成**红金色系 / 企业蓝 / 我们的 VI 色**」这类**具体颜色**时，"
+            "set_theme 要带上 colors，例如 {\"op\":\"set_theme\",\"theme\":\"red\","
+            "\"colors\":{\"accent\":\"#B8860B\",\"cover_bg\":\"#8B0000\"}}；"
+            "只挑个近似的预设**不算做到**。add_slide 也可以带 colors。\n"
             "  {\"op\":\"duplicate_slide\",\"slide\":3} / {\"op\":\"move_slide\",\"slide\":3,\"to\":1} / {\"op\":\"delete_slide\",\"slide\":3}\n"
             "  {\"op\":\"add_slide\",\"slide_spec\":{...和 make_pptx 的一页同格式...}}\n"
             "Word 文档用它：\n"
@@ -683,7 +711,8 @@ _WS_PROJECT_SCHEMAS = [
 
 def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
                  code_exec: bool = False, writing: bool = False,
-                 ask_mode: str = "quick", office: bool = False) -> list:
+                 ask_mode: str = "quick", office: bool = False,
+                 office_gen: bool = False) -> list:
     """返回工具 schema 列表。
 
     web_enabled=True 时才暴露联网搜索工具——保证"开关不开不联网"的约定：
@@ -714,7 +743,17 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
     #   这是"复杂内容的 PPT 做不出来"的直接原因，所以这里要**优先保住生成工具**：
     #     留 make_pptx / make_docx / make_xlsx / edit_office + 文库 + 问细节，
     #     其余（画图、地图、文件系统、跑代码、联网…）照旧砍掉，省下的额度给长输出。
-    if office:
+    if office_gen:
+        # ⚠️⚠️ 触发场景：**办公任务重试**时（见 main.py 的空回答重试）。
+        #   原来的重试统一换成"写作精简集"（writing=True），而那个集合里
+        #   **没有 make_pptx / make_docx / make_xlsx** —— 于是"首次尝试把额度
+        #   全烧在思考上"之后，重试这一轮模型**根本没法生成文件**，
+        #   最后只回一段文字：用户要 PPT，拿到的是一段话（2026-09-26 实测复现：
+        #   端到端跑出来 工具=[]、一个文件都没有）。
+        #   这里保留**三个生成工具**，砍掉「问细节 / 改文件 / 文库」，
+        #   省下约 2600 token 的窗口，同时守住"能做出文件"这条底线。
+        _keep = {"make_pptx", "make_docx", "make_xlsx"}
+    elif office:
         _keep = {"make_pptx", "make_docx", "make_xlsx", "edit_office",
                  "library", "ask_user"}
         if kb_enabled:
@@ -796,7 +835,10 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
                                                            "cartoon, anime, illustration, painting, 3d render, "
                                                            "plastic, oversaturated, blurry, deformed, extra limbs"},
                         "size": {"type": "integer", "enum": [512, 768],
-                                 "description": "图片边长，默认512。要细节/要印出来用 768"},
+                                 "description": "图片边长，默认512。要细节/写实/要印出来用 768"},
+                        "aspect": {"type": "string",
+                                   "enum": ["1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3"],
+                                   "description": ("画幅比例，默认 1:1。用户说「竖版/海报/手机壁纸」用 9:16 或 2:3；说「横版/宽屏/PPT 配图/Banner」用 16:9 或 3:2。像素面积与方形一致，耗时不变。")},
                         "hd": {"type": "boolean",
                                "description": "是否出高清成品（默认 false）。"
                                               "用户要「高清/高分辨率/画质好点/能放大看/要写实细节」时设为 true ——"
@@ -1943,6 +1985,37 @@ def _do_save_image_to_library(arguments, context):
             "用户可在左侧「图片库」面板随时查看、调用或删除。")
 
 
+# 画幅比例 → 宽高。**保持像素面积与方形一致**，这样显存/耗时基本不变。
+# ⚠️ 2026-09-26 加：原来只有方形（size × size），用户说"竖版海报""16:9 横图"
+#    根本做不到 —— 而 t2i.generate 本来就支持 width/height 分开传。
+#    尺寸都取 8 的倍数（SD 的 VAE 下采样要求）。
+_IMG_ASPECTS = {
+    "1:1": ((512, 512), (768, 768)),
+    "4:3": ((584, 448), (888, 664)),
+    "3:4": ((448, 584), (664, 888)),
+    "16:9": ((680, 384), (1024, 576)),
+    "9:16": ((384, 680), (576, 1024)),
+    "3:2": ((624, 416), (936, 624)),
+    "2:3": ((416, 624), (624, 936)),
+}
+
+
+def _img_wh(size, aspect):
+    """把 (size, aspect) 解析成 (width, height)。不认识的比例按 1:1。"""
+    try:
+        base = int(size or 512)
+    except Exception:
+        base = 512
+    key = str(aspect or "1:1").strip().lower().replace("x", ":").replace("：", ":")
+    key = {"square": "1:1", "wide": "16:9", "tall": "9:16",
+           "竖版": "9:16", "竖图": "9:16", "横版": "16:9", "横图": "16:9",
+           "方形": "1:1", "正方": "1:1"}.get(key, key)
+    pair = _IMG_ASPECTS.get(key)
+    if not pair:
+        return base, base
+    return pair[1] if base >= 768 else pair[0]
+
+
 def _do_generate_image(arguments, ui_events):
     prompt = (arguments.get("prompt") or "").strip()
     if not prompt:
@@ -1952,13 +2025,17 @@ def _do_generate_image(arguments, ui_events):
     style_pos, style_neg = _style_for(prompt)
     user_neg = (arguments.get("negative_prompt") or "").strip()
     negative = ", ".join(x for x in (user_neg, style_neg or _IMAGE_NEG_DEFAULT) if x)
-    size = int(arguments.get("size") or 512)
+    try:
+        size = int(arguments.get("size") or 512)
+    except Exception:
+        size = 512
     hd = bool(arguments.get("hd"))
+    width, height = _img_wh(size, arguments.get("aspect"))
     boosted = ", ".join(x for x in (prompt, style_pos or _IMAGE_PROMPT_NEUTRAL) if x)
     t2i.unload()  # 确保显存空闲
     start = time.time()
     result = t2i.generate(boosted, negative_prompt=negative, steps=4,
-                          width=size, height=size, hd=hd)
+                          width=width, height=height, hd=hd)
     cost = time.time() - start
     if not result.get("ok"):
         return (f"图片生成失败：{result.get('error')}。"
@@ -1969,7 +2046,7 @@ def _do_generate_image(arguments, ui_events):
                     "model": result.get("model"), "cost_s": round(cost, 1),
                     "size": result.get("size"),
                     "origin": "gen"})     # ← 前端据此标注「AI 生成」
-    real_size = result.get("size") or f"{size}x{size}"
+    real_size = result.get("size") or ("%d x %d" % (width, height))
     extra = f"（{result['hd_note']}）" if (hd and result.get("hd_note")) else ""
     style_note = "（已按「%s」风格加强）" % style_pos.split(",")[0] if style_pos else ""
     return (f"已生成图片（{real_size}，{result.get('device')}，用 {round(cost,1)} 秒）"
@@ -2741,6 +2818,48 @@ def _do_workspace_pack(arguments=None) -> str:
 _BAD_FN = re.compile(r'[\\/:*?"<>|\r\n\t]')
 
 
+def _pptx_text_chars(slides) -> int:
+    """粗略统计一份 PPT 规格里的**正文字数**（判断内容够不够充实用）。
+
+    只求量级正确：把各版式里承载文字的那些字段加起来即可。
+    """
+    n = 0
+    for sl in (slides or []):
+        if not isinstance(sl, dict):
+            n += len(str(sl))
+            continue
+        for k in ("title", "text", "subtitle", "name", "value", "unit", "note"):
+            n += len(str(sl.get(k) or ""))
+        q = sl.get("quote")
+        if isinstance(q, dict):                      # quote 版式是嵌套对象
+            n += len(str(q.get("text") or "")) + len(str(q.get("from") or ""))
+        elif q:
+            n += len(str(q))
+        for k in ("bullets", "items", "left", "right", "cards", "stats",
+                  "steps", "nodes", "series"):
+            v = sl.get(k)
+            if not isinstance(v, list):
+                continue
+            for it in v:
+                if isinstance(it, dict):
+                    for kk in ("text", "title", "label", "value", "unit",
+                               "desc", "name", "quote"):
+                        n += len(str(it.get(kk) or ""))
+                else:
+                    n += len(str(it))
+        for k in ("header", "rows"):
+            v = sl.get(k)
+            if isinstance(v, list):
+                for it in v:
+                    if isinstance(it, (list, tuple)):
+                        n += sum(len(str(x)) for x in it)
+                    elif isinstance(it, dict):
+                        n += sum(len(str(x)) for x in it.values())
+                    else:
+                        n += len(str(it))
+    return n
+
+
 def _do_make_pptx(arguments=None, ui_events=None) -> str:
     """把结构化内容生成 .pptx，存进生成文库，返回可点下载链接。
 
@@ -2786,6 +2905,7 @@ def _do_make_pptx(arguments=None, ui_events=None) -> str:
         cover_image=str(a.get("cover_image") or ""),
         logo_pos=str(a.get("logo_pos") or "tr"),
         logo_size=float(a.get("logo_size") or 0.5),
+        colors=a.get("colors"),
     )
     if not r.get("ok"):
         return "生成 PPT 失败：%s" % r.get("error")
@@ -2815,6 +2935,18 @@ def _do_make_pptx(arguments=None, ui_events=None) -> str:
     tip = ""
     if r.get("warnings"):
         tip = "\n（提示：%s）" % "；".join(r["warnings"][:3])
+    # 把**实测内容密度**回传给模型（2026-09-26 用户要求「太简单要修正」）。
+    # 8B 模型常常只写三四条短句就交差，而工具描述里的"丰富度要求"它未必照做；
+    # 给它一个数字，它才知道自己写得够不够、要不要再补一版。
+    _chars = _pptx_text_chars(slides)
+    if n_pages >= 5:
+        _dense = _chars / float(n_pages)
+        if _dense < 55:
+            tip += ("\n（自检：这版平均每页约 %.0f 字，**偏薄**。用户若要的是"
+                    "「内容充实」的稿子，请再调一次 make_pptx 补足：每页 3~6 条要点、"
+                    "每条 15~40 字的完整句子 —— 别只是重发一份一样的。）" % _dense)
+        else:
+            tip += "\n（自检：平均每页约 %.0f 字，内容密度合格。）" % _dense
     return ("已生成 PPT《%s》——共 %d 页，%.0f KB。\n"
             "下载链接（**直接点就能存下来，原样给用户**）：\n"
             "/api/doclib/download?rel=%s\n"
@@ -2936,6 +3068,7 @@ def _do_make_docx(arguments=None, ui_events=None) -> str:
         toc=bool(a.get("toc")),
         bases=_img_bases(),
         logo=str(a.get("logo") or ""),
+        colors=a.get("colors"),
     )
     if not r.get("ok"):
         return "生成文档失败：%s" % r.get("error")
@@ -3012,7 +3145,8 @@ def _do_make_xlsx(arguments=None, ui_events=None) -> str:
         os.close(fd)
         r = _xl.build_xlsx(tmp, sheets,
                            theme=str(a.get("theme") or "blue"),
-                           author="本地多模态助手")
+                           author="本地多模态助手",
+                           colors=a.get("colors"))
         if not r.get("ok"):
             return "生成表格失败：%s" % r.get("error")
         with open(tmp, "rb") as f:

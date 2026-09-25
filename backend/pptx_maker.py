@@ -63,6 +63,118 @@ THEMES = {
 }
 DEFAULT_THEME = "blue"
 
+# 可自定义的配色键（**通用词汇**，不是某个生成器的键名）。
+# ⚠️ 2026-09-26 加：用户/模型常提「红金色系」「企业蓝」「莫兰迪色」这类要求，
+#    而预设只有 6 套 —— 做不到的时候模型就**只好嘴上说做到了**
+#    （实测真有：它回「采用党政机关推荐的红金色系」，而当时的代码里根本没有红金）。
+#    现在允许直接给十六进制色覆盖，只给一部分也行，其余走预设。
+COLOR_KEYS = ("cover_bg", "cover_fg", "body", "accent", "bg", "muted", "card")
+
+# 通用键 → 各生成器主题键的**别名落位**。
+# ⚠️ 三个生成器的主题键名并不统一：pptx 用 accent/cover_bg/bg/body/muted/card，
+#    而 xlsx 的表头色叫 **head**、隔行底叫 **zebra**，docx 还有 text/quote_bg。
+#    少了这层映射就会出现"设了 accent 但表头照样是蓝的"——**静默失效**，
+#    2026-09-26 实测踩到：Excel 传 {"accent": "#B8860B"}，表头一变没变。
+#    模型只需要记一套通用键，落到哪个生成器由这里分发。
+_COLOR_ALIASES = {
+    "accent": ("accent", "head", "accent2"),   # 主色：xlsx/docx 的表头与封面标题叫 head，
+                                               # docx 的一级列表符号叫 accent2
+    "card":   ("card", "zebra"),      # 卡片底 → xlsx 的隔行底纹
+    "body":   ("body", "text"),       # 正文色：docx 里叫 text
+    "bg":     ("bg", "quote_bg"),     # 浅底 → docx 的引用底色
+}
+
+# 这几个键是**从 accent 推导出来**的（不是简单等同）：warm 的 head 比 accent 暗一档、
+# docx 的 accent2 比 accent 亮一档，都按**通道比例**映射才不丢那个主题的性格。
+_DERIVED_FROM_ACCENT = ("head", "accent2")
+
+# 主色一变，**跟它配套的浅色也要跟着变** —— 它们本来就是主色调浅出来的。
+# 不跟着变就会出现"金色表头 + 蓝色隔行底"这种难受的搭配。
+# 比例是从预设里量出来的（blue: accent 2E75B6 → zebra EAF1F9 ≈ tint .90、
+# line BDD3E8 ≈ tint .68；pptx 的 card F2F7FC ≈ tint .94；docx 的 line D6E4F0 ≈ tint .85）。
+# line 取 .80 是折中：xlsx 偏浅一点、docx 几乎吻合，两边都是"能看的浅色分隔线"。
+_TINT_OF_ACCENT = {"card": 0.94, "zebra": 0.90, "quote_bg": 0.92,
+                   "callout_bg": 0.90, "line": 0.80}
+
+
+def _chan_scale(new_hex, old_accent, old_head):
+    """按预设里 accent→head 的关系，把新主色映射成对应的 head 色。
+
+    预设里两者相等时（blue/green/purple/red、以及 xlsx 全部）直接用新主色；
+    不相等时（warm 的 9A4A0B、mono 的 1A1A1A 都是 accent 的加深）按**通道比例**
+    缩放，保住那个主题的性格 —— 而不是简单粗暴地等同。
+    """
+    def _c(h):
+        h = str(h or "").lstrip("#")
+        try:
+            return [int(h[i:i + 2], 16) for i in (0, 2, 4)]
+        except Exception:
+            return None
+    a, b, n = _c(old_accent), _c(old_head), _c(new_hex)
+    if not a or not b or not n:
+        return new_hex
+    out = []
+    for i in range(3):
+        r = (b[i] / a[i]) if a[i] else 1.0
+        out.append(max(0, min(255, int(round(n[i] * r)))))
+    return "%02X%02X%02X" % tuple(out)
+
+
+def apply_colors(th: dict, colors) -> dict:
+    """把自定义配色覆盖到主题上，返回新字典。
+
+    colors 形如 {"accent": "#B8860B", "cover_bg": "#8B0000"}（键名同 COLOR_KEYS）。
+    容错：'#' 可带可不带、大小写随意；非 hex 的值会被忽略并记进 _warn（不抛异常，
+    免得一个手滑的颜色把整份文档搞崩）。
+
+    三件事一起做（缺一个都会让"自定义配色"名不副实）：
+      ① 主色落到目标主题的 **accent + head** 上；
+      ② 与主色配套的浅色（卡片/隔行底/分隔线/引用底）按预设比例**跟着重算**；
+      ③ 写回时**沿用目标主题原有的 '#' 风格**（pptx 存 "2E75B6"，xlsx 存 "#2E75B6"）
+         —— 否则下游按 "#" 拼接或切片会拿到半截色值。
+    """
+    out = dict(th or {})
+    warns = []
+    if not isinstance(colors, dict):
+        return out
+
+    def _put(dst, hex6):
+        """写进 dst 键，格式跟该键原有取值保持一致；该键不存在就跳过。"""
+        if dst not in out:
+            return
+        out[dst] = ("#" + hex6) if str(out.get(dst) or "").startswith("#") else hex6
+
+    for k, v in colors.items():
+        key = str(k or "").strip().lower()
+        if key not in COLOR_KEYS:
+            continue
+        s = str(v or "").strip().lstrip("#").strip()
+        if len(s) == 3:                      # #abc → aabbcc
+            s = "".join(c * 2 for c in s)
+        if len(s) != 6 or not all(c in "0123456789abcdefABCDEF" for c in s):
+            warns.append("配色 %s=%r 不是合法的十六进制颜色，已忽略" % (key, v))
+            continue
+        hex6 = s.upper()
+        for dst in _COLOR_ALIASES.get(key, (key,)):
+            if dst not in out:
+                continue
+            if key == "accent" and dst in _DERIVED_FROM_ACCENT and dst != key:
+                # head/accent2 是从 accent 派生的（warm 里 head 更暗、docx 里 accent2 更亮），
+                # 按预设的通道比例映射；预设里两者相等时（如 xlsx 的 head）比例就是 1，等同主色。
+                _put(dst, _chan_scale(hex6, th.get("accent"), th.get(dst)))
+            else:
+                _put(dst, hex6)
+
+    # 主色被指定了，但没单独给配套浅色 → 按预设比例重算，避免配色割裂
+    if "accent" in (colors or {}):
+        acc = str(out.get("accent") or th.get("accent") or "2E75B6").lstrip("#")
+        for dst, ratio in _TINT_OF_ACCENT.items():
+            if dst in out and dst not in (colors or {}):
+                _put(dst, _tint(acc, ratio))
+
+    out["_warn"] = (list(th.get("_warn") or []) + warns) if warns else th.get("_warn")
+    return out
+
 FONTS = {"yahei": "微软雅黑", "song": "等线", "kai": "楷体", "mono": "等线"}
 DEFAULT_FONT = "yahei"
 
@@ -305,6 +417,39 @@ def _est_block_h(bs, size, w_in):
     return total
 
 
+# 行内标记：`**粗**` / `==高亮==` / `` `等宽` ``。
+# ⚠️ 2026-09-26 加：**模型天然会写 **加粗**** —— 我们自己在 docx 的说明里就这么教它
+#    （"正文，可用 **加粗**、==高亮== 标重点"），而 pptx 以前完全不解析，
+#    于是幻灯片上直接出现字面的 `**核心任务**`（用户实拍到的现象："文字排版全都没有"）。
+#    docx_maker 早就有 _INLINE 做这件事，pptx 这边漏了 —— 现在两边用同一套写法。
+_INLINE_RE = re.compile(r"(\*\*.+?\*\*|==.+?==|`[^`]+`)")
+
+
+def _add_inline(p, text, size, color, font=None, bold=False, italic=False,
+                hl=None):
+    """把带行内标记的文字铺成多个 run（其余按原样）。
+
+    hl 给了颜色时，`==高亮==` 之外的普通文字**不**加底色；只有 `==…==`
+    那几段会加 —— 这样"只标重点"才名副其实。
+    """
+    for seg in _INLINE_RE.split(str(text or "")):
+        if not seg:
+            continue
+        _b, _mark = bold, None
+        if seg.startswith("**") and seg.endswith("**") and len(seg) > 4:
+            seg, _b = seg[2:-2], True
+        elif seg.startswith("==") and seg.endswith("==") and len(seg) > 4:
+            seg, _mark = seg[2:-2], (hl or HL_DEFAULT)
+        elif seg.startswith("`") and seg.endswith("`") and len(seg) > 2:
+            seg = seg[1:-1]
+        r = p.add_run()
+        r.text = seg
+        _set_font(r, size, color, bold=_b, font=font, italic=italic)
+        if _mark:
+            _set_hl(r, _hex6(_mark, HL_DEFAULT))
+    return p
+
+
 def _put_bullets(slide, bs, x, y, w, h, th, st, base_size=None, font=None,
                  centered=False, valign="auto"):
     """把要点列表铺进一个文本框。
@@ -347,14 +492,11 @@ def _put_bullets(slide, bs, x, y, w, h, th, st, base_size=None, font=None,
             r0 = p.add_run()
             r0.text = mark
             _set_font(r0, sz, th["accent"] if not lvl else (st.get("muted") or th["muted"]), font=font)
-        r = p.add_run()
-        r.text = b["text"]          # 不截断：装不下靠下面的自适应字号解决
-        _set_font(r, sz, col, bold=bool(b.get("bold")), font=font,
-                  italic=bool(b.get("italic")))
         hl = b.get("hl") if b.get("hl") is not None else b.get("highlight")
-        if hl:
-            # hl: true 用默认浅黄；想指定颜色就写六位十六进制（如 "FFD9D9"）
-            _set_hl(r, _hex6(hl, HL_DEFAULT))
+        # 走行内解析：**加粗** / ==高亮== / `等宽` 都要真的生效，不能把星号原样印出来
+        _add_inline(p, b["text"], sz, col, font=font,
+                    bold=bool(b.get("bold")), italic=bool(b.get("italic")),
+                    hl=_hex6(hl, HL_DEFAULT) if hl else None)
     return tf
 
 
@@ -803,9 +945,9 @@ def _add_table(prs, th, st, sl, page_no):
             tf.word_wrap = True
             p = tf.paragraphs[0]
             p.alignment = PP_ALIGN.CENTER
-            r = p.add_run()
-            r.text = (header[ci] if ci < len(header) else "")
-            _set_font(r, size, "FFFFFF", bold=True, font=st.get("font"))
+            # 表头也可能被模型写上行内标记（**加粗** 之类），统一解析，别把标记印出来
+            _add_inline(p, header[ci] if ci < len(header) else "", size,
+                        "FFFFFF", font=st.get("font"), bold=True)
         ri = 1
     for k, row in enumerate(rows):
         for ci in range(ncol):
@@ -818,9 +960,8 @@ def _add_table(prs, th, st, sl, page_no):
             tf = c.text_frame
             tf.word_wrap = True
             p = tf.paragraphs[0]
-            r = p.add_run()
-            r.text = (row[ci] if ci < len(row) else "")
-            _set_font(r, size, th["body"], font=st.get("font"))
+            _add_inline(p, row[ci] if ci < len(row) else "", size, th["body"],
+                        font=st.get("font"))
         tb.rows[ri + k].height = row_h
     if sl.get("notes"):
         s.notes_slide.notes_text_frame.text = str(sl["notes"])[:2000]
@@ -971,15 +1112,13 @@ def _add_cards(prs, th, st, sl, page_no):
         _set_font(rn, 26, _tint(acc, 0.45), bold=True, font=st.get("font"))
         pt = tf.add_paragraph()
         pt.space_before = Pt(6)
-        rt = pt.add_run()
-        rt.text = str(c.get("title") or "")
-        _set_font(rt, 17, th["body"], bold=True, font=st.get("font"))
+        _add_inline(pt, str(c.get("title") or ""), 17, th["body"],
+                    font=st.get("font"), bold=True)
         pb = tf.add_paragraph()
         pb.space_before = Pt(8)
         pb.line_spacing = 1.3
-        rb = pb.add_run()
-        rb.text = str(c.get("text") or "")
-        _set_font(rb, 13, st.get("muted") or th["muted"], font=st.get("font"))
+        _add_inline(pb, str(c.get("text") or ""), 13,
+                    st.get("muted") or th["muted"], font=st.get("font"))
     if sl.get("notes"):
         s.notes_slide.notes_text_frame.text = str(sl["notes"])[:2000]
     return s
@@ -1017,9 +1156,8 @@ def _add_stats(prs, th, st, sl, page_no):
         pl = tfl.paragraphs[0]
         pl.alignment = PP_ALIGN.CENTER
         pl.line_spacing = 1.25
-        rl = pl.add_run()
-        rl.text = str(it.get("label") or "")
-        _set_font(rl, 14, st.get("muted") or th["muted"], font=st.get("font"))
+        _add_inline(pl, str(it.get("label") or ""), 14,
+                    st.get("muted") or th["muted"], font=st.get("font"))
     if sl.get("notes"):
         s.notes_slide.notes_text_frame.text = str(sl["notes"])[:2000]
     return s
@@ -1058,16 +1196,14 @@ def _add_steps(prs, th, st, sl, page_no):
                        card_h - Inches(0.7), anchor=MSO_ANCHOR.MIDDLE)
         pt = tfb.paragraphs[0]
         pt.alignment = PP_ALIGN.CENTER
-        rt = pt.add_run()
-        rt.text = str(it.get("title") or "")
-        _set_font(rt, 16, th["body"], bold=True, font=st.get("font"))
+        _add_inline(pt, str(it.get("title") or ""), 16, th["body"],
+                    font=st.get("font"), bold=True)
         pb = tfb.add_paragraph()
         pb.alignment = PP_ALIGN.CENTER
         pb.space_before = Pt(9)
         pb.line_spacing = 1.3
-        rb = pb.add_run()
-        rb.text = str(it.get("text") or "")
-        _set_font(rb, 12.5, st.get("muted") or th["muted"], font=st.get("font"))
+        _add_inline(pb, str(it.get("text") or ""), 12.5,
+                    st.get("muted") or th["muted"], font=st.get("font"))
         if i < n - 1:
             _rect(s, cx + cw + Inches(0.03), top + card_h / 2 - Inches(0.1),
                   Inches(0.19), Inches(0.19), fill=_tint(acc, 0.4),
@@ -1100,18 +1236,16 @@ def _add_timeline(prs, th, st, sl, page_no):
                        Inches(0.45))
         pd = tfd.paragraphs[0]
         pd.alignment = PP_ALIGN.CENTER
-        rd = pd.add_run()
-        rd.text = str(it.get("title") or it.get("time")
-                      or it.get("label") or "")
-        _set_font(rd, 14, acc, bold=True, font=st.get("font"))
+        _add_inline(pd, str(it.get("title") or it.get("time")
+                            or it.get("label") or ""), 14, acc,
+                    font=st.get("font"), bold=True)
         tfb = _textbox(s, cx - Inches(1.0), axis_y + Inches(0.32), Inches(2.0),
                        Inches(1.8))
         pb = tfb.paragraphs[0]
         pb.alignment = PP_ALIGN.CENTER
         pb.line_spacing = 1.3
-        rb = pb.add_run()
-        rb.text = str(it.get("text") or "")
-        _set_font(rb, 12, st.get("muted") or th["muted"], font=st.get("font"))
+        _add_inline(pb, str(it.get("text") or ""), 12,
+                    st.get("muted") or th["muted"], font=st.get("font"))
     if sl.get("notes"):
         s.notes_slide.notes_text_frame.text = str(sl["notes"])[:2000]
     return s
@@ -1149,10 +1283,9 @@ def _add_quote(prs, th, st, sl, page_no):
     p = tf.paragraphs[0]
     p.alignment = PP_ALIGN.CENTER
     p.line_spacing = 1.35
-    r = p.add_run()
-    r.text = text
-    _set_font(r, 30 if len(text) <= 40 else 24, th["cover_fg"], bold=True,
-              font=st.get("font"))
+    # 引用句也过一遍行内解析（整句本来就是粗体，这里再解析是为了不让 ** 露出来）
+    _add_inline(p, text, 30 if len(text) <= 40 else 24, th["cover_fg"],
+                font=st.get("font"), bold=True)
     if src:
         p2 = tf.add_paragraph()
         p2.alignment = PP_ALIGN.CENTER
@@ -1373,7 +1506,8 @@ def _add_logo(slide, path, pos="tr", height_in=0.5, margin_in=0.42):
 def build_pptx(path, title, slides, subtitle="", author="", theme=DEFAULT_THEME,
                end_text="", font=DEFAULT_FONT, page_number=True,
                cover=True, end_page=True, img_bases=None,
-               logo="", cover_image="", logo_pos="tr", logo_size=0.5):
+               logo="", cover_image="", logo_pos="tr", logo_size=0.5,
+               colors=None):
     """把结构化内容生成 pptx，返回 {'ok','path','slides','warnings','error'}。
 
     slides 每项：见模块 docstring。`layout` 决定版式，`decor` 加装饰，
@@ -1382,7 +1516,10 @@ def build_pptx(path, title, slides, subtitle="", author="", theme=DEFAULT_THEME,
     """
     warnings = []
     try:
-        th = dict(THEMES.get(str(theme or "").strip().lower(), THEMES[DEFAULT_THEME]))
+        # 先取预设，再用自定义配色覆盖（支持「红金色系」这类要求，见 apply_colors）
+        th = apply_colors(
+            THEMES.get(str(theme or "").strip().lower(), THEMES[DEFAULT_THEME]),
+            colors)
         fname = FONTS.get(str(font or "").strip().lower(), FONTS[DEFAULT_FONT])
         prs = Presentation()
         prs.slide_width, prs.slide_height = SLIDE_W, SLIDE_H

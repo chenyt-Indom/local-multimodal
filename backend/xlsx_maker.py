@@ -86,10 +86,14 @@ def _safe_name(s, fallback):
     return s
 
 
-def build_xlsx(path, sheets, theme=DEFAULT_THEME, author="本地多模态助手"):
+def build_xlsx(path, sheets, theme=DEFAULT_THEME, author="本地多模态助手",
+               colors=None):
     """按 sheets 规格生成 xlsx。返回 {"ok","sheets","rows","warnings"}。"""
     warnings = []
-    th = THEMES.get(str(theme or "").strip().lower(), THEMES[DEFAULT_THEME])
+    # 支持自定义配色（见 pptx_maker.apply_colors 的说明）
+    from backend.pptx_maker import apply_colors
+    th = apply_colors(
+        THEMES.get(str(theme or "").strip().lower(), THEMES[DEFAULT_THEME]), colors)
     if not isinstance(sheets, list) or not sheets:
         return {"ok": False, "error": "至少要有一个工作表（sheets）"}
 

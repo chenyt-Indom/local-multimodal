@@ -303,17 +303,20 @@ def _is_simple_question(text: str) -> bool:
     return not any(k in t for k in _COMPLEX_HINTS)
 
 
-# 简单问题的生成长度上限（思考+回答总量）。
+# 简单问题的**起手配额**（思考+回答总量）——⚠️ 2026-09-26 起它不再是"篇幅上限"：
+# 用户明确要求「取消所有篇幅限制」，各档位一律提到与天花板同级，
+# 真正能用多少只由「num_ctx − 提示词占用」决定（重试逻辑会按实测剩余窗口夹住）。
+# 打这么高不会拖慢短回答：模型自己 EOS 就停了，这个值只是"允许它写多长"。
 # ⚠️ 原来是 512，实测**明显不够**：「Python 的列表和元组有什么区别」这种
 # 19 字的问题会被 `_is_simple_question` 判成"简单"，512 token 写一半就断，
 # 用户看到的是"配额不足/回答被截断"。这类问题只是**问句短**，不代表答案短。
 # 1536 仍会偶尔截断，再提到 3072 —— 用户明确要求"尽量不要限制"。
 # 问候语这类真正的一问一答根本用不到 3072，自然停下，不会变慢。
-SIMPLE_MAX_TOKENS = 3072
+SIMPLE_MAX_TOKENS = 8192
 
 # 联网场景的生成长度下限：要把搜索结果喂给模型 + 让它逐条列出来源链接，
 # token 消耗远高于普通问答。给少了就会出现"搜索完了但没输出回答"。
-WEB_MAX_TOKENS = 8192
+WEB_MAX_TOKENS = 16384
 # 长文创作（作文/方案/报告）的输出上限。
 # 这类任务要真写出几百上千字，还要留足"思考"的额度 —— 4096 实测经常写不完，
 # 而且这一轮已经把用不到的工具 schema 砍掉了，腾出的空间正好给它。
@@ -323,7 +326,7 @@ WRITING_MAX_TOKENS = 16384
 # 实测踩过：用默认额度（2048）让模型写一个完整文件时，输出**中途被截断** ——
 # 生成出来的 todo.py 停在 `print(f'{index}. {task[`，一跑就 SyntaxError。
 # 写整份代码文件 + 工具调用 JSON 的开销，比普通问答大得多，必须单独给足。
-CODE_MAX_TOKENS = 8192
+CODE_MAX_TOKENS = 16384
 
 # 输出长度天花板：空回答重试时加倍，但不能无限涨
 # （上下文窗口还要留给提示词与历史，超出只会让 Ollama 截断提示词）
@@ -1485,6 +1488,9 @@ def _ask_rules(cfg: dict) -> str:
         "      · 理由：画一次要几十秒，风格选错就得重画 —— 问一句比返工便宜得多；\n"
         "      · 用户**已经**说了风格/用途（「画一只写实狐狸，做儿童绘本封面，竖版」）"
         "→ 一个字都别问，直接画；\n"
+        "      · 问到/说到画幅就**传给 generate_image 的 aspect**"
+        "（「竖版/海报/壁纸」→ 9:16 或 2:3，「横版/宽屏/Banner/PPT 配图」→ 16:9 或 3:2，"
+        "方形 → 1:1）；要写实、要细节、要印出来就把 size 提到 768，必要时 hd=true。\n"
         "      · **只问一轮**：答复到手就必须动手画，不许问完又停在原地等用户再说话。\n"
         "- ⚠️ **问题个数不限，也可以分多轮问**（用户明确要求）——守住这三条：\n"
         "    · **绝不重复**：已经问过、用户已经答过的，一个字都别再问；\n"
@@ -1987,11 +1993,16 @@ _TEXT_TOOL_DOCS = {
                    '参数 {"repo": "git@github.com:user/repo.git", "message": "提交说明"}',
     "search_knowledge": '在用户的知识库里检索资料。参数 {"query": "检索词"}',
     "generate_image": '生成一张图片并展示（可以直接当网页 / 应用的素材）。'
-                      '参数 {"prompt": "画面描述", "size": 512}',
+                      '参数 {"prompt": "画面描述", "size": 512, '
+                      '"aspect": "1:1 / 4:3 / 3:4 / 16:9 / 9:16 / 3:2 / 2:3", "hd": false}'
+                      ' —— 用户说"竖版/海报/手机壁纸"用 9:16 或 2:3，'
+                      '说"横版/宽屏/PPT 配图/Banner"用 16:9 或 3:2；'
+                      '要写实/要印出来把 size 提到 768、必要时 hd=true。',
     "make_pptx": '生成一份真正的 PPT（.pptx），存进生成文库并给出可点下载链接。'
                  '**你只管想内容，排版由工具做，不用写代码。**'
                  '参数 {"title": "封面主标题", "subtitle": "副标题（可选）", '
                  '"author": "落款（可选）", "theme": "blue/green/warm/purple/mono/red", '
+                 '"colors": {"accent": "#B8860B", "cover_bg": "#8B0000"}, '
                  '"cover_image": "封面整页背景图（本地路径；用户给了图并说放封面就用它）", '
                  '"slides": [{"title": "页标题", '
                  '"bullets": ["要点1", "- 二级要点", {"text": "重点", "hl": true}], '
@@ -2052,6 +2063,7 @@ _TEXT_TOOL_DOCS = {
                  '用户说「做个表格 / Excel / 统计表 / 对照表 / 报表 / 台账 / 预算表」'
                  '或给了一堆数据要整理时用它。**你只填数据，不用写代码。**'
                  '参数 {"filename": "文件名（可省）", "theme": "blue/green/warm/purple/mono/red", '
+                 '"colors": {"accent": "#B8860B"}, '
                  '"sheets": [{"name": "工作表名", "title": "表内大标题（可省）", '
                  '"header": ["列1","列2"], "rows": [["A", 120.5], ["B", 300]], '
                  '"formats": ["text","money"], "widths": [14,12], "total_row": true, '
@@ -2065,6 +2077,7 @@ _TEXT_TOOL_DOCS = {
                  '不要用 library 写 .md 再让用户自己转。**'
                  '参数 {"title": "标题", "cover": true, "toc": true, '
                  '"theme": "blue/green/warm/purple/mono/red", '
+                 '"colors": {"accent": "#B8860B"}, '
                  '"blocks": [{"type": "heading", "level": 1, "text": "一、背景"}, '
                  '{"type": "para", "text": "正文，可用 **加粗**、==高亮== 标重点"}, '
                  '{"type": "bullet", "items": ["要点", "- 二级要点"]}, '
@@ -3475,6 +3488,20 @@ async def chat(req: ChatRequest):
         "→ 用 **edit_office**（先 action=inspect 看结构，再 action=edit 改）；\n"
         "    · 要**纯文本 / 代码 / 数据文件**（.md .txt .py .json .csv）→ 才用 library。\n"
         "   生成完只把**下载链接**给用户，**别描述界面按钮或操作步骤**（界面上没有那些）。\n"
+        "- **配色与风格要按用户说的来**（2026-09-26 用户明确要求支持自定义）："
+        "用户提到具体颜色（「红金色系」「企业蓝」「莫兰迪色」「我们 VI 是 #0B5FA5」）时，"
+        "**必须**给 make_pptx / make_docx / make_xlsx 传 **colors**"
+        '（如 {"accent": "#B8860B", "cover_bg": "#8B0000"} 就是红金），'
+        "**光挑个近似的预设不算做到**；只给一部分键也行，其余走 theme。"
+        "可用键：accent（主色）/ cover_bg、cover_fg（封面底与字）/ bg / body / muted / card。\n"
+        "- ⚠️⚠️ **内容要充实，这是最容易做砸的地方**（2026-09-26 用户明确要求，"
+        "实测 8B 模型很容易只给三四条短句就交差）：\n"
+        "    · **PPT**：常规主题 **8~15 页**；**每页 3~6 条要点、每条 15~40 字的完整句子**"
+        "（写清做什么、为什么、做到什么程度，带上数字 / 时间 / 责任人），"
+        "**绝不出现只有标题、下面一两个词的空壳页**；该上表格/图表/指标卡的地方就上；\n"
+        "    · **Word**：**8~20 个内容块**，每个段落 **3~6 句、150~400 字**，别只写两三段；\n"
+        "    · **Excel**：明细表通常 **8~30 行**（用户给多少写多少，没给就按主题把该有的行补全）。\n"
+        "    素材来自知识库/前文/附件时**照着写实**，别自己编数字。\n"
         "- **配图**（用户说「配点图」「图文并茂」「找张图放上去」「加个 logo」时）：\n"
         "    · 给那一页/那一块写 **image_query**（中文搜索词，如「校园 图书交换 活动」）\n"
         "      → 系统会**自动联网搜一张合适的图插进去**，你不用自己找链接、也不要说做不到；\n"
@@ -4094,11 +4121,20 @@ async def chat(req: ChatRequest):
                         try:
                             _before = _est_tokens(
                                 json.dumps(tool_schemas, ensure_ascii=False))
+                            # ⚠️⚠️ 办公任务（要做 PPT/Word/Excel）**不能**切成
+                            #   "写作精简集"——那个集合里没有 make_pptx/dcox/xlsx，
+                            #   于是首次尝试把额度烧在思考上之后，重试这一轮
+                            #   **根本没法生成文件**，用户最后只拿到一段文字
+                            #   （2026-09-26 端到端实测：工具=[]、零个产物）。
+                            #   office_mode 时改用 office_gen：只留三个生成工具，
+                            #   照样省下两千多 token，但守住"能做出文件"。
                             tool_schemas = tools.make_schemas(
                                 cfg.get("web_enabled", False),
                                 cfg.get("rag_enabled", False),
                                 code_exec=False,
-                                writing=True,    # 精简集，见 tools.make_schemas
+                                writing=not office_mode,
+                                office=office_mode,
+                                office_gen=office_mode,
                                 ask_mode=str(cfg.get("ask_mode") or "quick"))
                             freed = max(0, _before - _est_tokens(
                                 json.dumps(tool_schemas, ensure_ascii=False)))
@@ -4122,8 +4158,20 @@ async def chat(req: ChatRequest):
                                        - max(0, int(prompt_tokens) - freed) - 512))
                     boosted = max(int(gen_params.get("max_tokens") or 2048) * 2, 4096)
                     nxt = min(boosted, room)
-                    if nxt > int(gen_params.get("max_tokens") or 0):
-                        gen_params["max_tokens"] = nxt
+                    _cur = int(gen_params.get("max_tokens") or 0)
+                    # ⚠️⚠️ 「额度涨不上去」**不等于**「重试没意义」（2026-09-26 修）。
+                    #   办公任务（做 PPT/Word/Excel）一上来就把 max_tokens 设成 16384
+                    #   （见上面的 WRITING_MAX_TOKENS），可它**本来就超窗**：
+                    #   提示词 1.4 万 + 16384 > 24576。于是重试走到这里时 nxt(≈12008)
+                    #   反而**小于**当前额度 → 直接判"放弃重试" → 连第二次机会都没有
+                    #   → 模型首轮把额度全烧在思考上之后，用户只拿到一段思考。
+                    #   而精简工具让提示词**小了两千多 token**，同样额度下实际能用的
+                    #   空间比上一轮宽 —— 这一轮当然值得再试。
+                    #   所以：额度能涨、**或者**这轮腾出了窗口（freed>0），都要重试。
+                    if nxt > _cur or freed > 0:
+                        # 但额度必须夹进本轮**真实窗口**：比窗口还大的额度等于没给，
+                        # 模型照样在窗口边界被截断（这正是办公任务首轮失败的原因）。
+                        gen_params["max_tokens"] = min(max(_cur, nxt), room)
                         # ★ 上一轮的思考必须作废，并通知前端把面板清空。
                         #   重试是从头重新生成，思考会**重新来一遍**；不重置的话
                         #   新一轮的思考就直接接在旧思考后面 —— 界面上看起来就是

@@ -433,8 +433,15 @@ def edit_pptx(path, ops, img_bases=None):
                 if not new:
                     warns.append("不认识的配色 %s" % name)
                     continue
+                # ★ 支持自定义配色（用户说「换成红金色系 / 企业蓝」）——
+                #   与 make_pptx 共用同一套覆盖逻辑（含键名别名 + 配套浅色派生），
+                #   否则只换了主色、卡片与隔行底还是原来的色，看着像没改干净。
+                if op.get("colors"):
+                    from .pptx_maker import apply_colors
+                    new = apply_colors(new, op.get("colors"))
                 n = _recolor(prs, old, new, THEMES)
-                logs.append("配色换成 %s，改了 %d 处颜色" % (name, n))
+                logs.append("配色换成 %s%s，改了 %d 处颜色"
+                            % (name, "（自定义）" if op.get("colors") else "", n))
 
             elif k in ("add_slide", "加一页"):
                 sp = dict(op.get("slide_spec") or {})
@@ -455,6 +462,10 @@ def edit_pptx(path, ops, img_bases=None):
                 tname = str(op.get("theme") or "").lower() or _detect_pptx_theme(
                     prs, THEMES)
                 th_new = THEMES.get(tname, THEMES["blue"])
+                # 新加的这页也可以直接给自定义配色（与 set_theme 同一套逻辑）
+                if op.get("colors"):
+                    from .pptx_maker import apply_colors
+                    th_new = apply_colors(th_new, op.get("colors"))
                 fn(prs, dict(th_new), st, sp, len(prs.slides) + 1)
                 logs.append("加了一页（版式 %s）" % lay)
 

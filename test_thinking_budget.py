@@ -43,6 +43,27 @@ NUM_CTX = int(CFG.get("num_ctx") or 8192)
 SAFETY = 512
 PASS = FAIL = 0
 
+# 精简工具到底能省多少 token —— **不能写死**。
+# 它会随工具 schema 变化：2026-09-26 给三个生成工具补了"丰富度要求"后，
+# saving 从 11706 涨到一万三，而这里原来是硬编码的（A 用 3000 / B 用 10782），
+# 于是 B2 判出"额度超过了剩余窗口" —— **假警报**，应用的估算其实是对的。
+# 这里跟应用**用同一套度量**（同两个 make_schemas 调用 + 同一个 _est_tokens）。
+# ⚠️ 两个调用都要带 ask_mode：ask_user 的**工具描述**会随模式变长，
+#    漏传就差 156 token，于是精算出的"省了多少"和应用的账对不上（实测踩到）。
+from backend import tools as _TM                                # noqa: E402
+
+_ASK = str(CFG.get("ask_mode") or "quick")
+# 测试用的用户消息不触发写作/办公模式，所以 writing/office 都是 False（同应用）
+_FULL_SCHEMAS = _TM.make_schemas(CFG.get("web_enabled", False),
+                                 CFG.get("rag_enabled", False),
+                                 CFG.get("code_exec_enabled", False),
+                                 writing=False, office=False, ask_mode=_ASK)
+_TRIM_SCHEMAS = _TM.make_schemas(CFG.get("web_enabled", False),
+                                 CFG.get("rag_enabled", False), False,
+                                 writing=True, ask_mode=_ASK)
+FREED = max(0, M._est_tokens(json.dumps(_FULL_SCHEMAS, ensure_ascii=False))
+            - M._est_tokens(json.dumps(_TRIM_SCHEMAS, ensure_ascii=False)))
+
 
 def check(name, ok, detail=""):
     global PASS, FAIL
@@ -76,13 +97,16 @@ def make_fake(prompt_tokens_seq):
 
     prompt_tokens_seq：每次调用**Ollama 报的提示词 token 数**（按序取，用完取最后一个）。
     """
-    state = {"n": 0, "tools": [], "max_tokens": []}
+    state = {"n": 0, "tools": [], "max_tokens": [], "tool_names": []}
 
     def fake_chat(messages, model=None, stream=True,
                   images_base64=None, params=None, tools=None):
         i = state["n"]
         state["n"] += 1
         state["tools"].append(len(tools or []))
+        # 记下**名字**（不只是个数）——场景 C 要确认 make_pptx 还在不在
+        state["tool_names"].append([(t.get("function") or {}).get("name")
+                                    for t in (tools or []) if isinstance(t, dict)])
         state["max_tokens"].append((params or {}).get("max_tokens"))
         pt = prompt_tokens_seq[min(i, len(prompt_tokens_seq) - 1)]
         return FakeResp([
@@ -94,10 +118,10 @@ def make_fake(prompt_tokens_seq):
     return fake_chat, state
 
 
-async def run_once(prompt_tokens_seq):
+async def run_once(prompt_tokens_seq, user="帮我看看这个问题"):
     fake, state = make_fake(prompt_tokens_seq)
     M.client.chat = fake
-    req = ChatRequest(messages=[{"role": "user", "content": "帮我看看这个问题"}],
+    req = ChatRequest(messages=[{"role": "user", "content": user}],
                       session_id="test-budget-%d" % id(state))
     resp = await M.chat(req)
     events = []
@@ -115,14 +139,14 @@ print("思考吃光配额 → 重试腾窗口 + 兜底交付（num_ctx=%d）" % 
 print("=" * 62)
 
 # ---------------- 场景 A：工具吃掉了窗口，但砍掉就能腾出来 ----------------
-print("\n【场景 A】提示词 14706（工具占大头），重试时可腾空间")
-events, state = asyncio.run(run_once([14706, 3000]))
+print("\n【场景 A】提示词 14706（工具占大头，精简能省 %d），重试时可腾空间" % FREED)
+events, state = asyncio.run(run_once([14706, 14706 - FREED]))
 done = next((e for e in events if e.get("done")), {})
 resets = [i for i, e in enumerate(events)
           if e.get("message", {}).get("thinking_reset")]
 print("   每次调用：tools=%s  max_tokens=%s" % (state["tools"], state["max_tokens"]))
-# 第 2 次调用时 Ollama 实报的提示词 token（精简要在这里生效）
-pt2 = 3000
+# 第 2 次调用时 Ollama 实报的提示词 token（= 原提示词 − 实测省下的）
+pt2 = 14706 - FREED
 room2 = max(1024, NUM_CTX - pt2 - SAFETY)
 check("A1 第一次带全部工具（对照）", state["tools"][0] > 5,
       "tools=%d" % state["tools"][0])
@@ -148,21 +172,42 @@ check("A9 最多重试 2 次（共 3 次调用），不会无限重试",
       state["n"] == 3, "调用次数=%d" % state["n"])
 
 # ---------------- 场景 B：连历史都很大 → 砍完工具仍腾不出多少，别白试 ----------------
-# 第一次：prompt=24000；砍掉工具后（省 10782）→ 13218，所以第一次重试仍然有意义。
-# 第二次：prompt 已是 13218（工具已精简过）→ 无空间可再腾 → **不该再试第三轮**。
+# 第一次：prompt=24000；砍掉工具后（实测省 FREED）→ 24000-FREED，所以第一次重试仍然有意义。
+# 第二次：prompt 已是精简后的值 → 没有空间可再腾 → **额度涨不上去，不该再试第三轮**。
 print("\n【场景 B】提示词 24000（历史+工具都很大），腾完空间后就不再白试")
-events_b, state_b = asyncio.run(run_once([24000, 13218]))
+events_b, state_b = asyncio.run(run_once([24000, 24000 - FREED]))
 done_b = next((e for e in events_b if e.get("done")), {})
 print("   每次调用：tools=%s  max_tokens=%s" % (state_b["tools"], state_b["max_tokens"]))
 check("B1 只重试了有意义的那一次（共 2 次调用，不试第三轮）", state_b["n"] == 2,
       "调用次数=%d" % state_b["n"])
 check("B2 额度没有超过真实剩余窗口",
-      state_b["max_tokens"][-1] <= max(1024, NUM_CTX - 13218 - SAFETY),
+      state_b["max_tokens"][-1] <= max(1024, NUM_CTX - (24000 - FREED) - SAFETY),
       "max_tokens=%s" % state_b["max_tokens"])
 check("B3 仍然把思考交付出来（正文非空）",
       bool((done_b.get("text") or "").strip()),
       "正文 %d 字" % len((done_b.get("text") or "")))
 check("B4 兜底内容有明确标注", "思考过程" in (done_b.get("text") or ""))
+
+# ---------------- 场景 C：办公任务重试时**不能把生成工具砍掉** ----------------
+# ⚠️ 这是实测踩到的坑（2026-09-26）：重试原来统一切成"写作精简集"，
+#    而那个集合里**没有 make_pptx**。于是"首次尝试把额度烧在思考上"之后，
+#    重试这一轮模型根本没法生成文件 —— 用户要 PPT，最后只拿到一段文字。
+#    （端到端实测：工具=[]、一个产物都没有。）
+print("\n【场景 C】办公任务（做 PPT）重试时必须保住生成工具")
+_OFFICE_Q = "帮我做一份建设方案PPT，要求内容充实、专业"
+events_c, state_c = asyncio.run(run_once([14706, 14706 - FREED], user=_OFFICE_Q))
+print("   每次调用工具数：%s" % state_c["tools"])
+print("   第一次的工具：%s" % (state_c["tool_names"][0] if state_c["tool_names"] else []))
+print("   重试后的工具：%s" % (state_c["tool_names"][-1] if state_c["tool_names"] else []))
+check("C0 这句话确实被判定为办公任务", M._is_office_task(_OFFICE_Q), _OFFICE_Q)
+check("C1 第一次就带上了 make_pptx",
+      "make_pptx" in (state_c["tool_names"][0] if state_c["tool_names"] else []))
+check("C2 ★ 重试后**仍然**有 make_pptx（不许砍掉生成工具）",
+      "make_pptx" in (state_c["tool_names"][-1] if state_c["tool_names"] else []),
+      "重试后的工具=%s" % (state_c["tool_names"][-1] if state_c["tool_names"] else []))
+check("C3 重试确实精简了（腾了窗口）",
+      len(state_c["tools"]) > 1 and state_c["tools"][-1] < state_c["tools"][0],
+      "工具数=%s" % state_c["tools"])
 
 print("\n" + "=" * 62)
 print("通过 %d 项，失败 %d 项" % (PASS, FAIL))
