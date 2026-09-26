@@ -61,8 +61,13 @@ print("① 微改：底图分辨率必须先归一化（这是「歪曲原图」
 print("=" * 68)
 check("有 _fit_working_size 归一化函数", callable(getattr(t2i, "_fit_working_size", None)))
 w, h = t2i._fit_working_size(2400, 1600)
-check("2400x1600 → 长边 ≤768 且保持比例", w <= 768 and h <= 768 and abs(w / h - 1.5) < 0.02,
-      "%dx%d" % (w, h))
+# ⚠️ 工作分辨率的**上限随模型代际变**：SD2.1 是 768，SDXL 是 1024
+#    （SDXL 原生就是 1024，按 768 重绘等于喂了张偏小的图 → 糊 + 结构飘）。
+#    所以这里别写死 768，跟着 t2i 的判定走，换底模不用改测试。
+_want_max = 1024 if t2i.is_xl() else t2i.EDIT_MAX_SIDE
+check("2400x1600 → 长边 ≤%d 且保持比例" % _want_max,
+      w <= _want_max and h <= _want_max and abs(w / h - 1.5) < 0.02,
+      "%dx%d（上限 %d）" % (w, h, _want_max))
 check("所有边都是 8 的倍数（VAE 下采样 8 倍，否则会静默裁掉几像素=边缘错位）",
       w % 8 == 0 and h % 8 == 0, "%dx%d" % (w, h))
 w2, h2 = t2i._fit_working_size(300, 200)
