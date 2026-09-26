@@ -419,26 +419,28 @@ def _image_tokens(images_b64: list) -> int:
       `request (26352 tokens) exceeds the available context size (24576 tokens)`
     （2026-09-22 用户截图里的报错就是这个）。
 
-    估法：Qwen3-VL 把图切成 28×28 的 patch、再 2×2 合并，所以
-    `token ≈ ceil(w/28) * ceil(h/28) / 4`。取不到尺寸时按 1024×1024 的常见上限估。
+    ⚠️⚠️ 2026-09-26 **按实测校准**（原来低估 3 倍，是"带图提问就 400"的根因之一）：
+      公式 `ceil(w/28)*ceil(h/28)/4` 给 1024×1024 算出 **342**，
+      而 Ollama **实报 1028** —— 差别在于 Ollama 会把图规整到自己的目标分辨率，
+      所以**同一张图 512×512 与 1024×1024 都是 1028 token**（实测两次一致）。
+      ⇒ 改成"按张数估、每张 1030"，并且**超过 1024 时才按面积放大**
+        （上游 `_shrink_for_model` 已经会把图缩到长边 1024，所以正常情况下就是 1030/张）。
     ⚠️ 宁可**高估**：多留一点空间只是少带两条历史，估少了就是直接报错。
     """
     total = 0
-    _imgs = list(images_b64 or [])
-    for idx, b64 in enumerate(_imgs):
-        w = h = 1024
-        # 前 6 张真的解码量尺寸；再多的按 1024×1024 估（够保守，也不拖慢）
-        # ⚠️ 以前写的是 `(_imgs)[:6]` 却注释"超过 6 张按同样大小累加" ——
-        #    实际**根本没累加**，第 7 张起等于没算，预算就会低估、提示词被顶爆。
-        if idx < 6:
-            try:
-                from PIL import Image as _PILImage  # 懒导入：没装 PIL 也能跑（退化成按 1024 估）
-                raw = base64.b64decode(str(b64).split(",")[-1], validate=False)
-                with _PILImage.open(io.BytesIO(raw)) as im:
-                    w, h = im.size
-            except Exception:
-                pass
-        total += int(math.ceil(w / 28.0) * math.ceil(h / 28.0) / 4) + 8
+    for b64 in (images_b64 or []):
+        # 每张图固定约 1030 token（见上面实测）；只有超过 1024 才按面积放大。
+        per = 1030
+        try:
+            from PIL import Image as _PILImage      # 懒导入：没装 PIL 也能跑
+            raw = base64.b64decode(str(b64).split(",")[-1], validate=False)
+            with _PILImage.open(io.BytesIO(raw)) as im:
+                side = max(im.size)
+            if side > 1024:                          # 超大的才线性放大
+                per = int(1030 * (side / 1024.0) ** 2)
+        except Exception:
+            pass
+        total += per
     return total
 
 
@@ -1641,6 +1643,16 @@ def _ask_rules(cfg: dict) -> str:
         "      · 问到/说到画幅就**传给 generate_image 的 aspect**"
         "（「竖版/海报/壁纸」→ 9:16 或 2:3，「横版/宽屏/Banner/PPT 配图」→ 16:9 或 3:2，"
         "方形 → 1:1）；要写实、要细节、要印出来就把 size 提到 768，必要时 hd=true。\n"
+        "      · **微改已有图片**（「把背景改成夜晚」「给她戴上眼镜」「把刚才那张换个颜色」）"
+        "→ 用 **edit_image**，不要重画；用户本轮拖进来的图或刚生成/刚改过的那张"
+        "**不用填 source**（系统自动拿最近那张）。改动越大 strength 越高，"
+        "换背景/换日夜必须 0.8~0.9，只改颜色/加小物件用 0.35~0.45。\n"
+        "      · **多张图要合到一起**（「把这几张拼起来 / 拼成一张 / 做个对比图 / 拼个长图」）"
+        "→ 用 **compose_images**：它做**像素级拼接**（横排/竖排/网格），接缝无缝、内容不走样；"
+        "用户还要求「看起来像一张图 / 色调统一」时再给 harmonize 0.25~0.4（会轻微重绘）。\n"
+        "      · ⚠️ 但「**把 A 图里的人/物放进 B 图**」这类**智能融合做不到** —— "
+        "如实告诉用户，别假装做到、更别用高 strength 硬糊（那会把人物重画变形）。"
+        "要改单张就用 edit_image 逐张来。\n"
         "      · **只问一轮**：答复到手就必须动手画，不许问完又停在原地等用户再说话。\n"
         "- ⚠️ **问题个数不限，也可以分多轮问**（用户明确要求）——守住这三条：\n"
         "    · **绝不重复**：已经问过、用户已经答过的，一个字都别再问；\n"
@@ -2151,6 +2163,14 @@ _TEXT_TOOL_DOCS = {
                       ' —— 用户说"竖版/海报/手机壁纸"用 9:16 或 2:3，'
                       '说"横版/宽屏/PPT 配图/Banner"用 16:9 或 3:2；'
                       '要写实/要印出来把 size 提到 768、必要时 hd=true。',
+    "compose_images": '把**多张图片拼接/缝合**成一张（横排 / 竖排 / 网格），可选统一风格。'
+                      '用户说「把这几张拼起来 / 拼成一张 / 做个对比图 / 拼个长图」时用它。'
+                      '参数 {"sources": ["路径…(可省，默认用本轮拖进来的全部图片)"], '
+                      '"layout": "horizontal|vertical|grid", "size": 1024, "gap": 0, '
+                      '"bg": "FFFFFF", "cols": 2, "harmonize": 0}'
+                      ' —— 拼接是**像素级**的（不重绘、接缝无缝）；'
+                      'harmonize>0 才会再跑一次图生图统一色调（0.25~0.4，别更大）。'
+                      '⚠️ 它只做**排版式拼接**，不会把 A 图里的人搬到 B 图里。',
     "make_pptx": '生成一份真正的 PPT（.pptx），存进生成文库并给出可点下载链接。'
                  '**你只管想内容，排版由工具做，不用写代码。**'
                  '参数 {"title": "封面主标题", "subtitle": "副标题（可选）", '
@@ -3498,6 +3518,19 @@ async def chat(req: ChatRequest):
     #    2048 的图一张就要 1300+ token，拖几张就把窗口撑爆（Ollama 回 400）。
     #    原件**不动** —— 落盘、"放进 PPT" 都还要清晰的原图。
     model_images = _shrink_for_model(images)
+    # ⚠️⚠️ 2026-09-26：**带图的轮次要把工具集精简掉**（见下面的实测数据）。
+    #   34~39 个工具 ≈ 15595 token，加系统提示 + 1 张图 = 23244，num_ctx 24576 里
+    #   只剩 1332 给"思考+回答" → 带 3 张图直接 400（实测 5 秒返回报错）。
+    #   精简掉「地图 / 工作区 / 天气 / 上传代码托管」≈ 省 3400 token。
+    #   ⚠️ 但用户这轮**明说了**要地图/工作区时不能裁，否则他会发现"工具不见了"。
+    _lean = False
+    if model_images:
+        _turn_text = str((req.messages[-1].get("content") if req.messages else "") or "")
+        _keep_rich = ("地图", "路线", "导航", "附近", "怎么走", "地图上", "标记",
+                      "工作区", "项目目录", "workspace", "上传到", "推到", "github",
+                      "git", "天气", "气温", "下雨")
+        _lean = not any(k in _turn_text.lower() for k in
+                        [x.lower() for x in _keep_rich])
     # ⚠️ 本轮附件还必须**落盘**：模型能"看到"图，却拿不到图的字节 ——
     # 用户说「把这张图放进 PPT / 插到文档里」时，只有磁盘上的文件才能被
     # python-pptx / python-docx 使用。落盘后把路径写进提示词，模型照抄即可。
@@ -3747,6 +3780,7 @@ async def chat(req: ChatRequest):
                                       cfg.get("code_exec_enabled", False),
                                       writing=writing_mode,
                                       office=office_mode,
+                                      lean=_lean,     # 带图的轮次走精简集（见 _lean 的说明）
                                       # ⚠️ 询问模式要传进去：ask_user 的**工具描述**会据此
                                       # 写清"这一轮该问几条、要不要再多问一轮"。
                                       # 只写在系统提示里不够 —— 模型挑工具时先看 schema。
@@ -4319,6 +4353,9 @@ async def chat(req: ChatRequest):
                                 writing=not office_mode,
                                 office=office_mode,
                                 office_gen=office_mode,
+                                # 带图的轮次重试时**继续用精简集**，
+                                # 否则一刀切回全集，又从"省了窗口"变回"超窗"
+                                lean=_lean,
                                 ask_mode=str(cfg.get("ask_mode") or "quick"))
                             freed = max(0, _before - _est_tokens(
                                 json.dumps(tool_schemas, ensure_ascii=False)))

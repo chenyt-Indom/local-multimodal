@@ -279,6 +279,36 @@ check("第二轮问**新方向**（配图）→ 正常弹框", len(_ui4.calls) =
 check("⚠️ 去重驳回**最多一次**（第二次必须放行，别卡死）",
       "重复" in _out2 and "重复" not in _out4)
 
+# ============================================================
+#  2026-09-26 补：两个实测挖出来的真问题，必须长期防住
+# ============================================================
+print()
+print("=" * 68)
+print("⑨ ★ 画图前必须把对话模型请出显存（否则单张图慢 20 倍）")
+# 实测：12GB 卡上 qwen3-vl:8b 常驻 5.79GB（keep_alive 30 分钟一直在），
+# 而 SDXL 要 11.5GB —— 两者不可能共存。共存时 SDXL 被挤进共享内存：
+#   同一张 1024²/fp16/28 步：**有 Qwen 占着 125~189 秒**，释放后 **6 秒**。
+# 这条断言防的就是"以后有人把 free_ollama_vram 删了/忘了接"。
+_src_t2i = open(os.path.join(ROOT, "backend", "t2i.py"), encoding="utf-8").read()
+check("t2i 里有 free_ollama_vram()", "def free_ollama_vram" in _src_t2i)
+check("文生图加载前会调用它", _src_t2i.count("free_ollama_vram()") >= 3,
+      "共 %d 处（定义 1 + 文生图 1 + 图生图 1）" % _src_t2i.count("free_ollama_vram()"))
+check("它按 keep_alive=0 让 Ollama 卸载", '"keep_alive": 0' in _src_t2i)
+check("卸载失败不会把画图搞挂（有 except 兜底）",
+      _src_t2i.count("pass                      # Ollama 没开 / 模型没装") >= 1)
+
+print()
+print("⑩ ★ 不许再对「微改能精确改元素」做没验证过的承诺")
+# 实测（同一张写实人像，逐档试「换衣服颜色」「加眼镜」）：
+#   0.45 / 0.60 / 0.85 **全都没改出来**；0.85 试「换背景」两次结果一次换成了别的场景、
+#   一次压根没换。所以描述里必须写"做不到精确改动"，而不是拍脑袋列一个"0.35~0.45=换颜色"。
+_src_tools = open(os.path.join(ROOT, "backend", "tools.py"), encoding="utf-8").read()
+check("edit_image 的描述写明「做不到精确改动某个元素」",
+      "做不到" in _src_tools and "精确改动" in _src_tools)
+check("不再承诺「0.35~0.45 = 换颜色 / 加小物件」",
+      "0.35~0.45 = 换颜色" not in _src_tools)
+check("写明了会如实告诉用户、不假装改到了", "别假装改到了" in _src_tools)
+
 shutil.rmtree(TMP, ignore_errors=True)
 print()
 print("=" * 68)

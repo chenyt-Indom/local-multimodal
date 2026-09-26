@@ -172,16 +172,24 @@ check("A9 最多重试 2 次（共 3 次调用），不会无限重试",
       state["n"] == 3, "调用次数=%d" % state["n"])
 
 # ---------------- 场景 B：连历史都很大 → 砍完工具仍腾不出多少，别白试 ----------------
-# 第一次：prompt=24000；砍掉工具后（实测省 FREED）→ 24000-FREED，所以第一次重试仍然有意义。
-# 第二次：prompt 已是精简后的值 → 没有空间可再腾 → **额度涨不上去，不该再试第三轮**。
-print("\n【场景 B】提示词 24000（历史+工具都很大），腾完空间后就不再白试")
-events_b, state_b = asyncio.run(run_once([24000, 24000 - FREED]))
+# ⚠️⚠️ 2026-09-26 改成**按窗口推导**（原来写死 24000，是个"当时刚好成立"的魔数）：
+#   这个场景要成立，必须让"第二次之后的剩余窗口"小到**涨不上去**：
+#       room = NUM_CTX − p2 − SAFETY ≤ 16384（第一次重试后的额度）⇒ p2 ≥ NUM_CTX − 16896
+#   写死 24000 之后：num_ctx 从 24576 提到 28672，p2 = 24000−FREED ≈ 1.1 万
+#   → 剩余窗口变成 16851 > 16384 → 应用**有理由**再试第三轮 → 断言成了假失败
+#   （不是代码错，是测试的假设过时 —— 同类"写死数字"的坑今天已经踩过三次）。
+_P2B = NUM_CTX - 16896 + 1500          # 留 1500 余量，确保"腾完也涨不上去"
+_P1B = _P2B + FREED                    # 第一次比第二次多出的那部分 = 精简工具省下的窗口
+print("\n【场景 B】提示词 %d（历史+工具都很大），腾完空间后就不再白试" % _P1B)
+print("   （按窗口推导：num_ctx=%d，第二次提示词 %d → 剩余 %d ≤ 16384 才该停）"
+      % (NUM_CTX, _P2B, NUM_CTX - _P2B - SAFETY))
+events_b, state_b = asyncio.run(run_once([_P1B, _P2B]))
 done_b = next((e for e in events_b if e.get("done")), {})
 print("   每次调用：tools=%s  max_tokens=%s" % (state_b["tools"], state_b["max_tokens"]))
 check("B1 只重试了有意义的那一次（共 2 次调用，不试第三轮）", state_b["n"] == 2,
-      "调用次数=%d" % state_b["n"])
+      "调用次数=%d（剩余窗口 %d）" % (state_b["n"], NUM_CTX - _P2B - SAFETY))
 check("B2 额度没有超过真实剩余窗口",
-      state_b["max_tokens"][-1] <= max(1024, NUM_CTX - (24000 - FREED) - SAFETY),
+      state_b["max_tokens"][-1] <= max(1024, NUM_CTX - _P2B - SAFETY),
       "max_tokens=%s" % state_b["max_tokens"])
 check("B3 仍然把思考交付出来（正文非空）",
       bool((done_b.get("text") or "").strip()),

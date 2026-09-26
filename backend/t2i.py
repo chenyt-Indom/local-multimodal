@@ -12,6 +12,7 @@ import math
 import os
 import threading
 from . import config
+import urllib.request
 
 MODEL_REPO_DEFAULT = "stabilityai/sd-turbo"
 
@@ -363,8 +364,45 @@ def _log_exc(where: str, exc: Exception) -> None:
         pass
 
 
+def free_ollama_vram() -> list:
+    """画图前让 Ollama 的对话模型**退出显存**，返回被卸载的模型名。
+
+    ⚠️ 2026-09-26 实测（排查"图片怎么这么慢"时挖出来的）：
+      12GB 卡上 qwen3-vl:8b 常驻 **5.79GB**（应用把 keep_alive 设成 30 分钟，它就一直赖着），
+      而 SDXL 要 **11.5GB** —— 两者**不可能共存**。共存时 SDXL 被挤进共享内存，
+      单张图从约 **30 秒变成约 120 秒**（实测 nvidia-smi 只剩 338MB 空闲）。
+      代价只是"画完图后下一条消息要重新加载模型"（几秒），远比每张图多等 90 秒划算。
+    """
+    names = []
+    try:
+        cfg = config.load_config() or {}
+    except Exception:
+        cfg = {}
+    for key in ("default_model", "code_model", "vision_model", "embed_model"):
+        m = str(cfg.get(key) or "").strip()
+        if m and m not in names:
+            names.append(m)
+    if not names:
+        return []
+    base = str(cfg.get("ollama_url") or "http://127.0.0.1:11434").rstrip("/")
+    freed = []
+    for m in names:
+        try:
+            body = json.dumps({"model": m, "keep_alive": 0}).encode("utf-8")
+            req = urllib.request.Request(
+                base + "/api/generate", data=body,
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                r.read()
+            freed.append(m)
+        except Exception:
+            pass                      # Ollama 没开 / 模型没装：忽略，别把画图搞挂
+    return freed
+
+
 def _load_pipe():
     """实际加载流水线（拆出来便于失败后重试）。"""
+    free_ollama_vram()                # ★ 先把对话模型请出显存（见该函数说明）
     import torch
     from diffusers import AutoPipelineForText2Image
 
@@ -627,6 +665,7 @@ def upscale_image(image, target_w: int | None = None, target_h: int | None = Non
 
 
 def _load_edit_pipe():
+    free_ollama_vram()                # ★ 同上：SDXL 与 Qwen 在 12GB 卡上不能共存
     """实际加载 img2img 流水线。"""
     import torch
     from diffusers import AutoPipelineForImage2Image
@@ -759,6 +798,128 @@ def edit_image(init_image, prompt: str, negative_prompt: str = "",
                 "size_note": back_note}
     except Exception as e:
         return {"ok": False, "error": f"图片微改失败: {e}"}
+
+
+# ---------- 多图缝合（纯 PIL，不经过模型） ----------
+COMPOSE_MAX_SIDE = 4096          # 成品长边上限（再大也没人看，还费内存）
+
+
+def _load_pil(x):
+    """把路径 / bytes / data URL / 裸 base64 / PIL.Image 统一成 RGB 的 PIL.Image。"""
+    from PIL import Image
+    if isinstance(x, Image.Image):
+        return x.convert("RGB")
+    if isinstance(x, (bytes, bytearray)):
+        return Image.open(io.BytesIO(bytes(x))).convert("RGB")
+    t = str(x or "").strip()
+    if t.startswith("data:") and "," in t:
+        t = t.split(",", 1)[1]
+    if os.path.isfile(t):
+        return Image.open(t).convert("RGB")
+    return Image.open(io.BytesIO(base64.b64decode(t, validate=False))).convert("RGB")
+
+
+def compose(images, layout="horizontal", size=None, gap=0, bg="FFFFFF",
+            align="center", cols=None) -> dict:
+    """把多张图拼成一张 —— **纯像素拼接、不重绘**，所以接缝是"无缝"的。
+
+    ⚠️ 2026-09-26 新增：用户要「给几张图让它缝合」，而此前只有 edit_image（改单张）。
+
+    layout : horizontal 横排 / vertical 竖排 / grid 网格（默认横排）
+    size   : 每张图统一到的**长边**像素（默认按当前底模的原生档：
+             横排统一高度、竖排统一宽度、网格统一到 size×size 的框内）
+    gap    : 图片之间的间距（像素）；0 = 紧贴，>0 会露出 bg 色的分隔线
+    bg     : 间距/补白的颜色（6 位十六进制，带不带 # 都行）
+    align  : start / center / end —— 尺寸不齐时怎么对齐（默认居中）
+    cols   : grid 时的列数（默认取 √n 向上取整）
+
+    返回 {"ok", "image"(PIL), "size", "cells", "layout", "count"}；
+    失败返回 {"ok": False, "error": ...}。
+    """
+    try:
+        from PIL import Image
+    except Exception as e:                                    # pragma: no cover
+        return {"ok": False, "error": "缺少 Pillow，无法拼接：%s" % e}
+    ims = []
+    for x in (images or []):
+        try:
+            ims.append(_load_pil(x))
+        except Exception as e:
+            return {"ok": False, "error": "有图片读不出来（%s）" % str(e)[:80]}
+    if len(ims) < 2:
+        return {"ok": False, "error": "至少要两张图片才能缝合（当前 %d 张）" % len(ims)}
+
+    n = len(ims)
+    tgt = max(64, int(size or native_side()))
+    lay = str(layout or "horizontal").strip().lower()
+    lay = {"h": "horizontal", "row": "horizontal", "横排": "horizontal", "横向": "horizontal",
+           "v": "vertical", "column": "vertical", "竖排": "vertical", "纵向": "vertical",
+           "网格": "grid", "方格": "grid", "拼贴": "grid"}.get(lay, lay)
+    if lay not in ("horizontal", "vertical", "grid"):
+        lay = "horizontal"
+
+    scaled = []
+    if lay == "horizontal":
+        # 统一**高度**：一排图的腰线齐，最像"拼在一起"
+        for im in ims:
+            w, h = im.size
+            k = tgt / float(h)
+            scaled.append(im.resize((max(1, int(round(w * k))), tgt), Image.LANCZOS))
+        ncol, nrow = n, 1
+        cw, ch = max(i.width for i in scaled), tgt
+    elif lay == "vertical":
+        for im in ims:
+            w, h = im.size
+            k = tgt / float(w)
+            scaled.append(im.resize((tgt, max(1, int(round(h * k)))), Image.LANCZOS))
+        ncol, nrow = 1, n
+        cw, ch = tgt, max(i.height for i in scaled)
+    else:
+        for im in ims:
+            w, h = im.size
+            k = tgt / float(max(w, h))
+            scaled.append(im.resize((max(1, int(round(w * k))), max(1, int(round(h * k)))),
+                                    Image.LANCZOS))
+        if cols is None:
+            cols = int(math.ceil(math.sqrt(n)))
+        cols = max(1, min(int(cols), n))
+        ncol = cols
+        nrow = int(math.ceil(n / float(cols)))
+        cw, ch = max(i.width for i in scaled), max(i.height for i in scaled)
+
+    gap = max(0, int(gap or 0))
+    W = ncol * cw + gap * (ncol - 1)
+    H = nrow * ch + gap * (nrow - 1)
+    # 成品过大就整体缩回去（保持比例）
+    if max(W, H) > COMPOSE_MAX_SIDE:
+        k = COMPOSE_MAX_SIDE / float(max(W, H))
+        W, H = max(1, int(W * k)), max(1, int(H * k))
+    # ⚠️ PIL 的 Image.new **不认裸的 "ffffff"**（要么 "#ffffff"、要么 (r,g,b) 元组），
+    #    传裸色值会抛 `unknown color specifier` —— 实测踩到，这里统一转成元组。
+    color = str(bg or "FFFFFF").strip().lstrip("#").strip() or "FFFFFF"
+    try:
+        color_rgb = tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+    except Exception:
+        color_rgb = (255, 255, 255)
+    canvas = Image.new("RGB", (W, H), color_rgb)
+    cells = []
+    for i, im in enumerate(scaled):
+        r, c = divmod(i, ncol)
+        x0 = c * (cw + gap)
+        y0 = r * (ch + gap)
+        if align == "start":
+            dx, dy = 0, 0
+        elif align == "end":
+            dx, dy = cw - im.width, ch - im.height
+        else:
+            dx, dy = (cw - im.width) // 2, (ch - im.height) // 2
+        canvas.paste(im, (x0 + dx, y0 + dy))
+        cells.append((x0 + dx, y0 + dy, im.width, im.height))
+    if (W, H) != canvas.size:                      # 缩放后按比例折算坐标
+        fx, fy = canvas.size[0] / float(W), canvas.size[1] / float(H)
+        cells = [(int(x * fx), int(y * fy), int(w * fx), int(h * fy)) for x, y, w, h in cells]
+    return {"ok": True, "image": canvas, "size": canvas.size, "cells": cells,
+            "layout": lay, "count": n, "gap": gap, "cell": (cw, ch)}
 
 
 def unload():

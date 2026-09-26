@@ -96,9 +96,16 @@ t512 = M._image_tokens([png_b64(512, 512)])
 t1024 = M._image_tokens([png_b64(1024, 1024)])
 t2048 = M._image_tokens([png_b64(2048, 2048)])
 check("512 图有非零估算", t512 > 0, t512)
-check("越大的图 token 越多（512 < 1024 < 2048）", t512 < t1024 < t2048,
+# ⚠️⚠️ 2026-09-26 按**实测**改正这条断言。
+#   原来写的是"越大的图 token 越多（512 < 1024 < 2048）"——那是照公式推的，
+#   而 Ollama 实报的是：512×512 与 1024×1024 **都是 1028 token**
+#   （它会先把图规整到自己的目标分辨率，所以**这一档之内大小不影响**）。
+#   所以正确的判据是"1024 以内按张计费、超过才放大"。
+check("1024 以内按张计费（512 与 1024 同价，实测如此）",
+      t512 == t1024, "%d / %d" % (t512, t1024))
+check("超过 1024 才按面积放大（2048 > 1024）", t2048 > t1024,
       "%d / %d / %d" % (t512, t1024, t2048))
-check("2048 图估算 ≥1000（按 28×28 patch 折算）", t2048 >= 1000, t2048)
+check("单张 1024 图估算 ≈1030（Ollama 实报 1028）", 1000 <= t1024 <= 1060, t1024)
 check("空图片列表 = 0", M._image_tokens([]) == 0 and M._image_tokens(None) == 0)
 check("取不到尺寸时也有兜底估算（不乱码就返回正数）",
       M._image_tokens(["not-a-real-image"]) > 0)
@@ -256,6 +263,57 @@ check("常量 ROUND_MSG_MAX_TOKENS 存在且合理",
       getattr(M, "ROUND_MSG_MAX_TOKENS", None))
 check("循环里每轮真的调了它（不是写了没用）",
       "_shrink_round_prompt(working" in SRC_MAIN)
+
+print()
+print("=" * 68)
+print("⑫ ★ 带图提问曾经必崩（工具 schema 把窗口吃光了）—— 三条修复都要在")
+# ⚠️⚠️ 实测复盘（2026-09-26）：用户在对话里**拖 3 张图**提问 → Ollama 直接 400
+#   `request (25383 tokens) exceeds the available context size (24576)`。
+#   用 Ollama 实报的 token 数一算就清楚了：
+#      39 个工具的 schema = 15595 token，系统提示 ≈6600，3 张图 = 3090(=3×1030)
+#      ⇒ 光这些就 25000+，留给"思考+回答"的**是负数**。
+#   三条修法缺一不可，这里逐条钉住：
+#     ① 图片 token 按实测校准（原来公式算 342/张，**实际 1028** —— 低估 3 倍）；
+#     ② 带图的轮次自动精简工具集（砍地图/工作区/天气/上传代码托管 ≈省 3900）；
+#     ③ 上下文窗口 24576 → **28672**（实测仍 100% 驻显存、速度不变，白送 4096）。
+_img_b64 = [png_b64(1024, 1024)]
+_per = M._image_tokens(_img_b64)
+check("★ 图片 token 按实测估（1028/张，不再低估 3 倍）",
+      1000 <= _per <= 1060, "估成 %d token/张" % _per)
+check("多张图按张数线性累加", M._image_tokens(_img_b64 * 3) == _per * 3,
+      "3 张 → %d" % M._image_tokens(_img_b64 * 3))
+check("ctx 默认 ≥ 28672（24576 时带 3 张图必超）",
+      int(CFG.get("num_ctx") or 0) >= 28672, "num_ctx=%s" % CFG.get("num_ctx"))
+
+_full = T.make_schemas(True, True, True, ask_mode="deep")
+_lean = T.make_schemas(True, True, True, ask_mode="deep", lean=True)
+_t_full = M._est_tokens(json.dumps(_full, ensure_ascii=False))
+_t_lean = M._est_tokens(json.dumps(_lean, ensure_ascii=False))
+check("带图精简集比完整集小（省得出来）", _t_lean < _t_full - 3000,
+      "%d → %d（省 %d）" % (_t_full, _t_lean, _t_full - _t_lean))
+_ln = [x["function"]["name"] for x in _lean]
+check("精简集**保住**图片与文档生成工具",
+      all(x in _ln for x in ("generate_image", "edit_image", "compose_images",
+                             "web_image_search", "make_pptx", "make_docx",
+                             "make_xlsx", "edit_office")))
+check("精简集砍掉本轮用不到的地图/工作区/天气/上传",
+      not any(x in _ln for x in ("map_plan", "nearby_places", "connect_amap",
+                                 "get_weather", "github_push"))
+      and not any(x.startswith("workspace_") for x in _ln))
+# 带 3 张图的实际占用要能装进窗口、并给输出留出空间
+_sys_real = 6600                         # 系统提示的实测占用（Ollama 实报 ≈6600）
+_tot3 = _t_lean + _sys_real + M._image_tokens(_img_b64 * 3)
+check("★ 3 张图 + 精简集 + 系统提示 装得进 num_ctx，且留有输出余量",
+      _tot3 < int(CFG.get("num_ctx") or 0) - 2000,
+      "约 %d / %d（余 %d）" % (_tot3, CFG.get("num_ctx"),
+                              int(CFG.get("num_ctx")) - _tot3))
+
+# 消息里明说要地图时不能裁（否则用户发现"工具不见了"）
+_src_main2 = SRC_MAIN
+check("带图轮的精简带了关键词豁免（用户说要地图/工作区就不裁）",
+      "_keep_rich" in _src_main2 and "地图" in _src_main2 and "workspace" in _src_main2)
+check("重试时也沿用精简集（别一刀切回全集）",
+      "lean=_lean" in _src_main2, "出现 %d 次" % _src_main2.count("lean=_lean"))
 
 print()
 print("=" * 68)

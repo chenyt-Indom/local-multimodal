@@ -12,6 +12,7 @@
 完全本地运行。
 """
 from __future__ import annotations
+import io
 import os
 import re
 import sys
@@ -713,7 +714,7 @@ _WS_PROJECT_SCHEMAS = [
 def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
                  code_exec: bool = False, writing: bool = False,
                  ask_mode: str = "quick", office: bool = False,
-                 office_gen: bool = False) -> list:
+                 office_gen: bool = False, lean: bool = False) -> list:
     """返回工具 schema 列表。
 
     web_enabled=True 时才暴露联网搜索工具——保证"开关不开不联网"的约定：
@@ -886,18 +887,86 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
                         "strength": {
                             "type": "number",
                             "description": "修改幅度 0~1，**默认 0.5**。"
-                                           "⚠️ 实测规律（同一张底图让它「把背景改成夜晚」）："
-                                           "**0.35~0.65 主体几乎不动，但场景级的改动（换背景/换日夜/"
-                                           "换天气）基本不会生效**；要到 0.8~0.9 才真能改出来，"
-                                           "代价是主体会被明显重画。按用户要的改动量选档：\n"
-                                           "    · 0.35~0.45 = 换颜色 / 加小物件 / 微调光影（最保原图）\n"
-                                           "    · 0.5（默认） = 一般细节改动\n"
-                                           "    · 0.6~0.7  = 换服装 / 换小场景\n"
-                                           "    · 0.8~0.9  = **换背景 / 换日夜 / 换天气这类大改**"
-                                           "（用户明确说「把背景改成…」「换成夜晚」时必须用这一档，"
-                                           "否则用户会觉得「根本没改」）"},
+                                           "⚠️⚠️ **实测结论（2026-09-26，同一张写实人像逐档试过）**："
+                                           "当前底模（SDXL base，纯图生图、没有蒙版）**做不到"
+                                           "「精确改动某个元素」** ——\n"
+                                           "    · 0.45 / 0.60 / 0.85 三个档位试「换衣服颜色」「加眼镜」，"
+                                           "**全都没改出来**（人物倒是基本保住了）；\n"
+                                           "    · 0.85 试「换背景」，两次结果**一次换成了别的场景、"
+                                           "一次压根没换**（只把脸重画了）——改哪里、改成什么**不受控**。\n"
+                                           "    所以**别再用 strength 去承诺「一定改出某个效果」**。"
+                                           "正确用法是按用户的**意图类型**选，并把预期说清：\n"
+                                           "      · 0.4~0.55 = 「保持这张图，只做整体微调」"
+                                           "（提清晰度、轻微改氛围）—— 适合「别动主体」的诉求；\n"
+                                           "      · 0.6~0.8  = 「按新描述重绘，但大致留住构图/风格」"
+                                           "—— 结果会有变化，**不是精确的局部修改**；\n"
+                                           "      · 0.85~0.95= 「基本重画一版」—— 只在该诉求本身就是"
+                                           "「换个风格/氛围」时用。\n"
+                                           "    ⚠️ 用户要「**只把人/物的某个地方改掉、别的都不许动**」时："
+                                           "老实说明当前只有图生图、做不到像素级锁定，"
+                                           "**别假装改到了**；可以退一步用 generate_image 重画一版，"
+                                           "或建议用户换个做法。"},
                     },
                     "required": ["prompt"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "compose_images",
+                "description": "把**多张图片拼接/缝合**成一张（横排 / 竖排 / 网格），"
+                               "可选再统一风格。\n"
+                               "⚠️ 用户说「把这几张图拼起来 / 合在一起 / 拼成一张 / "
+                               "做个对比图 / 拼个长图」时用它。\n"
+                               "拼接是**像素级**的（不重绘），所以接缝天然无缝、内容不走样；"
+                               "只有给了 harmonize（>0）才会再跑一次图生图去统一色调/光线，"
+                               "那一步会**轻微重绘**（所以幅度默认 0，别乱给）。\n"
+                               "⚠️ 它做的是**排版式拼接**，**不会**把 A 图里的人/物搬到 B 图里 ——"
+                               "用户要那种「智能融合」时如实说明做不到，并建议改用 edit_image "
+                               "逐张微改，不要假装做到了。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "sources": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "要拼接的图片：本地绝对路径或文库文件名。"
+                                           "**留空则自动使用用户本轮拖进对话的全部图片**"
+                                           "（用户刚说「把这几张拼起来」时通常留空即可）"},
+                        "layout": {
+                            "type": "string",
+                            "enum": ["horizontal", "vertical", "grid"],
+                            "description": "拼接方式：horizontal 横排（默认）/ "
+                                           "vertical 竖排 / grid 网格"},
+                        "size": {
+                            "type": "integer",
+                            "description": "每张图统一到的长边像素，默认按当前底模原生档（1024）。"
+                                           "拼长图想让每张更大就写 1200~1600"},
+                        "gap": {
+                            "type": "integer",
+                            "description": "图片之间的间距像素（默认 0 紧贴）；"
+                                           "想要「白边分隔」的效果写 16~40"},
+                        "bg": {
+                            "type": "string",
+                            "description": "间距与补白的颜色（6 位十六进制，默认 FFFFFF 白）"},
+                        "cols": {
+                            "type": "integer",
+                            "description": "grid 网格时的列数（默认 √n 向上取整）；"
+                                           "横排/竖排时忽略"},
+                        "harmonize": {
+                            "type": "number",
+                            "description": "可选：拼完统一色调/光线的幅度 0~0.55（**默认 0 不重绘**）。"
+                                           "只应该在用户明确说「让它们看起来像一张图 / 色调统一」时"
+                                           "给 0.25~0.4；给太大（>0.45）画面会被重画、人物可能变形。"},
+                        "prompt": {
+                            "type": "string",
+                            "description": "（可选）harmonize 用的**英文**提示，如 "
+                                           "seamless single photo, consistent lighting and color"},
+                        "filename": {"type": "string",
+                                     "description": "（可选）成品文件名"},
+                    },
+                    "required": [],
                 },
             },
         },
@@ -1076,6 +1145,21 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
         # 这样既不用把整张大表复制一遍，也不会漏掉任何新加的工具。
         schemas = [s for s in schemas
                    if s.get("function", {}).get("name") in _keep]
+    elif lean:
+        # ⚠️⚠️ 2026-09-26 加：**带图轮的精简集**。
+        #   实测 Ollama 的真账：34~39 个工具的 schema 就要 **15595 token**，
+        #   加系统提示 + 1 张图 = 23244 —— num_ctx 24576 里只剩 **1332** 给
+        #   "思考 + 回答"，带 3 张图直接 400（`exceed_context_size_error`）。
+        #   这里砍掉本轮**几乎用不到**的几组（用户明说要用时不会走这条，见 main.py）：
+        #     地图 3 个（≈1900 token）+ 工作区 12 个（≈1429）+ 天气 + 上传代码托管
+        #   合计省 ≈3400 token —— 换来"带几张图也能正常回答"。
+        #   留在集合里的：图片 4 个、文档生成 4 个、文件操作、联网、知识库、记忆、
+        #   问细节、跑代码、时间 —— 该有的都有。
+        _drop = {"map_plan", "nearby_places", "connect_amap",
+                 "get_weather", "github_push"}
+        schemas = [s for s in schemas
+                   if (s.get("function", {}).get("name") not in _drop
+                       and not s.get("function", {}).get("name", "").startswith("workspace_"))]
     return schemas
 
 
@@ -1508,6 +1592,8 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
         return _do_generate_image(arguments, ui_events)
     if name == "edit_image":
         return _do_edit_image(arguments, ui_events, context)
+    if name == "compose_images":
+        return _do_compose_images(arguments, ui_events, context)
     if name == "list_directory":
         return _do_list_directory(arguments)
     if name == "read_file":
@@ -2209,6 +2295,137 @@ def _do_edit_image(arguments, ui_events, context):
                     "origin": "edit"})   # ← 前端据此标「AI 微改」（原来没标，显示成"图片"）
     return (f"已根据修改要求生成新图（用 {round(cost,1)} 秒）。原图已按描述微改并展示给用户。"
             f"若还要继续调整，**直接说明新的修改点即可**，不用再拖一次图。")
+
+
+def _do_compose_images(arguments, ui_events, context):
+    """把多张图**缝合成一张**（可选再统一风格）。
+
+    ⚠️ 2026-09-26 新增：用户问「我给几张图让它进行缝合并微改」，而此前只有
+    edit_image（改单张），"缝合"完全没有。
+    ★ 分工：拼接交给 PIL（像素级、无缝、快、不走样）；
+      "微改/统一风格"是**可选的第二步**（img2img，有幅度上限）。
+    """
+    import base64 as _b64
+    from . import doclib, image_library
+    srcs = arguments.get("sources") or []
+    if isinstance(srcs, str):
+        srcs = [x for x in re.split(r"[,\n]", srcs) if x.strip()]
+    imgs, missing = [], []
+    for x in (srcs or []):
+        p = str(x or "").strip()
+        if not p:
+            continue
+        if os.path.isfile(p):
+            imgs.append(p)
+            continue
+        # 也认「生成文库」里的文件名（用户通常说的是界面上看到的名字）
+        try:
+            fp = doclib.file_path(p)
+            if os.path.isfile(fp):
+                imgs.append(fp)
+                continue
+        except Exception:
+            pass
+        # ⚠️ 也许它本身就是 base64 / data URL（前端有时这么传）——
+        #    只有这种情况才交给 t2i；否则**直接算"找不到"**。
+        #    不判这一下的话，一个拼错的路径会被当 base64 去解码，报出
+        #    "string argument should contain only ASCII characters" 这种
+        #    用户和模型都看不懂的错误（实测踩到）。
+        if p.startswith("data:image/") or (
+                len(p) > 512 and not any(ch in p for ch in "\\/:*?\"<>|")):
+            imgs.append(p)
+            continue
+        missing.append(p)
+    if not imgs:
+        # 没给 sources（或全找不到）→ 用本轮拖进对话的图
+        imgs = list((context or {}).get("images") or [])
+    if len(imgs) < 2:
+        _hint = ("（你给的这几张我找不到：%s）" % "、".join(missing[:3])) if missing else ""
+        return ("错误：至少要两张图片才能缝合%s。请让用户把图片拖进对话"
+                "（一次可以拖多张），或用 sources 给出本地路径。" % _hint)
+
+    layout = str(arguments.get("layout") or "horizontal").strip().lower()
+    try:
+        size = int(arguments.get("size") or t2i.native_side())
+    except Exception:
+        size = t2i.native_side()
+    try:
+        gap = max(0, int(arguments.get("gap") or 0))
+    except Exception:
+        gap = 0
+    try:
+        cols = int(arguments.get("cols")) if arguments.get("cols") else None
+    except Exception:
+        cols = None
+    t2i.unload()                       # 先把显存腾出来（拼接本身不吃显存）
+    start = time.time()
+    r = t2i.compose(imgs, layout=layout, size=size, gap=gap,
+                    bg=arguments.get("bg") or "FFFFFF", cols=cols)
+    if not r.get("ok"):
+        return "图片缝合失败：%s" % r.get("error")
+    out = r["image"]
+    stitch_cost = time.time() - start
+    note = "拼接完成（%d 张，%s，%d×%d，像素级无缝，%.1f 秒）" % (
+        r["count"], r["layout"], r["size"][0], r["size"][1], stitch_cost)
+
+    # ---- 可选的第二步：统一风格（会轻微重绘）----
+    harm = 0.0
+    try:
+        harm = float(arguments.get("harmonize") or 0.0)
+    except Exception:
+        harm = 0.0
+    harm = max(0.0, min(0.45, harm))       # 硬上限：再大就是把整张重画了
+    if harm > 0:
+        _cfg_now = config.load_config() or {}
+        pr = str(arguments.get("prompt") or "").strip()
+        if not pr:
+            pr = ("a single seamless photograph, consistent lighting, color grading "
+                  "and white balance, natural blending between parts, high quality")
+        elif _needs_en(pr):
+            pr = _to_english(pr, _cfg_now)
+        t2i.unload()
+        t0 = time.time()
+        e = t2i.edit_image(out, pr, strength=harm,
+                           steps=t2i.base_steps())
+        if e.get("ok"):
+            from PIL import Image
+            out = Image.open(io.BytesIO(_b64.b64decode(e["b64"]))).convert("RGB")
+            note += "；已按 harmonize=%.2f 统一风格（%.0f 秒）" % (harm, time.time() - t0)
+        else:
+            note += "；统一风格这步没做成（%s），**已保留未重绘的拼接版**" % e.get("error")
+
+    # ---- 落盘：进生成文库（可下载）+ 图片库（可在「图片库」面板看到）----
+    buf = io.BytesIO()
+    out.save(buf, format="PNG")
+    png = buf.getvalue()
+    rel = ""
+    try:
+        rel = (str(arguments.get("filename") or "").strip()
+               or "拼图_%s.png" % time.strftime("%H%M%S"))
+        if not rel.lower().endswith(".png"):
+            rel += ".png"
+        doclib.save_bytes(rel, png)
+    except Exception:
+        rel = ""
+    b64 = _b64.b64encode(png).decode("ascii")
+    try:
+        image_library.save_image(b64, name=os.path.splitext(os.path.basename(rel))[0]
+                                 if rel else "", source="多图缝合", origin="compose")
+    except Exception:
+        pass
+    _ui(ui_events, {"type": "image", "mime": "image/png", "b64": b64,
+                    "prompt": "缝合：%d 张图 / %s" % (r["count"], r["layout"]),
+                    "size": "%d x %d" % (out.size[0], out.size[1]),
+                    "cost_s": round(time.time() - start, 1),
+                    "origin": "compose"})
+    link = ""
+    if rel:
+        link = ("\n下载链接（**原样给用户**）：\n/api/doclib/download?rel=%s"
+                % urllib.parse.quote(rel))
+    return (note + "。" + ("图片已展示给用户。" if not link else "")
+            + link
+            + "\n※ 拼接不会重绘内容；若用户想要「把 A 图里的人放进 B 图」这类智能融合，"
+              "如实说明本工具只做排版式拼接，需要的话用 edit_image 逐张微改。")
 
 
 # ---------- 文件系统 ----------
