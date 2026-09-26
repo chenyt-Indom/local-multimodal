@@ -620,6 +620,12 @@ _BLOCK_ALIAS = {
     "title": "heading", "h": "heading", "p": "para", "text": "para",
     "paragraph": "para", "bullets": "bullet", "ul": "bullet", "list": "bullet",
     "numbers": "number", "ol": "number", "ordered": "number",
+    # ⚠️ 2026-09-26 补：`numbered` 是最容易写出来的自然写法之一，原来不在表里，
+    #    写它就会命中"不认识的内容块类型，已跳过"——**整段内容凭空消失**
+    #    （实测生成调研报告时，「对策建议」下 3 条建议全没了）。
+    #    宁可多几个别名，也别让用户看到内容莫名少一段。
+    "numbered": "number", "num": "number", "enum": "number",
+    "bullet_list": "bullet", "ordered_list": "number", "item": "bullet",
     "blockquote": "quote", "note": "callout", "tip": "callout",
     "warn": "callout", "box": "callout", "grid": "table", "img": "image",
     "picture": "image", "figure": "image", "pre": "code", "mono": "code",

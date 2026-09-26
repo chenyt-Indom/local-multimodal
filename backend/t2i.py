@@ -11,6 +11,7 @@ import io
 import math
 import os
 import threading
+import time
 from . import config
 import urllib.request
 
@@ -380,8 +381,14 @@ def free_ollama_vram() -> list:
       12GB 卡上 qwen3-vl:8b 常驻 **5.79GB**（应用把 keep_alive 设成 30 分钟，它就一直赖着），
       而 SDXL 要 **11.5GB** —— 两者**不可能共存**。共存时 SDXL 被挤进共享内存，
       单张图从约 **30 秒变成约 120 秒**（实测 nvidia-smi 只剩 338MB 空闲）。
-      代价只是"画完图后下一条消息要重新加载模型"（几秒），远比每张图多等 90 秒划算。
+      代价只是"画完图后下一条消息要重新加载模型"，远比每张图多等 90 秒划算。
+
+    ⚠️ 2026-09-27：但那个"下一条消息要重新加载"的代价**比当初估的大得多** ——
+      换成 30B 模型后一次冷加载 **约 20 秒**（当初按 8B 估的是"几秒"）。
+      所以卸载时把模型名记到 `_REWARM_PENDING`，画完由 `rewarm_async()` 请回来，
+      用户接着聊就是热的（见 `rewarm_async` 的说明）。
     """
+    global _REWARM_PENDING
     names = []
     try:
         cfg = config.load_config() or {}
@@ -406,7 +413,85 @@ def free_ollama_vram() -> list:
             freed.append(m)
         except Exception:
             pass                      # Ollama 没开 / 模型没装：忽略，别把画图搞挂
+    # 记下"为了画图可能被请出去"的模型，画完由 rewarm_async() 请回来。
+    #
+    # ⚠️ 记的是**尝试过的全部**，不是 `freed`。2026-09-27 实测踩到的坑：
+    #    keep_alive=0 之后 Ollama 是**异步**卸载的，`api/ps` 要过几秒才更新；
+    #    而且这个请求很容易超时抛异常 —— 结果模型**明明被卸掉了**，`freed` 却是空的，
+    #    于是画完不预热，下一轮照样白等 20 秒（症状和没修一样）。
+    #    宁可多记：rewarm 时会自己过滤掉"已经加载着"的，不会做无用功。
+    #
+    # ⚠️ 但**只预热默认模型**（不预热代码模型）：两个 30B 合计 37GB，
+    #    12GB 卡上不可能共存 —— 一起预热等于后一个把前一个挤掉，
+    #    白耗一次加载还让用户多等。用户画完图接着的通常是聊天，不是写代码。
+    _def_model = str(cfg.get("default_model") or "").strip()
+    _REWARM_PENDING = [_def_model] if _def_model else []
     return freed
+
+
+# 被 free_ollama_vram() 请出显存、等着画完请回来的模型名
+_REWARM_PENDING: list = []
+
+
+def rewarm_async() -> None:
+    """**画完图后，在后台把对话模型请回显存**（不阻塞返回）。
+
+    为什么需要（2026-09-27 用户反馈"多轮对话每次都要等模型启动"）：
+      · 画图前 free_ollama_vram() 会主动卸载对话模型（12GB 卡装不下 SDXL + 30B）；
+      · 画完**不会**自动回来 —— 用户接着发消息时，Ollama 只能现加载，
+        实测 30B 冷启动 **约 20 秒**，体感就是"发出去半天不吐字"。
+      · 这里在图片生成**返回之后**立刻后台预热，用户读图/看结果那几秒里
+        模型就已经在加载了，下一轮基本是热的。
+
+    设计取舍：
+      · **后台线程 + daemon**：绝不能让预热把画图响应卡住；
+      · **失败静默**：预热只是优化，失败了大不了下一轮慢一次；
+      · 幂等：`_REWARM_PENDING` 取完即清，重复调用不会反复加载。
+    """
+    global _REWARM_PENDING
+    if not _REWARM_PENDING:
+        return
+    models = list(_REWARM_PENDING)
+    _REWARM_PENDING = []
+
+    def _run():
+        try:
+            cfg = config.load_config() or {}
+        except Exception:
+            cfg = {}
+        keep = str(cfg.get("model_keep_alive") or "4h")
+        base = str(cfg.get("ollama_url") or "http://127.0.0.1:11434").rstrip("/")
+
+        def _already_loaded() -> set:
+            """当前真正在显存/内存里的模型。查不到就当"没加载"，宁可多热一次。"""
+            try:
+                req = urllib.request.Request(base + "/api/ps")
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    data = json.load(r)
+                return {str(x.get("name") or "") for x in (data.get("models") or [])}
+            except Exception:
+                return set()
+
+        # ⚠️ 先等一会儿再探：Ollama 的卸载是**异步**的，keep_alive=0 刚发出去时
+        #    `api/ps` 里还看得见它。此时立刻预热等于把它又拉回來（白热一趟）。
+        #    实测卸载后 5 秒左右列表才清空，这里给 6 秒余量。
+        time.sleep(6)
+        loaded = _already_loaded()
+        for m in models:
+            if m in loaded:
+                continue              # 还活着（用户正在用 / 压根没卸掉）→ 别打扰
+            try:
+                body = json.dumps({"model": m, "prompt": "", "stream": False,
+                                   "keep_alive": keep,
+                                   "options": {"num_predict": 1}}).encode("utf-8")
+                req = urllib.request.Request(
+                    base + "/api/generate", data=body,
+                    headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=600) as r:
+                    r.read()
+            except Exception:
+                pass                  # 预热失败无所谓，真正请求时还会再加载
+    threading.Thread(target=_run, daemon=True, name="ollama-rewarm").start()
 
 
 def _load_pipe():

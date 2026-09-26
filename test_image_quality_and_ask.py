@@ -61,13 +61,21 @@ print("① 微改：底图分辨率必须先归一化（这是「歪曲原图」
 print("=" * 68)
 check("有 _fit_working_size 归一化函数", callable(getattr(t2i, "_fit_working_size", None)))
 w, h = t2i._fit_working_size(2400, 1600)
-# ⚠️ 工作分辨率的**上限随模型代际变**：SD2.1 是 768，SDXL 是 1024
-#    （SDXL 原生就是 1024，按 768 重绘等于喂了张偏小的图 → 糊 + 结构飘）。
-#    所以这里别写死 768，跟着 t2i 的判定走，换底模不用改测试。
-_want_max = 1024 if t2i.is_xl() else t2i.EDIT_MAX_SIDE
+# ⚠️ 工作分辨率的**上限随模型代际变**：SD2.1 是 768，SDXL 是 1216。
+#    （SDXL 原生 1024，但原生**竖版档是 832×1216** —— 上限若卡在 1024，
+#      会把 832×1216 缩成 700×1024 再放回，整张图留下重采样噪声。
+#      实测局部重绘「加眼镜」时区域外有 8.15% 像素被无谓改动。详见 t2i._fit_working_size）
+#    所以这里别写死，跟着 t2i 的判定走，换底模不用改测试。
+_want_max = 1216 if t2i.is_xl() else t2i.EDIT_MAX_SIDE
 check("2400x1600 → 长边 ≤%d 且保持比例" % _want_max,
       w <= _want_max and h <= _want_max and abs(w / h - 1.5) < 0.02,
       "%dx%d（上限 %d）" % (w, h, _want_max))
+# ★ 补：SDXL 的原生竖版/横版档必须**原样进出**（不能被缩放，否则留噪声）
+if t2i.is_xl():
+    for _sz in ((832, 1216), (1216, 832), (1024, 1024)):
+        check("原生档 %dx%d 原样进出（不缩放）" % _sz,
+              t2i._fit_working_size(*_sz) == _sz,
+              "%s → %s" % (_sz, t2i._fit_working_size(*_sz)))
 check("所有边都是 8 的倍数（VAE 下采样 8 倍，否则会静默裁掉几像素=边缘错位）",
       w % 8 == 0 and h % 8 == 0, "%dx%d" % (w, h))
 w2, h2 = t2i._fit_working_size(300, 200)

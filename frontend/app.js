@@ -3183,6 +3183,9 @@
     // ⚠️ 有数据进来后自然恢复成「思考中…（N 字）」——因为 updateThinkStatus 会覆盖它。
     let _stallT0 = 0;
     let _stallTimer = null;
+    // 后端在"模型还没加载"时会先发一条 status（30B 冷启动实测约 20 秒）。
+    // 存下来，让下面的等待提示带上**具体原因**，而不是只说"在准备"。
+    let _backendStatus = "";
     const _clearStall = () => {
       if (_stallTimer) { clearInterval(_stallTimer); _stallTimer = null; }
     };
@@ -3192,8 +3195,10 @@
       _stallTimer = setInterval(() => {
         const sec = Math.round((Date.now() - _stallT0) / 1000);
         if (sec >= 4) {
-          thinkStatus.textContent = "⏳ 模型正在准备…已等待 " + sec
-            + " 秒（大提示词要先读一遍；若前面还有任务在跑，会等它让出来）";
+          thinkStatus.textContent = _backendStatus
+            ? (_backendStatus + "　已等待 " + sec + " 秒")
+            : ("⏳ 模型正在准备…已等待 " + sec
+               + " 秒（大提示词要先读一遍；若前面还有任务在跑，会等它让出来）");
         }
       }, 1000);
     };
@@ -3299,6 +3304,10 @@
             } else addMedia(obj.ui);
           }
           if (obj.note) { notes.push(obj.note); showToast(obj.note, "warn"); }
+          // ⏳ 后端在模型**还没加载**时先发一条状态（30B 冷启动实测约 20 秒）。
+          //    这段时间 Ollama 一个字都不吐，不提示的话界面上就是"完全没反应"。
+          //    只改状态栏文案，不动回答气泡 —— 真正的思考/正文到了会覆盖它。
+          if (obj.status) { _backendStatus = obj.status; thinkStatus.textContent = obj.status; }
           if (obj.done) break;
         }
         messagesEl.scrollTop = messagesEl.scrollHeight;

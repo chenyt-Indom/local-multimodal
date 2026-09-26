@@ -25,6 +25,7 @@ import json
 #    漏了这行的话，unquote 会抛 NameError 被 except 吞掉 →
     #    每个**真的**中文名文件都会被误判成"并不存在"（假警报满天飞）。
 import urllib.parse
+import urllib.request
 import math
 import time
 import asyncio
@@ -3531,6 +3532,24 @@ def _stop_streams(session: str = "") -> int:
         return killed
 
 
+def _ollama_loaded_models() -> set:
+    """查询 Ollama 当前**已加载在显存/内存里**的模型名集合。
+
+    用途：判断这一轮要不要现加载模型 —— 30B 冷启动实测约 20 秒，
+    不知道的话用户只会看到"发出去半天不吐字"（2026-09-27 用户反馈）。
+    拿不到（Ollama 没开等）就返回空集合，调用方按"未加载"处理即可。
+    """
+    try:
+        cfg = config.load_config() or {}
+        base = str(cfg.get("ollama_url") or "http://127.0.0.1:11434").rstrip("/")
+        req = urllib.request.Request(base + "/api/ps")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.load(r)
+        return {str(m.get("name") or "") for m in (data.get("models") or [])}
+    except Exception:
+        return set()
+
+
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     cfg = config.load_config()
@@ -4077,6 +4096,17 @@ async def chat(req: ChatRequest):
         # 换了模型就提前吱一声，免得用户以为"怎么这次回复的口吻变了"
         if model_note:
             yield json.dumps({"note": model_note}) + "\n"
+        # ★ 模型还没加载 → 先告诉前端"在加载"，别让用户对着空白等 20 秒。
+        #   30B 冷启动实测约 20~45 秒（磁盘被占时更久），这段时间里 Ollama
+        #   一个字都不吐 —— 没有这条提示，界面上就是"发出去完全没反应"，
+        #   用户会以为卡死了（2026-09-27 反馈："每次模型启动都要等那么久"）。
+        #   ⚠️ 必须放在**第一次 client.chat 之前**，否则起不到作用。
+        try:
+            if model not in _ollama_loaded_models():
+                yield json.dumps({"status": "⏳ 正在加载模型 %s（首次加载较慢，之后就是秒回）…"
+                                            % model}) + "\n"
+        except Exception:
+            pass
         # session 已在上面定义（记忆按对话隔离，需要提前拿到）
 
         # 空回答重试：qwen3-vl 的思考会吃掉大量 token，偶尔会「想完了但没来得及写正文」，
@@ -4523,6 +4553,16 @@ async def chat(req: ChatRequest):
                                                   dict(ctx))
                 except Exception as e:
                     res = f"[工具执行失败] {name}：{e}"
+                # ★ 画完图后**后台把对话模型请回显存**（不阻塞这里）。
+                #   画图前 t2i 会主动卸载对话模型（12GB 卡装不下 SDXL + 30B），
+                #   而 30B 冷启动要 ~20 秒 —— 不请回来的话，用户画完图接着聊
+                #   就得干等 20 秒（2026-09-27 用户反馈"多轮对话每次都要等模型启动"）。
+                #   预热跑在后台线程里，用户看图这几秒模型就加载好了。
+                #   没画过图时它是空操作（见 t2i.rewarm_async）。
+                try:
+                    t2i.rewarm_async()
+                except Exception:
+                    pass
                 if name in _SERIAL_TOOLS:
                     logger.warning("[ws] 执行 %s 后 active_project=%s 结果=%s",
                                    name, workspace.active_project(),
