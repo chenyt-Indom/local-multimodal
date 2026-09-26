@@ -13,23 +13,85 @@ import os
 import threading
 from . import config
 
-MODEL_REPO = os.environ.get("SD_MODEL", "stabilityai/sd-turbo")
-# 本地已下载的模型目录（通过 ModelScope 下载的 fp16 权重），优先使用，避免联网拉取。
-# 打包运行时会自动探测随应用分发的 sd_model 资源目录；源码运行时用环境变量或本机路径。
+MODEL_REPO_DEFAULT = "stabilityai/sd-turbo"
+
+
+def _cfg_sd(key: str, default: str = "") -> str:
+    """从 config 读文生图设置（**配置统一走 config**，环境变量在里面已合并）。"""
+    try:
+        return str((config.load_config() or {}).get(key) or default).strip()
+    except Exception:
+        return default
+
+
+def model_repo() -> str:
+    """当前权重名。**每次现取**（不是导入时定死），改配置后不用重启就生效。"""
+    return (os.environ.get("SD_MODEL") or _cfg_sd("sd_model")
+            or MODEL_REPO_DEFAULT).strip()
+
+
+# 本地已下载的模型目录（fp16 权重），优先使用，避免联网拉取。
+# 打包运行时会自动探测随应用分发的 sd_model 资源目录；源码运行时用配置/环境变量/本机路径。
 def _resolve_model_dir() -> str:
-    env = os.environ.get("SD_MODEL_DIR")
+    env = os.environ.get("SD_MODEL_DIR") or _cfg_sd("sd_model_dir")
     if env:
         return env
     candidates = [
-        config.res("sd_model"),               # 打包后：_internal/sd_model
-        r"D:\local-multimodal-models\sd-turbo",  # 源码本机路径
+        config.res("sd_model"),                        # 打包后：_internal/sd_model
+        r"E:\local-multimodal-models\sdxl-base",       # 本机下载的 SDXL
+        r"D:\local-multimodal-models\sdxl-base",
+        r"D:\local-multimodal-models\sd-turbo",        # 旧的 sd-turbo（保底）
     ]
     for c in candidates:
         if os.path.isdir(c) and os.path.exists(os.path.join(c, "model_index.json")):
             return c
     return candidates[0]
 
-LOCAL_MODEL_DIR = _resolve_model_dir()
+
+def local_model_dir() -> str:
+    return _resolve_model_dir()
+
+
+# ---------- 模型代际：决定原生分辨率 / 步数 / 要不要开 CFG ----------
+# 2026-09-26 补。原来所有参数都按 sd-turbo（SD2.1 蒸馏版）写死 ——
+# 原生 512、4 步、`guidance_scale=0`（CFG 关闭）。换成 SDXL base 后这些全都不对：
+# SDXL 原生 1024（喂 512 会明显糊）、要 20~30 步、必须开 CFG。
+# 而 guidance=0 正是"提示词画不对内容"的根因 —— 实测：
+#   「一只橘猫坐在木质窗台上」→ 河边鹅卵石滩
+#   「一位女性站在实验室里微笑」→ 坐在海中央石板上
+#   「实训室里工位上的学生」→ 空教室，一个人都没有
+# 且 negative_prompt 完全失效（负面词靠的正是 CFG 的反向引导）。
+def _name_blob() -> str:
+    return (model_repo() + " " + os.path.basename(local_model_dir() or "")).lower()
+
+
+def is_turbo() -> bool:
+    """蒸馏 turbo 系：必须 guidance=0 且只要 1~4 步。"""
+    return "turbo" in _name_blob()
+
+
+def is_xl() -> bool:
+    """SDXL 系：原生 1024。"""
+    n = _name_blob()
+    return ("xl" in n) or ("sdxl" in n)
+
+
+def native_side() -> int:
+    """原生（训练）分辨率边长：SD1.5/SD2.1 = 512，SDXL = 1024。"""
+    return 1024 if is_xl() else 512
+
+
+def base_steps() -> int:
+    """一次"正常质量"的步数：turbo 蒸馏只要 4，常规权重 22~28。"""
+    if is_turbo():
+        return 4
+    return 28 if is_xl() else 22
+
+
+def guidance() -> float:
+    """CFG 系数 —— 提示词能不能被"听进去"的关键。
+    turbo 蒸馏模型必须 0（开了会过饱和、结构崩），常规权重 7.5。"""
+    return 0.0 if is_turbo() else 7.5
 
 
 # ---------- 工作分辨率：SD 原生只有 512，喂多大的图它就得在多大的画布上重绘 ----------
@@ -44,20 +106,25 @@ EDIT_MIN_SIDE = 384            # 太小也重绘不出东西，兜个下限
 HD_TARGET_MAX = 2048           # hd 交付的最大边长（超分是 4x，4096 太大没必要）
 
 
-def _fit_working_size(w: int, h: int, max_side: int = EDIT_MAX_SIDE) -> tuple:
+def _fit_working_size(w: int, h: int, max_side: int | None = None) -> tuple:
     """把 (w,h) 折算成"适合交给 SD 重绘"的尺寸：长边 ≤ max_side、保持比例、8 的倍数。
 
     8 的倍数不是洁癖 —— VAE 下采样 8 倍，尺寸不是 8 的倍数时 diffusers 会**静默裁掉**
     几个像素，微改出来的图和原图对不齐（叠在一起看就是"边缘错位"）。
     """
+    # 工作分辨率要贴着模型原生来：SD2.1 是 512，SDXL 是 1024。
+    # 在 SDXL 上按 768 重绘等于"喂了张偏小的图"，细节会糊、结构会飘。
+    if max_side is None:
+        max_side = 1024 if is_xl() else EDIT_MAX_SIDE
+    min_side = 512 if is_xl() else EDIT_MIN_SIDE
     w, h = max(1, int(w)), max(1, int(h))
     m = float(max(w, h))
     if m > max_side:
         s = max_side / m
         w, h = int(round(w * s)), int(round(h * s))
     # 长边太小时整体放大到下限以上（否则重绘幅度再好也没细节可依）
-    if max(w, h) < EDIT_MIN_SIDE:
-        s = EDIT_MIN_SIDE / float(max(1, max(w, h)))
+    if max(w, h) < min_side:
+        s = min_side / float(max(1, max(w, h)))
         w, h = int(round(w * s)), int(round(h * s))
     return max(64, (w // 8) * 8), max(64, (h // 8) * 8)
 
@@ -247,8 +314,8 @@ def set_device(mode: str) -> dict:
     # 这才是"确实能跑"的证据：设备可用不代表这个模型能装上去
     # （显存不够、权重精度不兼容都会在这步炸）。
     verified, verify_note = True, ""
-    model_ready = (os.path.isdir(LOCAL_MODEL_DIR)
-                   and os.path.exists(os.path.join(LOCAL_MODEL_DIR, "model_index.json")))
+    model_ready = (os.path.isdir(local_model_dir())
+                   and os.path.exists(os.path.join(local_model_dir(), "model_index.json")))
     if model_ready:
         try:
             pipe, dev = _get_pipe()
@@ -310,15 +377,15 @@ def _load_pipe():
     dtype = torch.float16 if device == "cuda" else torch.float32
 
     # 优先从本地目录加载（离线，无需联网）
-    if os.path.isdir(LOCAL_MODEL_DIR) and os.path.exists(
-            os.path.join(LOCAL_MODEL_DIR, "model_index.json")):
+    if os.path.isdir(local_model_dir()) and os.path.exists(
+            os.path.join(local_model_dir(), "model_index.json")):
         pipe, last_err = None, None
         for variant in ("fp16", None):
             try:
                 kw = {"torch_dtype": dtype, "local_files_only": True}
                 if variant:
                     kw["variant"] = variant
-                pipe = AutoPipelineForText2Image.from_pretrained(LOCAL_MODEL_DIR, **kw)
+                pipe = AutoPipelineForText2Image.from_pretrained(local_model_dir(), **kw)
                 break
             except Exception as e:
                 last_err = e
@@ -326,7 +393,7 @@ def _load_pipe():
             raise last_err or RuntimeError("本地模型加载失败")
     else:
         pipe = AutoPipelineForText2Image.from_pretrained(
-            MODEL_REPO, torch_dtype=dtype,
+            model_repo(), torch_dtype=dtype,
             variant="fp16" if device == "cuda" else None)
     pipe.to(device)
     return pipe, device
@@ -387,20 +454,21 @@ def refine_detail(image, prompt: str, negative_prompt: str = "",
             pipe.to(device)
         except Exception:
             pass
-        # 总步数要按 strength 折算（见 edit_image 里的说明），保证实际生效步数 ≈ 4
+        # 总步数要按 strength 折算（见 edit_image 里的说明），
+        # 保证实际生效的步数 ≈ base_steps()（turbo 是 4，SDXL 是 28）
         ratio = max(0.05, min(1.0, float(strength)))
-        total = max(1, math.ceil(4 / ratio))
+        total = max(1, math.ceil(base_steps() / ratio))
         out = pipe(prompt=prompt,
                    negative_prompt=negative_prompt or "low quality, blurry, watermark",
                    image=big, num_inference_steps=total, strength=float(strength),
-                   guidance_scale=0.0 if MODEL_REPO.endswith("sd-turbo") else 7.5).images[0]
+                   guidance_scale=guidance()).images[0]
         return out, f"细节精修 {w}x{h} → {out.size[0]}x{out.size[1]}"
     except Exception as exc:
         _log_exc("细节精修", exc)
         return image, f"细节精修跳过（{type(exc).__name__}）"
 
 
-def generate(prompt: str, negative_prompt: str = "", steps: int = 4,
+def generate(prompt: str, negative_prompt: str = "", steps: int | None = None,
              width: int = 512, height: int = 512, hd: bool = False) -> dict:
     """文生图，返回 base64 PNG。
 
@@ -422,8 +490,8 @@ def generate(prompt: str, negative_prompt: str = "", steps: int = 4,
         result = pipe(
             prompt=prompt,
             negative_prompt=negative_prompt or "low quality, blurry, watermark",
-            num_inference_steps=max(1, steps),
-            guidance_scale=0.0 if MODEL_REPO.endswith("sd-turbo") else 7.5,
+            num_inference_steps=max(1, int(steps or base_steps())),
+            guidance_scale=guidance(),
             width=width, height=height,
         ).images[0]
         note = ""
@@ -447,7 +515,7 @@ def generate(prompt: str, negative_prompt: str = "", steps: int = 4,
         buf = io.BytesIO()
         result.save(buf, format="PNG")
         return {"ok": True, "b64": base64.b64encode(buf.getvalue()).decode("utf-8"),
-                "device": device, "model": MODEL_REPO,
+                "device": device, "model": model_repo(),
                 "size": f"{result.size[0]}x{result.size[1]}", "hd_note": note}
     except Exception as e:
         return {"ok": False, "error": f"文生图生成失败: {e}"}
@@ -569,15 +637,15 @@ def _load_edit_pipe():
     # 与 _load_pipe 同理：精度跟着设备走（CPU 不能用 float16），
     # 同时用 fp16 变体取文件（本机目录往往只有 fp16 权重）。
     dtype = torch.float16 if device == "cuda" else torch.float32
-    if os.path.isdir(LOCAL_MODEL_DIR) and os.path.exists(
-            os.path.join(LOCAL_MODEL_DIR, "model_index.json")):
+    if os.path.isdir(local_model_dir()) and os.path.exists(
+            os.path.join(local_model_dir(), "model_index.json")):
         pipe, last_err = None, None
         for variant in ("fp16", None):
             try:
                 kw = {"torch_dtype": dtype, "local_files_only": True}
                 if variant:
                     kw["variant"] = variant
-                pipe = AutoPipelineForImage2Image.from_pretrained(LOCAL_MODEL_DIR, **kw)
+                pipe = AutoPipelineForImage2Image.from_pretrained(local_model_dir(), **kw)
                 break
             except Exception as e:
                 last_err = e
@@ -585,7 +653,7 @@ def _load_edit_pipe():
             raise last_err or RuntimeError("本地模型加载失败")
     else:
         pipe = AutoPipelineForImage2Image.from_pretrained(
-            MODEL_REPO, torch_dtype=dtype,
+            model_repo(), torch_dtype=dtype,
             variant="fp16" if device == "cuda" else None)
     pipe.to(device)
     return pipe, device
@@ -676,7 +744,7 @@ def edit_image(init_image, prompt: str, negative_prompt: str = "",
             image=work,
             num_inference_steps=total_steps,
             strength=float(strength),
-            guidance_scale=0.0 if MODEL_REPO.endswith("sd-turbo") else 7.5,
+            guidance_scale=guidance(),
         ).images[0]
         # 放回用户原来的尺寸（微改不该顺手把人家照片改小）
         back_note = ""
@@ -686,7 +754,7 @@ def edit_image(init_image, prompt: str, negative_prompt: str = "",
         buf = io.BytesIO()
         result.save(buf, format="PNG")
         return {"ok": True, "b64": base64.b64encode(buf.getvalue()).decode("utf-8"),
-                "device": device, "model": "img2img-" + MODEL_REPO,
+                "device": device, "model": "img2img-" + model_repo(),
                 "work_size": f"{work_w}x{work_h}", "source_size": f"{orig_size[0]}x{orig_size[1]}",
                 "size_note": back_note}
     except Exception as e:

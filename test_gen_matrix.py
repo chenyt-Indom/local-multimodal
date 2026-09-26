@@ -255,7 +255,15 @@ if "--img" in sys.argv:
         check("是真 PNG（魔数正确）", png[:8] == b"\x89PNG\r\n\x1a\n")
         w = int.from_bytes(png[16:20], "big")
         h = int.from_bytes(png[20:24], "big")
-        check("尺寸符合 16:9 要求", (w, h) == (1024, 576), "%dx%d" % (w, h))
+        # ⚠️ 别写死 (1024,576) —— 出图尺寸随**模型原生档**走：
+        #    SD2.1 系 768/16:9 → 1024x576；SDXL 系 → 1360x768（原生 1024 档）。
+        #    这里按"和当前模型的尺寸表一致 + 比例确实是 16:9"来判，换模型不用改测试。
+        _want = T._img_wh(768, "16:9")
+        check("尺寸与当前模型的尺寸表一致", (w, h) == _want,
+              "%dx%d（期望 %dx%d）" % (w, h, _want[0], _want[1]))
+        check("确实是 16:9", abs(w / float(h) - 16 / 9.0) < 0.02,
+              "%.3f" % (w / float(h)))
+        check("短边不低于 384（不是糊图）", min(w, h) >= 384, "%dx%d" % (w, h))
         check("走的是显卡", imgs[0].get("device") == "cuda", imgs[0].get("device"))
         check("有写实风格加成", "photorealistic" in str(txt) or "摄影" in str(txt),
               str(txt)[:60].replace("\n", " "))

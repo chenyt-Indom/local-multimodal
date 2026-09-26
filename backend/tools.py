@@ -21,6 +21,7 @@ import json
 import logging
 import urllib.parse
 
+from . import config
 from . import t2i
 from . import file_tools
 from . import memory as memory_mod
@@ -828,14 +829,21 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
                     "type": "object",
                     "properties": {
                         "prompt": {"type": "string",
-                                   "description": "详细的英文图片描述。要写全：主体+动作、场景、光线、镜头、风格"
+                                   "description": "详细的**英文**图片描述（必须英文！中文会被底模"
+                                                  "截断成 77 token 以内，画出来完全对不上）。"
+                                                  "要写全：主体+动作、场景、光线、镜头、风格"
                                                   "（写实类务必带 photorealistic / 35mm photograph）"},
                         "negative_prompt": {"type": "string",
                                             "description": "英文负面描述。写实类建议：" 
                                                            "cartoon, anime, illustration, painting, 3d render, "
                                                            "plastic, oversaturated, blurry, deformed, extra limbs"},
                         "size": {"type": "integer", "enum": [512, 768],
-                                 "description": "图片边长，默认512。要细节/写实/要印出来用 768"},
+                                 "description": ("图片边长档位，默认 512。"
+                                                 "512=常规，768=更细（要写实/要印出来用）。"
+                                                 "⚠️ 换了 SDXL 系底模后基础分辨率固定按"
+                                                 "其**原生 1024 档**出图（喂 512 会糊），"
+                                                 "此时这个参数不再改变分辨率 —— "
+                                                 "要更大更细请用 hd=true。")},
                         "aspect": {"type": "string",
                                    "enum": ["1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3"],
                                    "description": ("画幅比例，默认 1:1。用户说「竖版/海报/手机壁纸」用 9:16 或 2:3；说「横版/宽屏/PPT 配图/Banner」用 16:9 或 3:2。像素面积与方形一致，耗时不变。")},
@@ -1989,19 +1997,30 @@ def _do_save_image_to_library(arguments, context):
 # ⚠️ 2026-09-26 加：原来只有方形（size × size），用户说"竖版海报""16:9 横图"
 #    根本做不到 —— 而 t2i.generate 本来就支持 width/height 分开传。
 #    尺寸都取 8 的倍数（SD 的 VAE 下采样要求）。
+# 出图尺寸表：(短边档, 长边档, SDXL 档)
+# ⚠️⚠️ 2026-09-26 补第三层。尺寸必须**贴着模型原生**来，用错一档就明显糊：
+#     SD1.5/SD2.1 原生 512（前两层），SDXL 原生 1024（第三层 = 第一层 ×2，
+#     面积都落在 1.0MP 上下，正好是 SDXL 的舒适区）。
+#     以前只有前两层，换成 SDXL 后会一直喂 512/768 的画布 → 又糊又飘。
 _IMG_ASPECTS = {
-    "1:1": ((512, 512), (768, 768)),
-    "4:3": ((584, 448), (888, 664)),
-    "3:4": ((448, 584), (664, 888)),
-    "16:9": ((680, 384), (1024, 576)),
-    "9:16": ((384, 680), (576, 1024)),
-    "3:2": ((624, 416), (936, 624)),
-    "2:3": ((416, 624), (624, 936)),
+    "1:1": ((512, 512), (768, 768), (1024, 1024)),
+    "4:3": ((584, 448), (888, 664), (1168, 896)),
+    "3:4": ((448, 584), (664, 888), (896, 1168)),
+    "16:9": ((680, 384), (1024, 576), (1360, 768)),
+    "9:16": ((384, 680), (576, 1024), (768, 1360)),
+    "3:2": ((624, 416), (936, 624), (1248, 832)),
+    "2:3": ((416, 624), (624, 936), (832, 1248)),
 }
 
 
-def _img_wh(size, aspect):
-    """把 (size, aspect) 解析成 (width, height)。不认识的比例按 1:1。"""
+def _img_wh(size, aspect, native=None):
+    """把 (size, aspect) 解析成 (width, height)。不认识的比例按 1:1。
+
+    native：文生图模型的**原生边长**。None = 按当前加载的模型自动判断
+    （见 t2i.native_side）：SD2.1 是 512、SDXL 是 1024。
+    ⚠️ SDXL 下**基础分辨率固定走 1024 档**：它的训练分辨率就是 1024，
+    喂 512/768 会明显糊；要更大更细就用 hd=true（精修 + 超分）。
+    """
     try:
         base = int(size or 512)
     except Exception:
@@ -2013,7 +2032,70 @@ def _img_wh(size, aspect):
     pair = _IMG_ASPECTS.get(key)
     if not pair:
         return base, base
+    if native is None:
+        try:
+            from . import t2i
+            native = t2i.native_side()
+        except Exception:
+            native = 512
+    if int(native) >= 1024 and len(pair) > 2:
+        return pair[2]
     return pair[1] if base >= 768 else pair[0]
+
+
+# ---------- 中文提示词兜底 ----------
+# ⚠️⚠️ 2026-09-26 实测（换 SDXL 后暴露出来的真问题）：
+#    底模的文本编码器（CLIP）**上限 77 token**，而中文一个字要拆成好几个 token ——
+#    中文提示词会被**直接截断**（diffusers 日志原话：
+#      "The following part of your input was truncated because CLIP can only handle
+#       sequences up to 77 tokens"），模型等于没拿到条件，画出来完全对不上：
+#        「一个苹果放在木桌上」        → 湖边石栏杆
+#        「一位女性站在实验室里微笑」  → 日式房间里的三个古装女子
+#    同一句翻成英文则完全正常（橘猫、人像都画对）。
+#    用户天然说中文、模型也不保证每次翻英文 ⇒ 这里加一道**代码级兜底**。
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _needs_en(text) -> bool:
+    """是否需要翻成英文（有 4 个以上汉字才翻；纯英文/数字不动它）。"""
+    return len(_CJK_RE.findall(str(text or ""))) >= 4
+
+
+def _to_english(text: str, cfg: dict, timeout: float = 30.0) -> str:
+    """用本机对话模型把中文画面描述翻成英文提示词。**任何失败都原样返回**，
+    绝不因为翻译失败就把用户的请求搞挂。"""
+    s = str(text or "").strip()
+    if not s or not _needs_en(s):
+        return s
+    _log = logging.getLogger("uvicorn.error")
+    try:
+        import urllib.request
+        url = str(cfg.get("ollama_url") or "http://127.0.0.1:11434").rstrip("/") + "/api/chat"
+        body = {
+            "model": cfg.get("default_model"),
+            "stream": False,
+            "options": {"temperature": 0.2, "num_predict": 220},
+            "messages": [
+                {"role": "system", "content": (
+                    "你是文生图提示词翻译器。把用户给的中文画面描述翻成**英文提示词**："
+                    "只输出英文，用逗号分隔的关键词/短语，保留主体、动作、场景、光线、镜头、"
+                    "风格，不要解释、不要引号、不要换行、不要加标题。")},
+                {"role": "user", "content": s},
+            ],
+        }
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            out = json.loads(r.read().decode("utf-8", "replace"))
+        txt = str((out.get("message") or {}).get("content") or "").strip()
+        txt = txt.strip("`\"' \n")
+        if txt and not _needs_en(txt):
+            return txt
+        _log.warning("[t2i] 提示词翻译没拿到英文，按原样使用：%r", txt[:80])
+    except Exception:
+        _log.warning("[t2i] 提示词翻译失败，按原样使用", exc_info=True)
+    return s
 
 
 def _do_generate_image(arguments, ui_events):
@@ -2023,7 +2105,13 @@ def _do_generate_image(arguments, ui_events):
     # ⚠️ 风格加成按**用户原话 + 模型写的英文 prompt**一起判（见 _STYLE_PRESETS 说明）：
     #    要"写实"就加摄影系正向词、排掉 cartoon/3d；要"卡通"就别再硬塞"professional photography"。
     style_pos, style_neg = _style_for(prompt)
+    # ⚠️ 中文提示词会被 CLIP 截断（见 _CJK_RE 的说明）→ 翻成英文再画。
+    #    放在 _style_for **之后**：风格判定要认中文原话（"写实/卡通"这些词）。
+    _cfg_now = config.load_config() or {}
+    prompt = _to_english(prompt, _cfg_now)
     user_neg = (arguments.get("negative_prompt") or "").strip()
+    if _needs_en(user_neg):
+        user_neg = _to_english(user_neg, _cfg_now)
     negative = ", ".join(x for x in (user_neg, style_neg or _IMAGE_NEG_DEFAULT) if x)
     try:
         size = int(arguments.get("size") or 512)
@@ -2034,7 +2122,10 @@ def _do_generate_image(arguments, ui_events):
     boosted = ", ".join(x for x in (prompt, style_pos or _IMAGE_PROMPT_NEUTRAL) if x)
     t2i.unload()  # 确保显存空闲
     start = time.time()
-    result = t2i.generate(boosted, negative_prompt=negative, steps=4,
+    # ⚠️ 步数**不能写死 4** —— 那是给 sd-turbo（蒸馏版）的。SDXL 要 28 步，
+    #    写死 4 会得到一张糊图。交给 t2i 按模型代际决定（见 t2i.base_steps）。
+    result = t2i.generate(boosted, negative_prompt=negative,
+                          steps=t2i.base_steps(),
                           width=width, height=height, hd=hd)
     cost = time.time() - start
     if not result.get("ok"):
@@ -2062,11 +2153,17 @@ def _do_edit_image(arguments, ui_events, context):
         return "错误：未提供修改描述（prompt）。"
     negative = (arguments.get("negative_prompt") or "").strip() or \
         "low quality, blurry, watermark, distorted, deformed"
+    # ⚠️ 同文生图：中文描述会被 CLIP 截断 → 先兜一道翻译
+    _cfg_now = config.load_config() or {}
+    prompt = _to_english(prompt, _cfg_now)
+    if _needs_en(negative):
+        negative = _to_english(negative, _cfg_now)
     # ⚠️ 默认 0.45（原 0.6）：SD-Turbo 在 0.6 上**整幅重画**的成分太高，
     #    用户报的"微改歪曲原图"与此有关。0.45 只改该改的地方，其余基本保持。
     #    幅度要变大时由模型传 strength（见工具描述里的档位）。
     strength = max(0.0, min(1.0, float(arguments.get("strength") or 0.5)))
-    steps = int(arguments.get("steps") or 4)
+    # ⚠️ 步数不能写死 4（那是 sd-turbo 的档）；SDXL 要 28 步
+    steps = int(arguments.get("steps") or t2i.base_steps())
     source = (arguments.get("source") or "").strip()
 
     # 1) 解析参考图：优先用 source 路径；否则用本轮对话拖入的那张图

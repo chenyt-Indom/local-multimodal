@@ -51,7 +51,13 @@ services:
       - "127.0.0.1:${APP_PORT:-8000}:8000"
     volumes:
       - ./data:/data                                  # 记忆库/会话/图片库/日志
-      - ./models/sd-turbo:/opt/app/sd_model:ro        # 绘图模型（缺省则自动降级）
+      # 绘图模型。⚠️ 目录名故意取中性名（sd_model），换权重只要换内容、不用动这里 ——
+      # 以前写的是 models/sd-turbo，一换模型就得改 compose，很容易漏改导致
+      # 容器里挂了个不存在的路径（会静默变成"要去联网下载"）。
+      # 2026-09-26 起内容为 **SDXL base 1.0（fp16，原生 1024）**：
+      # 之前的 sd-turbo 是 SD2.1 蒸馏版，只能 guidance=0（CFG 关闭），
+      # 提示词几乎不起作用（实测"橘猫坐窗台"画成河滩），negative_prompt 也失效。
+      - ./models/sd_model:/opt/app/sd_model:ro
       - ./models/esrgan:/opt/app/esrgan:ro            # 超分模型
     shm_size: "2gb"                                   # 多模态推理需要较大共享内存
 

@@ -146,6 +146,18 @@ DEFAULT_CONFIG = {
     #   "cpu"  = 强制 CPU
     #   "gpu"  = 强制显卡（无显卡时切换会被拒绝，不会静默回退）
     "t2i_device": "auto",
+    # 文生图/图片微改用哪个权重。留空 = 用代码里的默认（见 t2i.MODEL_REPO）。
+    # ⚠️⚠️ 2026-09-26 实测：默认的 sd-turbo 是 **SD2.1 蒸馏版**，代码里对它把
+    #    guidance_scale 设成 0（**CFG 关闭**）→ 提示词只当弱条件用。实测：
+    #      「一只橘猫坐在木质窗台上」→ 河边鹅卵石滩
+    #      「一位女性站在实验室里微笑」→ 坐在海中央石板上
+    #      「实训室里工位上的学生」→ 空教室，一个人都没有
+    #    而且 negative_prompt **完全失效**（负面词靠的正是 CFG 的反向引导）。
+    #    ⇒ 要"画什么就是什么"必须换 **CFG 可用**的权重：SDXL base（原生 1024，约 6.9GB）。
+    "sd_model": "stabilityai/stable-diffusion-xl-base-1.0",
+    # 本地权重目录（离线用）。留空 = 自动探测（打包目录 / 源码本机路径）。
+    # 下载好的放这儿，之后就不联网。
+    "sd_model_dir": "",
     # 程序启动时自动打开麦克风监听（说「小千小千」唤醒）。
     # 容器里没有麦克风，会自动跳过并提示，不影响其它功能。
     "voice_auto_start": True,
@@ -190,6 +202,8 @@ def load_config() -> dict:
     环境变量可覆盖个别关键项（容器化部署用，未设置时行为不变）：
       MM_OLLAMA_URL  → ollama_url（精简版镜像里 Ollama 是独立容器，需指向服务名）
       MM_MODEL       → default_model
+      SD_MODEL       → sd_model（换文生图权重，如 stabilityai/stable-diffusion-xl-base-1.0）
+      SD_MODEL_DIR   → sd_model_dir（本地权重目录，离线用）
     """
     cfg = dict(DEFAULT_CONFIG)
     if os.path.exists(CONFIG_FILE):
@@ -203,6 +217,10 @@ def load_config() -> dict:
         cfg["ollama_url"] = os.environ["MM_OLLAMA_URL"]
     if os.environ.get("MM_MODEL"):
         cfg["default_model"] = os.environ["MM_MODEL"]
+    if os.environ.get("SD_MODEL"):
+        cfg["sd_model"] = os.environ["SD_MODEL"]
+    if os.environ.get("SD_MODEL_DIR"):
+        cfg["sd_model_dir"] = os.environ["SD_MODEL_DIR"]
 
     # ⚠️ 把 localhost 换成 127.0.0.1。
     # Windows 上 localhost 会先解析到 IPv6 的 ::1，而 Ollama 只监听 IPv4，
