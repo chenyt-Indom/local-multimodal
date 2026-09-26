@@ -63,3 +63,4 @@ vendor/
 
 # 构建期离线资源：只保留说明，大文件自己下载（见 docker/vendor-assets/README.md）
 docker/vendor-assets/*.tar.gz
+bench_30b.txt
