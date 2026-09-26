@@ -2957,6 +2957,62 @@ def _pptx_text_chars(slides) -> int:
     return n
 
 
+# 这些字段一出现，说明这一页是靠**表格 / 图表 / 配图 / 卡片**撑起来的 ——
+# 它们的"字数"天然就少，但页面并不空，不该算进"内容密度"。
+# ⚠️ 2026-09-26 加（踩过的坑）：只按字数判密度时，一份 11 页的稿子里
+# 表格页(15 字)/图表页(10 字)/配图页(13 字) 全被算成"很薄"，
+# 工具于是反复喊"请再调一次"，模型连改 7 版把额度耗光 ——
+# 用户拿到的反而是一份"改到最后没写完"的稿子。
+_STRUCTURED_PAGE_KEYS = ("table", "chart", "diagram", "image", "image_query",
+                         "image_prompt", "bg_image", "cover_image", "gallery")
+
+
+def _page_is_structured(sl) -> bool:
+    """这一页是不是靠表格/图表/配图构成（而不是靠文字）？"""
+    if not isinstance(sl, dict):
+        return False
+    for k in _STRUCTURED_PAGE_KEYS:
+        v = sl.get(k)
+        if isinstance(v, dict):
+            if any(v.values()):
+                return True
+        elif isinstance(v, (list, tuple)):
+            if v:
+                return True
+        elif str(v or "").strip():
+            return True
+    return False
+
+
+def _pptx_text_density(slides) -> tuple:
+    """返回 (正文字数, 纯文字页数) —— **表格/图表/配图页不计**。
+
+    这样"密度"反映的才是"该写字的地方写够了没有"，
+    而不是把结构化的页面当成偷懒。
+    """
+    # 封面/结尾页天然字少，也不算（它们是版式，不是内容页）。
+    # ⚠️ 只在该页确实"只有标题没有正文"时才剥掉，并且首尾**各自判断** ——
+    #    不能因为第一页像封面就把最后一页也无条件砍掉（那会白丢一页的分母）。
+    body = [sl for sl in (slides or []) if not _page_is_structured(sl)]
+    if len(body) > 4 and _is_plain_coverish(body[0]):
+        body = body[1:]
+    if len(body) > 4 and _is_plain_coverish(body[-1]):
+        body = body[:-1]
+    text_pages = len(body)
+    chars = _pptx_text_chars(body)
+    return chars, text_pages
+
+
+def _is_plain_coverish(sl) -> bool:
+    """像封面/结尾那样"只有标题+副标题、没有正文"的页？"""
+    if not isinstance(sl, dict):
+        return False
+    has_body = any(sl.get(k) for k in ("bullets", "items", "cards", "stats",
+                                       "steps", "left", "right", "quote",
+                                       "table", "chart"))
+    return not has_body
+
+
 def _do_make_pptx(arguments=None, ui_events=None) -> str:
     """把结构化内容生成 .pptx，存进生成文库，返回可点下载链接。
 
@@ -3035,15 +3091,29 @@ def _do_make_pptx(arguments=None, ui_events=None) -> str:
     # 把**实测内容密度**回传给模型（2026-09-26 用户要求「太简单要修正」）。
     # 8B 模型常常只写三四条短句就交差，而工具描述里的"丰富度要求"它未必照做；
     # 给它一个数字，它才知道自己写得够不够、要不要再补一版。
-    _chars = _pptx_text_chars(slides)
-    if n_pages >= 5:
-        _dense = _chars / float(n_pages)
-        if _dense < 55:
-            tip += ("\n（自检：这版平均每页约 %.0f 字，**偏薄**。用户若要的是"
-                    "「内容充实」的稿子，请再调一次 make_pptx 补足：每页 3~6 条要点、"
-                    "每条 15~40 字的完整句子 —— 别只是重发一份一样的。）" % _dense)
+    _chars, _text_pages = _pptx_text_density(slides)
+    if _text_pages >= 4:
+        _dense = _chars / float(_text_pages)
+        # ⚠️ 2026-09-26 收紧判据。原来 < 55 才算"偏薄"，实测出现过
+        #    **8 页 / 平均 85 字** 被判定为"合格"—— 可我们要的是
+        #    "每页 3~6 条、每条 15~40 字"（即 45~240，目标 ~120）。
+        #    85 落在下沿，成稿明显单薄。现在两个维度分开说，模型才知道差在哪：
+        _thin = _dense < 110
+        _few = n_pages < 8
+        if _thin or _few:
+            _why = []
+            if _few:
+                _why.append("页数偏少（%d 页，这类汇报一般 8~15 页）" % n_pages)
+            if _thin:
+                _why.append("纯文字页平均仅 %.0f 字（内容充实的话应在 110 字以上）" % _dense)
+            tip += ("\n（自检：%s。**请再补一次**：每页 3~6 条要点、每条 15~40 字的"
+                    "完整句子，别只是重发一份一样的。⚠️ **只补这一次**，补完就交差 —— "
+                    "表格 / 图表 / 配图页不算薄，别为它们反复重做。）"
+                    % "；".join(_why))
         else:
-            tip += "\n（自检：平均每页约 %.0f 字，内容密度合格。）" % _dense
+            tip += ("\n（自检：%d 页 / %d 张纯文字页平均约 %.0f 字，内容密度合格。）"
+                    "\n※ 表格页、图表页、配图页**不计入密度**（它们内容不在字数上），"
+                    "所以这里合格就**不要再重做**了。" % (n_pages, _text_pages, _dense))
     return ("已生成 PPT《%s》——共 %d 页，%.0f KB。\n"
             "下载链接（**直接点就能存下来，原样给用户**）：\n"
             "/api/doclib/download?rel=%s\n"

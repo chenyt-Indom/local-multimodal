@@ -51,6 +51,39 @@ def _num_fmt(v):
     return NUM_FORMATS.get(s.lower(), s)      # 不是关键字就当成原始格式串
 
 
+def _disp_text(v, nf) -> str:
+    """按数字格式估算「Excel 里实际会显示的文本」，**专供算列宽用**。
+
+    ⚠️ 2026-09-26 修（实测导出 PDF 才看出来）：列宽原来只按**原始值**估 ——
+    `256000` 算 6 个字符 → 列宽 9，可套上货币格式后实际显示是 `¥256,000.00`
+    （11 个字符）→ 列不够宽，单元格直接显示 **`#########`**。
+    用户打开表格看到的就是一堆井号，等于数据"看不见"。
+    """
+    s = str("" if v is None else v)
+    if not nf or nf == "General":
+        return s
+    # ⚠️ 必须先用 _is_num 判：`_as_num` 对认不出的值会**静默返回 0**
+    #    （实测 `_as_num("2026-03-01") == 0`），日期列会被算成 1 个字符宽 → 列太窄。
+    if not _is_num(v):
+        return s
+    n = _as_num(v)
+    if n is None:
+        return s
+    dec = 0
+    if "." in nf:                       # 小数位数 = 小数点后 0/# 的个数
+        dec = sum(1 for ch in nf.split(".", 1)[1] if ch in "0#")
+    pct = "%" in nf
+    if pct:
+        n = n * 100
+    body = ("{:,.%df}" % dec).format(n) if "," in nf else ("{:.%df}" % dec).format(n)
+    prefix = ""
+    for sym in ("¥", "￥", "$", "€", "£"):
+        if sym in nf:
+            prefix = sym
+            break
+    return prefix + body + ("%" if pct else "")
+
+
 def _is_num(v):
     if isinstance(v, bool) or v is None:
         return False
@@ -205,16 +238,31 @@ def build_xlsx(path, sheets, theme=DEFAULT_THEME, author="本地多模态助手"
                             continue
                         want_cols.add(c)
                 ws.write(r, 0, label, f_total)
+                _tf_cache = {}          # 每个数字格式只建一次 format 对象
                 for c in range(1, ncol):
                     vals = [x[c] for x in rows
                             if isinstance(x, (list, tuple)) and c < len(x) and _is_num(x[c])]
                     if c in want_cols and vals and len(vals) == nrow:
                         col_letter = (chr(65 + c) if c < 26
                                       else chr(64 + c // 26) + chr(65 + c % 26))
+                        # 合计数字也要**跟着该列的格式走** —— 否则金额列合计显示成
+                        # 光秃秃的 442000，和上面带 ¥ 的明细不一致（实测看到的）。
+                        _nf = _num_fmt(formats[c] if c < len(formats) else "")
+                        tf = _tf_cache.get(_nf)
+                        if tf is None:
+                            if _nf == "General":
+                                tf = f_total
+                            else:
+                                tf = wb.add_format({"bold": True, "font_size": 11,
+                                                   "bg_color": th["zebra"],
+                                                   "top": 2, "top_color": th["head"],
+                                                   "border": 1, "border_color": th["line"],
+                                                   "num_format": _nf, "align": "right"})
+                            _tf_cache[_nf] = tf
                         ws.write_formula(
                             r, c, "=SUM(%s%d:%s%d)" % (col_letter, body_start + 1,
                                                        col_letter, body_start + nrow),
-                            f_total, sum(_as_num(v) for v in vals))
+                            tf, sum(_as_num(v) for v in vals))
                     else:
                         ws.write(r, c, "", f_total)
                 ws.set_row(r, 20)
@@ -229,11 +277,12 @@ def build_xlsx(path, sheets, theme=DEFAULT_THEME, author="本地多模态助手"
                 if c < len(widths) and widths[c]:
                     w = float(widths[c])
                 else:
+                    _nf = _num_fmt(formats[c] if c < len(formats) else "")
                     cells = [header[c] if c < len(header) else ""] + \
-                            [(x[c] if c < len(x) else "") for x in rows
+                            [_disp_text(x[c] if c < len(x) else "", _nf) for x in rows
                              if isinstance(x, (list, tuple))]
-                    longest = max([len(str(x)) for x in cells] or [8])
-                    # 中文按 2 个字符宽算
+                    # 中文按 2 个字符宽算（原来这里先按 len() 算了一遍又被覆盖，
+                    # 是死代码 —— 顺手删掉，免得读的人以为有两套口径）
                     longest = max([sum(2 if ord(ch) > 127 else 1 for ch in str(x))
                                    for x in cells] or [8])
                     w = min(42, max(9, longest + 3))

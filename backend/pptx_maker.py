@@ -1503,6 +1503,56 @@ def _add_logo(slide, path, pos="tr", height_in=0.5, margin_in=0.42):
 # --------------------------------------------------------------------------
 # 主入口
 # --------------------------------------------------------------------------
+def _page_has_content(page: dict) -> bool:
+    """这一页到底有没有东西可画？—— 判定要**把各版式读的字段都算上**。
+
+    ⚠️ 2026-09-26 修（端到端实测发现的）：模型给过一页
+    `{"layout": "content"}`（title / bullets 全空）—— 生成出来的成稿里就是
+    **一页只有页码 `07` 的白板**。用户拿去汇报很尴尬，而且这种"空页"
+    从工具返回的"共 N 页"里完全看不出来（页数是够的）。
+
+    注意不能用 `any(page.values())` 糊弄：`{"layout": "chart"}` 是有值的，
+    但画出来还是白板 —— 必须看**真正能渲染出东西**的字段里有没有实质内容。
+    """
+    if not isinstance(page, dict):
+        return False
+    for k in ("title", "section", "subtitle", "note"):
+        if str(page.get(k) or "").strip():
+            return True
+    for k in ("bullets", "items", "left", "right", "cards", "stats", "steps",
+              "timeline"):
+        v = page.get(k)
+        if isinstance(v, (list, tuple)) and any(
+                (str(x).strip() if not isinstance(x, dict)
+                 else any(str(y or "").strip() for y in x.values())) for x in v):
+            return True
+        if isinstance(v, str) and v.strip():
+            return True
+    q = page.get("quote")
+    if isinstance(q, dict):
+        if str(q.get("text") or q.get("content") or "").strip():
+            return True
+    elif str(q or "").strip():
+        return True
+    tb = page.get("table")
+    if isinstance(tb, dict):
+        if tb.get("rows") or tb.get("header") or tb.get("columns"):
+            return True
+    elif isinstance(tb, (list, tuple)) and tb:
+        return True
+    ch = page.get("chart")
+    if isinstance(ch, dict):
+        if any(ch.get(k) for k in ("data", "series", "values", "categories",
+                                   "labels", "rows")):
+            return True
+    elif isinstance(ch, (list, tuple)) and ch:
+        return True
+    for k in ("image", "image_query", "image_prompt", "bg_image", "cover_image"):
+        if str(page.get(k) or "").strip():
+            return True
+    return False
+
+
 def build_pptx(path, title, slides, subtitle="", author="", theme=DEFAULT_THEME,
                end_text="", font=DEFAULT_FONT, page_number=True,
                cover=True, end_page=True, img_bases=None,
@@ -1578,6 +1628,12 @@ def build_pptx(path, title, slides, subtitle="", author="", theme=DEFAULT_THEME,
             if _idx == _skip_idx:
                 continue
             if not isinstance(sl, dict):
+                continue
+            # ⚠️ 空页直接跳过 —— 否则成稿里会留下"只有页码的白板页"（实测遇到）。
+            #    记进 warnings 让模型知道"你这一页白写了"，它下次会补内容。
+            if not _page_has_content(sl):
+                warnings.append("第 %d 页没有任何内容（标题/要点/表格/图表都是空的），"
+                                "已跳过 —— 空页在成稿里很难看" % (_idx + 1))
                 continue
             s = dict(sl)
             s["_bases"] = bases

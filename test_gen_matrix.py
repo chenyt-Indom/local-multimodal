@@ -13,6 +13,7 @@
 import glob
 import io
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -135,6 +136,77 @@ for s in prs.slides:
             pass
 check("自定义金色主色 B8860B 生效", gold >= 1, "%d 处" % gold)
 
+# ⚠️ 2026-09-26 补：空页拦截。端到端实测发现模型给过一页 `{"layout":"content"}`
+#   （title / bullets 全空）—— 成稿里就是**一页只有页码的白板**，
+#   而"共 N 页"看不出异常（页数是够的），用户拿去汇报很尴尬。
+_empty_txt, _ = call("make_pptx", {"title": "空页测试", "filename": "blank-check",
+                                  "slides": [{"layout": "content", "title": "第一页",
+                                              "bullets": ["要点一", "要点二"]},
+                                             {"layout": "content"},          # 空页
+                                             {"layout": "content", "title": "",
+                                              "bullets": []},                # 空页
+                                             {"layout": "chart", "chart": {}},  # 空图表
+                                             {"layout": "content", "title": "末页",
+                                              "bullets": ["要点三"]}]})
+_blank_f = newest(".pptx")
+_blank_prs = Presentation(_blank_f)
+_blank_pages = []
+for _s in _blank_prs.slides:
+    _t = "".join(sh.text_frame.text.strip() for sh in _s.shapes
+                 if sh.has_text_frame).strip()
+    _blank_pages.append(_t)
+check("空页被丢弃（封面+2 内容+结尾 = 4 页，不含那 3 张白板）",
+      len(_blank_prs.slides) == 4, "%d 页" % len(_blank_prs.slides))
+check("返回里明确说了哪一页被跳过（模型据此知道要补内容）",
+      "没有任何内容" in str(_empty_txt), str(_empty_txt)[:80].replace("\n", " "))
+check("每页都有实际文字（没有只剩页码的白板）",
+      all(len(p) > 3 for p in _blank_pages),
+      "各页字符数 %s" % [len(p) for p in _blank_pages])
+check("页码自动顺延（空页被丢后不跳号）",
+      "02" in _blank_pages[1] and "03" in _blank_pages[2],
+      "%r / %r" % (_blank_pages[1][:6], _blank_pages[2][:6]))
+
+# 密度自检的判据：同一份稿子，薄的要说"请再补"，厚的要放行
+_thin_txt, _ = call("make_pptx", {"title": "薄稿", "filename": "density-thin",
+                                  "slides": [{"layout": "content", "title": "第%d页" % i,
+                                              "bullets": ["短"]} for i in range(1, 9)]})
+_fat_bullet = "本年度完成三个模块建设并组织验收，配套预算与责任人都已落实到具体责任人。"
+_fat_txt, _ = call("make_pptx", {"title": "厚稿", "filename": "density-fat",
+                                 "slides": [{"layout": "content", "title": "第%d页" % i,
+                                             "bullets": [_fat_bullet] * 4} for i in range(1, 11)]})
+check("薄稿会被提醒补足（8 页 / 每页几个字 → 不该报「合格」）",
+      "请再补一次" in _thin_txt, str(_thin_txt)[-90:].replace("\n", " "))
+check("厚稿放行（不瞎催模型重做）",
+      "合格" in _fat_txt and "请再补一次" not in _fat_txt,
+      str(_fat_txt)[-90:].replace("\n", " "))
+# ⚠️ 2026-09-26 补：**表格/图表/配图页不能算"薄"**。
+#   实测踩到的坑：一份 11 页的稿子里，表格页(15 字)/图表页(10 字)/配图页(13 字)
+#   被按字数算成"很薄"，工具于是反复喊"请再补一次"，模型**老实照做连改 7 版**，
+#   把输出额度耗光 —— 用户最后连一句正式回复都没拿到（比稿子薄更糟）。
+_ok_bullet = "本年度完成三个模块建设并组织验收，配套预算与责任人都已落实到具体责任人。"   # 37 字
+_mix_txt, _ = call("make_pptx", {
+    "title": "图文混排", "filename": "density-mixed",
+    "slides": ([{"layout": "content", "title": "文字页%d" % i,
+                 "bullets": [_ok_bullet] * 3} for i in range(1, 7)]
+               + [{"layout": "table", "title": "预算表",
+                   "table": {"header": ["年度", "金额"], "rows": [["第一年", 420]]}},
+                  {"layout": "chart", "title": "经费分配",
+                   "chart": {"values": [420, 380, 200]}},
+                  {"layout": "image_right", "title": "实训室示意图",
+                   "image_query": "实训室", "bullets": [_ok_bullet]},
+                  {"layout": "content", "title": "小结", "bullets": [_ok_bullet] * 3}])})
+check("表格/图表/配图页**不**计入密度（6 张 111 字的文字页 → 判定合格）",
+      "合格" in _mix_txt and "请再补一次" not in _mix_txt,
+      str(_mix_txt)[-100:].replace("\n", " "))
+from backend import tools as _T2                                           # noqa: E402
+_c, _p = _T2._pptx_text_density([{"layout": "content", "title": "文字页", "bullets": [_ok_bullet] * 3},
+                                 {"layout": "table", "title": "表",
+                                  "table": {"header": ["A"], "rows": [["1"]]}},
+                                 {"layout": "image_query", "title": "图", "image_query": "x"},
+                                 {"layout": "chart", "title": "图", "chart": {"values": [1]}}])
+check("密度只数纯文字页（4 页里只有 1 页计入）", _p == 1 and _c >= 111,
+      "文字页 %s 张 / %s 字" % (_p, _c))
+
 # ---------------------------------------------------------------- Word
 print("\n【2】Word —— 复杂规格：封面+目录+四类块+自定义配色")
 blocks = [
@@ -209,6 +281,37 @@ check("明细数据完整（大数字 256000 在）", "256000" in sheet_text.rep
 check("合计行有内容", "合计" in sheet_text)
 check("三张表的名字都在", all(n in sheet_text or n in book
                               for n in ("明细", "分类汇总", "总览")))
+
+# ⚠️ 2026-09-26 补：这三个断言来自一次"导出 PDF 肉眼看"才发现的缺陷 ——
+#   列宽原来是按**原始值**估的（256000 → 6 字符 → 宽 9），可套上货币格式后
+#   实际显示是 `¥256,000.00`（11 字符）→ 列不够宽，单元格直接渲染成 **`#########`**。
+#   用户打开表格看到一堆井号，等于数据"看不见"。这类问题**静态断言查不出来**，
+#   只有把文件渲染出来看才发现 —— 所以这里把判据固化成断言。
+_ws1 = ""
+with zipfile.ZipFile(f) as z:
+    _ws1 = z.read("xl/worksheets/sheet1.xml").decode("utf-8", "replace")
+_widths = {int(a): float(w) for a, b, w in
+           re.findall(r'<col min="(\d+)" max="(\d+)" width="([0-9.]+)"', _ws1)}
+# min/max 相同的会被 xlsxwriter 合并成一段，展开成每列宽度
+_colw = {}
+for a, b, w in re.findall(r'<col min="(\d+)" max="(\d+)" width="([0-9.]+)"', _ws1):
+    for c in range(int(a), int(b) + 1):
+        _colw[c] = float(w)
+check("金额列宽够放下 ¥256,000.00（≥13，否则会显示成 ####）",
+      _colw.get(5, 0) >= 13, "第 5 列宽 %.1f" % _colw.get(5, 0))
+check("明细里没有 `####` 之类的溢出现象（列宽与格式匹配）",
+      all(_colw.get(c, 9) >= 9 for c in (1, 2, 3, 4, 5)), str(_colw))
+# 合计行要继承该列的货币格式，否则显示成光秃秃的 442000（与上面的 ¥… 不一致）
+_sty = ""
+with zipfile.ZipFile(f) as z:
+    _sty = z.read("xl/styles.xml").decode("utf-8", "replace")
+_codes = re.findall(r'formatCode="([^"]*)"', _sty)
+check("styles 里确实写了货币格式（¥#,##0.00）",
+      any("¥" in c and "#,##0" in c for c in _codes), "格式串 %s" % _codes[:6])
+check("xl/ 里没有出现字面的 `####` 占位或格式串错误",
+      "####" not in _ws1, "（单元格显示成井号是 Excel 渲染行为，这里查格式串没写坏）")
+check("合计行的求和公式在（=SUM 而不是写死的数字）",
+      "SUM(" in _ws1, "公式 %d 处" % _ws1.count("SUM("))
 
 # ---------------------------------------------------------------- 代码
 print("\n【4】代码 —— 生成并**真跑**（不是纸上谈兵）")
