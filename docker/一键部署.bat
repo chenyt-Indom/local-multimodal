@@ -28,18 +28,25 @@ if errorlevel 1 (
     set "DC=docker-compose"
 )
 echo [1/6] Docker 引擎正常
-REM 磁盘空间：镜像 7GB + 模型 19GB，解包和运行还要留余量，建议 40GB
+REM 磁盘空间：紧的其实是**模型** ——
+REM   离线包模式：models\ 已随包拷好，只需再留运行余量（约 10GB）。
+REM   在线模式：  要把约 50GB 模型拉进 Docker，再 docker cp 提取到本目录 models\，
+REM               所以**本目录要再留约 60GB**；Docker 存储盘还需另留约 80GB。
 REM [!] 必须是 `%CD%` 而不是 `$env:CD` —— `CD` 是 cmd 的**内部命令**、不是环境变量，
 REM    在 PowerShell 里读 `$env:CD` 永远是空 → Split-Path 抛错 → catch 返回 0
 REM    → 界面上永远显示「磁盘只剩 0 GB」（2026-09-19 实测踩到，任何机器都会误报）。
 set "FREEGB=0"
 for /f %%s in ('powershell -NoProfile -Command "try{[math]::Round((Get-PSDrive ((Split-Path -Qualifier '%CD%').TrimEnd(':'))).Free/1GB,0)}catch{0}"') do set "FREEGB=%%s"
-if %FREEGB% GEQ 40 goto :disk_ok
-if %FREEGB% GEQ 25 (
-    echo        [注意] 磁盘只剩 %FREEGB% GB，勉强够用，建议再清理一些。
+set "NEEDGB=60"
+set "SOFTGB=35"
+if exist "models\ollama\manifests" set "NEEDGB=10"
+if exist "models\ollama\manifests" set "SOFTGB=6"
+if %FREEGB% GEQ %NEEDGB% goto :disk_ok
+if %FREEGB% GEQ %SOFTGB% (
+    echo        [注意] 磁盘只剩 %FREEGB% GB，本模式需要约 %NEEDGB% GB，建议再清理一些。
 ) else (
     echo        [警告] 磁盘只剩 %FREEGB% GB，很可能不够！
-    echo               本包需要约 30 GB（镜像 7GB + 模型 19GB + 运行时余量）。
+    echo               本模式需要约 %NEEDGB% GB（模型约 50GB + 运行余量）。
     echo               建议先清理磁盘，或换一台空间足够的机器。
     choice /c YN /n /m "        确定要继续吗？[Y/N] "
     if errorlevel 2 exit /b 1
@@ -254,9 +261,9 @@ REM  在线模式：  模型在 multimodal-models 镜像里，提取到本地 models/ 目录 ——
 REM             compose 挂载的是 ./models/ollama，不提取容器里就是空的。
 REM ============================================================
 :ensure_models
-if exist "models\ollama\manifests" exit /b 0
-if exist "models\sd-turbo\model_index.json" exit /b 0
-echo       本地还没有模型，正在从镜像仓库提取（约 18GB，第一次会久一点）...
+REM 两项都在才算「模型已就位」：只看 ollama 的话，缺 sd_model 时会静默跳过提取。
+if exist "models\ollama\manifests" if exist "models\sd_model\model_index.json" exit /b 0
+echo       本地还没有模型，正在从镜像仓库提取（约 50GB，第一次会久一点）...
 docker pull %REG%/multimodal-models:latest
 if errorlevel 1 exit /b 1
 docker rm -f mm-models-tmp >nul 2>&1
@@ -287,14 +294,14 @@ exit /b 0
 
 :eo_registry
 REM 镜像仓库里有现成的（就是从这个包推上去的），比走 Docker Hub 快得多也不容易失败
-echo       正在从镜像仓库拉取 Ollama 运行时（约 9GB，请耐心等待）...
+echo       正在从镜像仓库拉取 Ollama 运行时（约 3.5GB，请耐心等待）...
 docker pull %REG%/multimodal-ollama:latest
 if errorlevel 1 goto :eo_pull
 docker tag %REG%/multimodal-ollama:latest local-multimodal-ollama:latest
 exit /b 0
 
 :eo_pull
-echo       未找到离线镜像，正在从镜像源拉取（约 9GB，请耐心等待）...
+echo       未找到离线镜像，正在从镜像源拉取（约 3.5GB，请耐心等待）...
 for %%M in (docker.1ms.run docker.1panel.live docker.xuanyuan.me) do call :try_mirror %%M
 docker image inspect local-multimodal-ollama:latest >nul 2>&1
 if not errorlevel 1 exit /b 0

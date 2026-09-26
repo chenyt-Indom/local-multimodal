@@ -45,6 +45,9 @@ REQUIRED_FILES = [
     "从镜像仓库部署.md",
     "校验安装包.bat",
     "校验安装包.ps1",
+    "推送到腾讯云.bat",
+    "make_manifest.py",
+    "make_deploy_kit.py",
     "data/config.json",
 ]
 # 模型目录：记文件清单 + 大小

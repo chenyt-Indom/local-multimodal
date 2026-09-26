@@ -6,7 +6,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-async-009688?logo=fastapi&logoColor=white)
-![Ollama](https://img.shields.io/badge/Ollama-Qwen3--VL--8B-000000)
+![Ollama](https://img.shields.io/badge/Ollama-Qwen3--VL--Think--30B-000000)
 ![License](https://img.shields.io/badge/License-Apache_2.0-2b6cb0)
 ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows&logoColor=white)
 
@@ -50,7 +50,7 @@
 | 持续成本 | 随用量线性增长 | 仅电费 |
 | 数据流向 | 出机器 | **不出机器** |
 | 可用性 | 依赖网络与第三方服务 | **断网可用** |
-| 能力上限 | 顶级大模型 | 本地 8B 级模型 |
+| 能力上限 | 顶级大模型 | 本地 30B 级模型 |
 
 **定位一句话**：不是"更便宜的云 API"，而是"把 AI 搬进内网"。
 
@@ -248,7 +248,7 @@ budget = ctx_limit - reserve_out - overhead - search_reserve - 512
 └────────────────────────┬─────────────────────────────────┘
                          │ 仅 127.0.0.1:11434
 ┌────────────────────────▼─────────────────────────────────┐
-│  Ollama  ──→  Qwen3-VL-8B（本地权重，约 6GB，显存占用 ~11.5GB）│
+│  Ollama  ──→  Qwen3-VL-Think 30B（本地权重 19.6GB，Q4_K_M）        │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -334,8 +334,10 @@ budget = ctx_limit - reserve_out - overhead - search_reserve - 512
 # 1. 安装 Ollama
 #    https://ollama.com   （或 winget install Ollama.Ollama ）
 
-# 2. 拉取模型（约 6GB，只需一次）
-ollama pull qwen3-vl:8b
+# 2. 拉取模型（约 19.6GB，只需一次）
+ollama pull qwen3-vl-think:30b
+# 写代码用的另一个模型（约 18.6GB，可选）
+ollama pull qwen3-coder:30b
 
 # 3. 安装依赖
 pip install -r requirements.txt
@@ -354,7 +356,7 @@ python run.py
 
 RTX 50 系显卡需用 cu130 重建：`--build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu130`
 
-> 也可以从镜像仓库部署（不用拷 27GB 交付包），见 [`docker/从镜像仓库部署.md`](docker/从镜像仓库部署.md)。
+> 也可以从镜像仓库部署（不用拷 58GB 交付包），见 [`docker/从镜像仓库部署.md`](docker/从镜像仓库部署.md)。
 
 ---
 
@@ -363,11 +365,12 @@ RTX 50 系显卡需用 cu130 重建：`--build-arg TORCH_INDEX=https://download.
 | 项目 | 要求 |
 |---|---|
 | 操作系统 | Windows 10 / 11（Linux / macOS 可手动运行） |
-| 显卡 | NVIDIA，显存 ≥ 8GB（**推荐 12GB**） |
-| 内存 | ≥ 16GB |
-| 硬盘 | ≥ 20GB（模型 6~15GB） |
+| 显卡 | NVIDIA 独显（**强烈建议**，显存 ≥ 12GB）；没显卡也能跑，但慢约 60 倍 |
+| 内存 | ≥ 32GB（12GB 显存装不全 30B 权重，一部分要走内存） |
+| 硬盘 | ≥ 90GB（模型约 50GB；Docker 部署另需数据盘空间） |
 
-**性能参考**（RTX 5070 Ti Laptop **12GB**，实测）：首次加载 10~30 秒，生成速度 20~40 token/s，显存占用约 11.5GB（`num_ctx=24576`）。
+**性能参考**（RTX 5070 Ti Laptop **12GB**，实测）：冷启动加载约 20 秒，热态首字 **0.07 秒**，生成速度约 **25 字/秒**。
+> 换过图/换过模型后第一条消息会重载模型（约 20 秒），之后就是热的 —— 对话模型保活 4 小时。
 
 > 显存不足时把 `config.json` 里的 `num_ctx` 调低（如 8192 或 4096）。
 
@@ -445,7 +448,7 @@ python test_loop.py
 
 **3. 为什么用文本协议兜底？**
 
-因为本地 8B 模型的能力边界很明确。原生 Function Calling 在长上下文里会失效，如果不兜底，整个 Agent 就废了。加一层容错解析，换来的是"降级可用"而不是"整体崩溃"。
+因为本地 30B 模型的能力边界很明确。原生 Function Calling 在长上下文里会失效，如果不兜底，整个 Agent 就废了。加一层容错解析，换来的是"降级可用"而不是"整体崩溃"。
 
 ---
 
@@ -472,7 +475,7 @@ GitHub：[@chenyt-Indom](https://github.com/chenyt-Indom)
 ## License
 
 - 本工具：**Apache 2.0**
-- 模型 Qwen3-VL-8B：**Apache 2.0**（免费商用）
+- 模型 Qwen3-VL-Think 30B / Qwen3-Coder 30B：**Apache 2.0**（免费商用）
 
 ---
 
