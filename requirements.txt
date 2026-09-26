@@ -24,6 +24,12 @@ torch>=2.2
 # 避免 basicsr/realesrgan 在 Python 3.13+ 上构建失败的问题。
 spandrel>=0.4
 
+# 抠图（去背景）。rembg 提供 ONNX 会话管理，实际模型用 **BiRefNet**
+# （当前开源里 SOTA 的二分图像分割，MIT 许可），发丝/毛绒/镂空边缘远好于 u2net。
+# ⚠️ 它会带来 onnxruntime + pymatting（发丝级 alpha）+ numba 等依赖；
+#    模型权重**不在 pip 包里**，首次调用时自动下到 REMBG_HOME（每档约 0.9~1.1GB）。
+rembg>=2.0.60
+
 # 打包应用
 pyinstaller>=6.0
 # 生成 PPT（make_pptx 工具）。纯 Python 库，约 10MB，带 lxml + XlsxWriter。

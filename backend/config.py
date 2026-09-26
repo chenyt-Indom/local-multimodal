@@ -53,8 +53,14 @@ CONFIG_FILE = data("config.json")
 DEFAULT_CONFIG = {
     # Ollama 本地服务地址（请保证 ollama serve 已启动）
     "ollama_url": "http://127.0.0.1:11434",
-    # 默认模型，需先用 ollama pull qwen3-vl:8b 下载
-    "default_model": "qwen3-vl:8b",
+    # 默认模型。⚠️ 2026-09-26 从 qwen3-vl:8b 升到 **qwen3-vl:30b**：
+    #   · 30B MoE（总参 30.5B / 激活 3.3B），知识广度与看图能力明显强于 8B；
+    #   · 实测看图问答 52.8 tok/s（MoE 只激活 3.3B，速度没受参数量拖累）；
+    #   · Q4_K_M 约 19GB，12GB 显存装不满 → 部分落内存，但 MoE 的掉速远小于 dense。
+    #   ⚠️ 这个模型是从 ModelScope 的 GGUF 导入的（ollama 官方源国内下不动，见 README）。
+    #   ⚠️ 导入时必须同时带 mmproj（视觉投影层），否则图片输入会报
+    #      `this model is missing data required for image input`。
+    "default_model": "qwen3-vl:30b",
     # 推理参数
     "temperature": 0.6,
     # ---------- 采样：专门用来压「思考打转」（复读）----------

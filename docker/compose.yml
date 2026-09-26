@@ -37,6 +37,9 @@ services:
       # 宿主机的 data 目录实际位置（由部署脚本写入 .env）。
       # 容器里点「打开文件夹」打不开宿主机资源管理器，用这个路径提示用户。
       MM_HOST_DATA_DIR: ${MM_HOST_DATA_DIR:-}
+      # 抠图（rembg + BiRefNet）的模型目录。镜像内路径固定 /opt/app/rembg，
+      # 由下面 volumes 挂到包内 models/rembg —— 预置权重，开箱即用、零下载。
+      REMBG_HOME: /opt/app/rembg
       TZ: Asia/Shanghai
     # 让 host.docker.internal 在 Linux 上也能解析到宿主机
     extra_hosts:
@@ -64,6 +67,10 @@ services:
       #    inpainting + 蒙版才行（实测「加眼镜」用紧框一次就干净）。
       - ./models/sd_inpaint:/opt/app/sd_inpaint:ro
       - ./models/esrgan:/opt/app/esrgan:ro            # 超分模型
+      # 抠图模型（BiRefNet，每档约 0.9~1.1GB）。**故意不加 :ro** ——
+      # 用户换档位（如人像 birefnet-portrait）时容器要能往里写。
+      # 打包会预置默认档位，所以常规使用依然是零下载。
+      - ./models/rembg:/opt/app/rembg
     shm_size: "2gb"                                   # 多模态推理需要较大共享内存
 
   # ---------------- 自带 Ollama（可选）----------------

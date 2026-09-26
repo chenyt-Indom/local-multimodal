@@ -48,10 +48,14 @@ REQUIRED_FILES = [
     "data/config.json",
 ]
 # 模型目录：记文件清单 + 大小
+# ⚠️ 2026-09-26 修正：以前这里还写着 models/sd-turbo（已弃用），
+#    却漏了实际在用的 sd_model / sd_inpaint —— 清单漏项等于给校验脚本开洞。
 DIRS = [
     "models/ollama",
-    "models/sd-turbo",
-    "models/esrgan",
+    "models/sd_model",      # 文生图：SDXL base 1.0
+    "models/sd_inpaint",    # 局部重绘：SDXL inpainting
+    "models/esrgan",        # 超分：RealESRGAN
+    "models/rembg",         # 抠图：BiRefNet
 ]
 
 

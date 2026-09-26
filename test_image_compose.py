@@ -8,8 +8,9 @@
   · 拼接走 PIL —— **像素级、不重绘**，所以接缝无缝、内容不走样、快（毫秒级）；
   · 「拼接后微改」是**可选的第二步**（img2img），幅度有**硬上限 0.45**
     （再大就不是"统一风格"而是"整张重画"，人物会变形）；
-  · 「把 A 图里的人放进 B 图」这类**智能融合做不到** —— 提示里必须如实说明，
-    不许模型假装做到（实测模型很爱编"已完成智能融合"）。
+  · 「把 A 图里的人放进 B 图」这类需求 —— **2026-09-26 起由 composite_image 提供**
+    （抠图 + 像素级合成，主体一个像素都不重画）。系统提示必须把模型引到它，
+    而不是用高 strength 的 edit_image 硬糊（那会把人物重画变形）。
   · 出参要能下载（进生成文库）+ 能在「图片库」看到。
 
 跑法：python test_image_compose.py   （纯 CPU，几秒）
@@ -188,10 +189,17 @@ print("【7】★ 不许假装能做「智能融合」（模型很爱编「已�
 print("=" * 66)
 _src_main = open(os.path.join(ROOT, "backend", "main.py"), encoding="utf-8").read()
 _src_tools = open(os.path.join(ROOT, "backend", "tools.py"), encoding="utf-8").read()
+# ⚠️ 2026-09-26 更新：下面这条以前断言的是"系统提示里写着『智能融合做不到』"，
+#    因为当时**真的**没有那个能力。如今 cutout_image + composite_image 已上线
+#    （抠图 + 像素级合成），系统提示改成把模型**引到 composite_image**，
+#    所以这条断言跟着守新边界：能力存在 → 提示必须指对工具，
+#    且仍然**不许**用高 strength 的 edit_image 去硬糊（那会把人物重画变形）。
 check("工具描述里写明了「不会把 A 图里的人搬到 B 图」",
       "不会" in _src_tools and "搬到" in _src_tools)
-check("系统提示里也写了这条边界（否则模型看不到 schema 的模型会乱答应）",
-      "智能融合做不到" in _src_main)
+check("系统提示已把「把人放进 B 图」指向 composite_image",
+      "composite_image" in _src_main)
+check("系统提示仍明确禁止用高 strength 硬糊（会把人物重画变形）",
+      "重画变形" in _src_main)
 check("工具返回里提醒模型如实说明", "如实说明" in _src_tools)
 check("compose_images 已在工具表里", any(
     s["function"]["name"] == "compose_images"

@@ -14,7 +14,7 @@ import threading
 from . import config
 import urllib.request
 
-MODEL_REPO_DEFAULT = "stabilityai/sd-turbo"
+MODEL_REPO_DEFAULT = "stabilityai/stable-diffusion-xl-base-1.0"
 
 
 def _cfg_sd(key: str, default: str = "") -> str:
@@ -41,7 +41,9 @@ def _resolve_model_dir() -> str:
         config.res("sd_model"),                        # 打包后：_internal/sd_model
         r"E:\local-multimodal-models\sdxl-base",       # 本机下载的 SDXL
         r"D:\local-multimodal-models\sdxl-base",
-        r"D:\local-multimodal-models\sd-turbo",        # 旧的 sd-turbo（保底）
+        # ⚠️ 2026-09-26 移除：原来这里还挂着 `sd-turbo`（SD2.1 蒸馏版）作"保底"。
+        #    它已经彻底弃用（CFG=0 导致"画什么不像什么"），且会误导后来人以为
+        #    系统还在用它。SDXL 就位后这个保底只会掩盖"SDXL 目录没配好"的问题。
     ]
     for c in candidates:
         if os.path.isdir(c) and os.path.exists(os.path.join(c, "model_index.json")):
@@ -115,8 +117,15 @@ def _fit_working_size(w: int, h: int, max_side: int | None = None) -> tuple:
     """
     # 工作分辨率要贴着模型原生来：SD2.1 是 512，SDXL 是 1024。
     # 在 SDXL 上按 768 重绘等于"喂了张偏小的图"，细节会糊、结构会飘。
+    #
+    # ⚠️⚠️ 2026-09-26 修正：原来 XL 档写的是 1024，那会把 SDXL 的原生竖版
+    #   **832×1216 缩成 700×1024 再放回去** —— 两次重采样都在**整张图**上留下噪声。
+    #   实测（加眼镜的局部重绘）：只圈了眼部，区域外仍有 8.15% 的像素发生变化，
+    #   平均差 6.6/255。虽然幅度很小（>40 的强变化为 **0**，即没有真被重绘），
+    #   但完全是白来的损耗。提到 **1216** 后，832×1216 / 1216×832 这类原生档
+    #   就**原样进、原样出**，噪声没有了，重绘质量也更好（SDXL 在原生分辨率上最准）。
     if max_side is None:
-        max_side = 1024 if is_xl() else EDIT_MAX_SIDE
+        max_side = 1216 if is_xl() else EDIT_MAX_SIDE
     min_side = 512 if is_xl() else EDIT_MIN_SIDE
     w, h = max(1, int(w)), max(1, int(h))
     m = float(max(w, h))
@@ -525,16 +534,38 @@ def generate(prompt: str, negative_prompt: str = "", steps: int | None = None,
             pipe.to(device)
         except Exception:
             pass
+        # ⚠️⚠️ 2026-09-26 修：**SDXL 上不能真的按小尺寸生成**。
+        #    实测 `width=512, height=512` + 提示词「雪地里的一只红狐」→
+        #    画出来的是一幅**挂在墙上的画**（画框 + 木地板 + 白墙）——
+        #    因为 SDXL 原生就是 1024，喂 512 时它把画面理解成"缩略图/作品照片"。
+        #    正确做法：先把尺寸顶到原生档生成，**再缩回**用户要的尺寸。
+        gen_w, gen_h = int(width), int(height)
+        shrink_to = None
+        if is_xl() and min(gen_w, gen_h) < 1024:
+            k = 1024.0 / max(1, min(gen_w, gen_h))
+            gen_w = max(1024, int(round(gen_w * k / 8)) * 8)
+            gen_h = max(1024, int(round(gen_h * k / 8)) * 8)
+            shrink_to = (int(width), int(height))
         result = pipe(
             prompt=prompt,
             negative_prompt=negative_prompt or "low quality, blurry, watermark",
             num_inference_steps=max(1, int(steps or base_steps())),
             guidance_scale=guidance(),
-            width=width, height=height,
+            width=gen_w, height=gen_h,
         ).images[0]
+        if shrink_to and result.size != shrink_to:
+            result = result.resize(shrink_to, 3)      # 3 = LANCZOS（本文件统一用数字常量）
         note = ""
         if hd:
             # ① 细节精修（真长细节）→ ② 超分（补像素密度）
+            #
+            # ⚠️⚠️ 2026-09-26 修：**精修前必须先把 text2img 流水线放掉**。
+            #    精修走的是 img2img 流水线，它和 text2img **加载的是同一份 SDXL 权重，
+            #    但是两个独立的 pipe 对象** —— 12GB 卡上装不下两份（各约 6.5GB），
+            #    于是溢出到共享内存，实测直接慢到 **10 分钟以上**（连 512×512 的输入都一样）。
+            #    先 unload 再精修，代价只是"精修要重载一次模型"（约 10 秒），
+            #    远比溢出好。（原来只在超分前 unload，漏了精修这一步。）
+            unload()
             result, extra = refine_detail(result, prompt, negative_prompt)
             note = extra
             # ⚠️⚠️ **超分前必须把 SD 流水线放掉**（2026-09-23 实测）：

@@ -1006,6 +1006,114 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
         {
             "type": "function",
             "function": {
+                "name": "cutout_image",
+                "description": "把图片的**主体抠出来**（去掉背景），产出带透明通道的 PNG。\n"
+                               "⚠️ 用户说「抠图 / 去背景 / 把背景去掉 / 只留人 / 抠出这个物体 / "
+                               "换个背景」时用它。\n"
+                               "用的是 **BiRefNet**（当前开源最强的抠图模型之一，MIT 许可），"
+                               "发丝、毛绒、镂空、半透明的边缘也抠得住 —— "
+                               "比老一代 u2net 那种“块状硬边”强一个档次。\n"
+                               "★ 它跑在 **CPU** 上，不占显存，所以**不会影响**正在对话的模型。\n"
+                               "抠完的结果会进图片库，也可以直接交给 composite_image 换背景。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": "要抠的图：本地绝对路径或文库文件名。"
+                                           "**留空则用用户本轮拖进对话的图**"},
+                        "model": {
+                            "type": "string",
+                            "enum": ["birefnet-general", "birefnet-portrait",
+                                     "birefnet-massive", "birefnet-general-lite",
+                                     "isnet-general-use", "u2net", "bria-rmbg"],
+                            "description": "模型档位。默认 birefnet-general（通用）；"
+                                           "**人像/头发多**用 birefnet-portrait；"
+                                           "要**最高质量**用 birefnet-massive（更慢）；"
+                                           "要快要省内存用 birefnet-general-lite。"
+                                           "（bria-rmbg 质量最强但非商业许可，别默认用它）"},
+                        "alpha_matting": {
+                            "type": "boolean",
+                            "description": "发丝级 alpha 估算。⚠️ BiRefNet 系**自带**柔和 alpha，"
+                                           "通常**不需要开**；只在“边缘形状本身就不对”时才设 true"
+                                           "（更慢，且干净背景上可能反而不如原生）"},
+                        "filename": {"type": "string",
+                                     "description": "（可选）成品文件名"},
+                    },
+                    "required": [],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "composite_image",
+                "description": "把一张图的**主体合成到另一张背景图**上（**内容级合成**，俗称“换背景/把人放进场景”）。\n"
+                               "⚠️ 用户说「把这张图里的人/东西放到那张图里 / 换个背景 / "
+                               "把这个产品放进那个场景 / 帮我把这两张合成一张」时用它。\n"
+                               "★ 主体**一个像素都不重画** —— 不是让 AI 照着重画一张，"
+                               "而是真实的像素级合成，所以**长相、衣服、细节 100% 保留**。\n"
+                               "主体如果没抠过，会自动先抠（auto_cutout，默认开）。\n"
+                               "⚠️ 与 compose_images 的分工：compose_images 是**并排拼接**"
+                               "（几张图各占一格，互不重叠）；本工具是**叠上去**"
+                               "（主体坐在背景上面，可调位置/大小/投影）。别用错。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "subject": {
+                            "type": "string",
+                            "description": "**主体**（要放上去的那个）：抠好的透明 PNG，"
+                                           "或原图（会先自动抠）。本地路径 / 文库文件名"},
+                        "background": {
+                            "type": "string",
+                            "description": "**背景**：背景图路径/文库文件名，"
+                                           "或 6 位十六进制纯色（如 “FFFFFF” 白底）"},
+                        "position": {
+                            "type": "string",
+                            "description": "摆在哪：center（默认）/ top / bottom / left / right / "
+                                           "top-left / top-right / bottom-left / bottom-right；"
+                                           "也可直接给 “x,y” 像素坐标"},
+                        "scale": {
+                            "type": "number",
+                            "description": "主体缩放比例，1.0 = 保持原始像素大小。"
+                                           "主体明显比背景大或小时用它调整（0.05~8.0）"},
+                        "shadow": {
+                            "type": "boolean",
+                            "description": "给主体加柔和投影，让它“坐”在背景上而不是飘着。"
+                                           "贴人物/产品时建议开"},
+                        "feather": {
+                            "type": "number",
+                            "description": "边缘羽化像素（默认 0 不动）。"
+                                           "只在边缘有生硬切边时给 1~3；抠得好的图别给"},
+                        "shrink": {
+                            "type": "integer",
+                            "description": "**去白边**：把主体边缘向内收几像素（默认 2，实测最优）。"
+                                           "⚠️ 用户反馈「人周围有一圈白光/白边/像贴上去的」时"
+                                           "调到 3；给 0 关闭。上限就是 3（再多会啃掉发丝和轮廓）"},
+                        "auto_cutout": {
+                            "type": "boolean",
+                            "description": "主体没有透明通道时是否自动抠图（默认 true）"},
+                        "margin": {
+                            "type": "integer",
+                            "description": "距边缘留白像素（只对九宫格位置生效）"},
+                        "canvas": {
+                            "type": "string",
+                            "description": "背景是纯色时的画布尺寸，如 “1024x1024”；"
+                                           "不给则按主体放大后的 1.5 倍"},
+                        "model": {
+                            "type": "string",
+                            "description": "自动抠图用的模型档位（同 cutout_image）"},
+                        "filename": {
+                            "type": "string",
+                            "description": "（可选）成品文件名"},
+                    },
+                    "required": ["subject", "background"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "list_directory",
                 "description": "列出指定目录下的一级内容（文件/子目录）。用于浏览用户本机文件系统。",
                 "parameters": {
@@ -1627,6 +1735,10 @@ def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
         return _do_edit_image(arguments, ui_events, context)
     if name == "compose_images":
         return _do_compose_images(arguments, ui_events, context)
+    if name == "cutout_image":
+        return _do_cutout_image(arguments, ui_events, context)
+    if name == "composite_image":
+        return _do_composite_image(arguments, ui_events, context)
     if name == "list_directory":
         return _do_list_directory(arguments)
     if name == "read_file":
@@ -2511,6 +2623,169 @@ def _do_compose_images(arguments, ui_events, context):
             + link
             + "\n※ 拼接不会重绘内容；若用户想要「把 A 图里的人放进 B 图」这类智能融合，"
               "如实说明本工具只做排版式拼接，需要的话用 edit_image 逐张微改。")
+
+
+def _do_cutout_image(arguments, ui_events, context):
+    """抠图：去掉背景，产出带透明通道的 PNG。
+
+    模型走 cutout（rembg + BiRefNet），**在 CPU 上跑** —— 不占显存，
+    不跟正在对话的模型抢那 12GB。
+    """
+    import base64 as _b64
+    from . import cutout, doclib, image_library
+
+    src = arguments.get("source")
+    src = src.strip() if isinstance(src, str) else src
+    if not src:
+        imgs = list((context or {}).get("images") or [])
+        if not imgs:
+            return ("错误：没有指定要抠的图。请让用户把图片拖进对话，"
+                    "或用 source 给出本地路径 / 文库文件名。")
+        src = imgs[0]
+
+    # 路径解析：本地文件 → 文库文件名 → 原样（可能是 base64 / data URL）
+    if isinstance(src, str) and not src.startswith("data:image/"):
+        if not os.path.isfile(src):
+            try:
+                fp = doclib.file_path(src)
+                if os.path.isfile(fp):
+                    src = fp
+            except Exception:
+                pass
+        looks_b64 = len(src) > 512 and not any(ch in src for ch in "\\/:*?\"<>|")
+        if not os.path.isfile(src) and not looks_b64:
+            return "错误：找不到要抠的图片：%s" % src
+
+    model = str(arguments.get("model") or "").strip() or cutout.MODEL_DEFAULT
+    if not cutout.is_downloaded(model):
+        _ui(ui_events, {"type": "status",
+                        "text": "首次使用，正在下载抠图模型 %s（约 1GB，需几分钟）…" % model})
+
+    r = cutout.cutout(src, model=model,
+                      alpha_matting=bool(arguments.get("alpha_matting")))
+    if not r.get("ok"):
+        return "抠图失败：%s" % r.get("error")
+
+    png = r["png"]
+    b64 = _b64.b64encode(png).decode("ascii")
+    rel = ""
+    try:
+        rel = (str(arguments.get("filename") or "").strip()
+               or "抠图_%s.png" % time.strftime("%H%M%S"))
+        if not rel.lower().endswith(".png"):
+            rel += ".png"
+        doclib.save_bytes(rel, png)
+    except Exception:
+        rel = ""
+    try:
+        image_library.save_image(
+            b64,
+            name=os.path.splitext(os.path.basename(rel))[0] if rel else "",
+            source="抠图", origin="cutout")
+    except Exception:
+        pass
+
+    _ui(ui_events, {"type": "image", "mime": "image/png", "b64": b64,
+                    "prompt": "抠图（%s）" % r["model"],
+                    "size": "%d x %d" % (r["width"], r["height"]),
+                    "cost_s": r.get("seconds"), "origin": "cutout"})
+
+    note = ("抠图完成（%s，%d×%d，透明背景已就绪，%.1f 秒）"
+            % (r["model"], r["width"], r["height"], r.get("seconds") or 0))
+    if not r.get("has_alpha"):
+        note += ("；⚠️ 结果里没检测到透明区域 —— 主体可能被当成了整张图，"
+                 "可改用 birefnet-portrait（人像）或开 alpha_matting 再试")
+    link = ""
+    if rel:
+        link = ("\\n下载链接（**原样给用户**）：\\n/api/doclib/download?rel=%s"
+                % urllib.parse.quote(rel))
+    return (note + "。图片已展示给用户。" + link
+            + "\\n※ 想换背景就把这张图交给 composite_image 做合成。")
+
+
+def _do_composite_image(arguments, ui_events, context):
+    """内容级合成：把主体贴到背景上。**主体不重画**，像素级保真。"""
+    import base64 as _b64
+    from . import composite as _comp, doclib, image_library
+
+    def _resolve(x):
+        if not isinstance(x, str):
+            return x
+        s = x.strip()
+        if not s or s.startswith("data:image/"):
+            return s
+        if os.path.isfile(s):
+            return s
+        try:
+            fp = doclib.file_path(s)
+            if os.path.isfile(fp):
+                return fp
+        except Exception:
+            pass
+        return s
+
+    subject = _resolve(arguments.get("subject"))
+    background = _resolve(arguments.get("background"))
+    if not subject:
+        imgs = list((context or {}).get("images") or [])
+        if imgs:
+            subject = imgs[0]
+        else:
+            return ("错误：缺少 subject（要放上去的主体）。"
+                    "请让用户拖入图片，或给出本地路径 / 文库文件名。")
+    if not background:
+        return "错误：缺少 background（背景图路径，或纯色如 FFFFFF）。"
+
+    r = _comp.composite(
+        subject, background,
+        position=str(arguments.get("position") or "center"),
+        scale=arguments.get("scale") or 1.0,
+        feather=arguments.get("feather") or 0.0,
+        shadow=bool(arguments.get("shadow")),
+        auto_cutout=bool(arguments.get("auto_cutout", True)),
+        margin=int(arguments.get("margin") or 0),
+        canvas=str(arguments.get("canvas") or ""),
+        model=str(arguments.get("model") or ""),
+        shrink=(int(arguments["shrink"]) if arguments.get("shrink") is not None else 1),
+    )
+    if not r.get("ok"):
+        return "图片合成失败：%s" % r.get("error")
+
+    png = r["png"]
+    b64 = _b64.b64encode(png).decode("ascii")
+    rel = ""
+    try:
+        rel = (str(arguments.get("filename") or "").strip()
+               or "合成_%s.png" % time.strftime("%H%M%S"))
+        if not rel.lower().endswith(".png"):
+            rel += ".png"
+        doclib.save_bytes(rel, png)
+    except Exception:
+        rel = ""
+    try:
+        image_library.save_image(
+            b64,
+            name=os.path.splitext(os.path.basename(rel))[0] if rel else "",
+            source="图片合成", origin="composite")
+    except Exception:
+        pass
+
+    _ui(ui_events, {"type": "image", "mime": "image/png", "b64": b64,
+                    "prompt": "图片合成（位置 %s）" % (r.get("position"),),
+                    "size": "%d x %d" % (r["width"], r["height"]),
+                    "cost_s": r.get("seconds"), "origin": "composite"})
+
+    note = ("合成完成（%d×%d，%.1f 秒）"
+            % (r["width"], r["height"], r.get("seconds") or 0))
+    if r.get("cutout"):
+        note += "；主体原本没有透明通道，已自动先抠图"
+    link = ""
+    if rel:
+        link = ("\\n下载链接（**原样给用户**）：\\n/api/doclib/download?rel=%s"
+                % urllib.parse.quote(rel))
+    return (note + "。图片已展示给用户。" + link
+            + "\\n※ 主体是**像素级真实合成**，长相 / 衣服 / 细节都没有被重画。"
+              "若主体相对背景过大过小或位置不合适，调 scale / position 再来一次即可。")
 
 
 # ---------- 文件系统 ----------
