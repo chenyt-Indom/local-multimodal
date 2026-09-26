@@ -58,6 +58,11 @@ services:
       # 之前的 sd-turbo 是 SD2.1 蒸馏版，只能 guidance=0（CFG 关闭），
       # 提示词几乎不起作用（实测"橘猫坐窗台"画成河滩），negative_prompt 也失效。
       - ./models/sd_model:/opt/app/sd_model:ro
+      # 局部重绘（精确微改）：只重画**涂选/圈定**的那块，其余像素原样保留。
+      # ⚠️ 与 sd_model（纯 img2img）不是一回事：img2img 是整图去噪，实测
+      #    「换衣服颜色」「加眼镜」在 0.45/0.60/0.85 **都改不出来**；
+      #    inpainting + 蒙版才行（实测「加眼镜」用紧框一次就干净）。
+      - ./models/sd_inpaint:/opt/app/sd_inpaint:ro
       - ./models/esrgan:/opt/app/esrgan:ro            # 超分模型
     shm_size: "2gb"                                   # 多模态推理需要较大共享内存
 

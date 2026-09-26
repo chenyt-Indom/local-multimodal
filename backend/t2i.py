@@ -922,10 +922,274 @@ def compose(images, layout="horizontal", size=None, gap=0, bg="FFFFFF",
             "layout": lay, "count": n, "gap": gap, "cell": (cw, ch)}
 
 
+# ---------- 局部重绘（inpainting）：真正"只改这一块" ----------
+# ⚠️⚠️ 2026-09-26 加。实测结论摆在前面，免得以后有人又去调 strength 找答案：
+#   纯图生图（SDXL base，无蒙版）**做不到"精确改动某个元素"** ——
+#     「加眼镜」0.45 / 0.85 → 都没戴上；「换衣服颜色」0.60 / 0.85 → 颜色都没变；
+#     「换背景」0.85 两次 → 一次换成别的场景、一次压根没换（只把脸重画了）。
+#   原因：img2img 是**整图去噪**，没有"只改这里"的约束。
+#   inpainting + 蒙版（白=重绘、黑=保留）才能做到，而且**没被圈到的像素原样保留**。
+INPAINT_DEFAULT_REPO = "AI-ModelScope/stable-diffusion-xl-1.0-inpainting-0.1"
+
+# 常用区域预设：给出归一化框 (x0, y0, x1, y1)，0~1，左上为原点。
+# 作用：用户说「把衣服换个颜色」时，模型即使拿不到涂抹蒙版，也能用一个**粗略区域**
+# 先把"只改这块"做起来（比整图重绘准得多）。
+AREA_PRESETS = {
+    "whole": (0.0, 0.0, 1.0, 1.0),
+    "upper": (0.0, 0.0, 1.0, 0.5), "top": (0.0, 0.0, 1.0, 0.5),
+    "lower": (0.0, 0.5, 1.0, 1.0), "bottom": (0.0, 0.5, 1.0, 1.0),
+    "left": (0.0, 0.0, 0.5, 1.0), "right": (0.5, 0.0, 1.0, 1.0),
+    "center": (0.25, 0.25, 0.75, 0.75), "middle": (0.25, 0.25, 0.75, 0.75),
+    "upper-third": (0.0, 0.0, 1.0, 0.34), "middle-third": (0.0, 0.33, 1.0, 0.67),
+    "lower-third": (0.0, 0.66, 1.0, 1.0),
+    "face": (0.25, 0.08, 0.75, 0.45),          # 人像常见构图的经验值
+    # ⚠️ 加眼镜/改表情请用 eyes：实测（2026-09-26）「加眼镜」用 face 会把头发和眼睛
+    #    一起重画（眼睛里出现红橙色乱纹），换成**只框眼周**这条紧框后一次就干净了
+    #    （黑框眼镜自然架上、镜片后眼睛清晰、人物与背景都不动）。
+    "eyes": (0.30, 0.19, 0.70, 0.36),
+    "glasses": (0.30, 0.19, 0.70, 0.36),
+    "torso": (0.2, 0.4, 0.8, 0.85),            # 人的上半身/衣服
+    "background": (0.0, 0.0, 1.0, 1.0),        # 整图（背景类改动靠 prompt 限定）
+}
+
+
+def inpaint_model_dir() -> str:
+    """局部重绘模型的本地目录（优先本地，避免联网）。"""
+    env = os.environ.get("SD_INPAINT_DIR") or _cfg_sd("inpaint_model_dir")
+    if env:
+        return env
+    candidates = [
+        config.res("sd_inpaint"),
+        r"E:\local-multimodal-models\sdxl-inpaint",
+        r"D:\local-multimodal-models\sdxl-inpaint",
+    ]
+    for c in candidates:
+        if os.path.isdir(c) and os.path.exists(os.path.join(c, "model_index.json")):
+            return c
+    return candidates[1]
+
+
+def inpaint_ready() -> bool:
+    """局部重绘模型装好了没（装了才能做"精确微改"）。
+
+    ⚠️ 不能只看 `model_index.json` —— 下载是**边下边落盘**的，`model_index.json`
+    往往是最先到的几个小文件之一。只看它就"装好了"的话，真正加载权重时会报
+    一堆看不懂的缺文件错误（用户看到的只是"微改失败"）。所以这里**必须确认权重真在**：
+      · unet 权重（fp16 或完整的 pth 之一）
+      · text_encoder / vae 的权重
+      · 目录里不能还有 `.incomplete` 残留
+    """
+    d = inpaint_model_dir()
+    if not d or not os.path.isdir(d):
+        return False
+    if not os.path.exists(os.path.join(d, "model_index.json")):
+        return False
+    # 还有没下完的分片 → 视为没装好
+    for root, _dirs, files in os.walk(d):
+        if any(f.endswith(".incomplete") for f in files):
+            return False
+    need_any = [
+        ("unet", ("diffusion_pytorch_model.fp16.safetensors",
+                  "diffusion_pytorch_model.safetensors")),
+        ("text_encoder", ("model.fp16.safetensors", "model.safetensors",
+                          "pytorch_model.fp16.bin", "pytorch_model.bin")),
+        ("vae", ("diffusion_pytorch_model.fp16.safetensors",
+                 "diffusion_pytorch_model.safetensors")),
+    ]
+    for sub, names in need_any:
+        sd = os.path.join(d, sub)
+        if not os.path.isdir(sd):
+            return False
+        if not any(os.path.exists(os.path.join(sd, n)) for n in names):
+            return False
+    return True
+
+
+def mask_from_regions(size, regions, feather: int = 12) -> "object":
+    """按归一化矩形列表造蒙版（白=重绘）。regions=[[x0,y0,x1,y1], ...]。
+
+    ⚠️ 边沿做**羽化**（先膨胀再高斯模糊）：不羽化的话重绘区与保留区之间
+    会有一条**生硬的接缝**（实测肉眼很明显）。
+    """
+    from PIL import Image, ImageDraw, ImageFilter
+    w, h = size
+    m = Image.new("L", (w, h), 0)
+    d = ImageDraw.Draw(m)
+    for r in (regions or []):
+        try:
+            x0, y0, x1, y1 = [float(v) for v in r]
+        except Exception:
+            continue
+        # 支持两种传法：0~1 归一化，或像素坐标
+        if max(x0, y0, x1, y1) <= 1.5:
+            x0, x1 = x0 * w, x1 * w
+            y0, y1 = y0 * h, y1 * h
+        x0, x1 = sorted((x0, x1))
+        y0, y1 = sorted((y0, y1))
+        d.rectangle([int(x0), int(y0), int(x1), int(y1)], fill=255)
+    if feather > 0:
+        m = m.filter(ImageFilter.MaxFilter(3 + 2 * (feather // 8 + 1)))
+        m = m.filter(ImageFilter.GaussianBlur(max(1, feather // 3)))
+    return m
+
+
+def mask_from_area(size, area: str, feather: int = 12):
+    """按区域名（center/torso/face/lower-third…）造蒙版。认不出就整图。"""
+    key = str(area or "").strip().lower()
+    box = AREA_PRESETS.get(key)
+    if not box:
+        return None
+    return mask_from_regions(size, [list(box)], feather=feather)
+
+
+def _fit_mask(mask_img, size):
+    """把蒙版对齐到工作分辨率（用 NEAREST，避免插值把边缘糊成一团）。"""
+    from PIL import Image
+    if mask_img.size != size:
+        mask_img = mask_img.resize(size, Image.NEAREST)
+    return mask_img.convert("L")
+
+
+def _load_mask(x, size):
+    """把前端涂抹传来的蒙版（base64 / data URL / 路径 / PIL）读成 L 图并对齐尺寸。"""
+    from PIL import Image
+    if isinstance(x, Image.Image):
+        return _fit_mask(x, size)
+    if isinstance(x, (bytes, bytearray)):
+        return _fit_mask(Image.open(io.BytesIO(bytes(x))).convert("L"), size)
+    t = str(x or "").strip()
+    if t.startswith("data:") and "," in t:
+        t = t.split(",", 1)[1]
+    if os.path.isfile(t):
+        return _fit_mask(Image.open(t).convert("L"), size)
+    return _fit_mask(Image.open(io.BytesIO(base64.b64decode(t, validate=False))).convert("L"), size)
+
+
+def _load_inpaint_pipe():
+    """加载局部重绘流水线（**独立于文生图那份**，两者不会同时用）。"""
+    free_ollama_vram()
+    import torch
+    from diffusers import AutoPipelineForInpainting
+    device = _pick_device(torch)
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    d = inpaint_model_dir()
+    if os.path.isdir(d) and os.path.exists(os.path.join(d, "model_index.json")):
+        pipe, last_err = None, None
+        for variant in ("fp16", None):
+            try:
+                kw = {"torch_dtype": dtype, "local_files_only": True}
+                if variant:
+                    kw["variant"] = variant
+                pipe = AutoPipelineForInpainting.from_pretrained(d, **kw)
+                break
+            except Exception as e:
+                last_err = e
+        if pipe is None:
+            raise last_err or RuntimeError("本地重绘模型加载失败")
+    else:
+        pipe = AutoPipelineForInpainting.from_pretrained(
+            str(_cfg_sd("inpaint_model") or INPAINT_DEFAULT_REPO),
+            torch_dtype=dtype, variant="fp16" if device == "cuda" else None)
+    pipe.to(device)
+    return pipe, device
+
+
+_inpaint_pipe = None
+
+
+def _get_inpaint_pipe():
+    global _inpaint_pipe
+    if _inpaint_pipe is None:
+        _inpaint_pipe = _load_inpaint_pipe()
+    return _inpaint_pipe
+
+
+def inpaint(init_image, prompt: str, mask=None, regions=None, area: str = "",
+            negative_prompt: str = "", strength: float = 0.85,
+            steps=None, feather: int = 12) -> dict:
+    """**局部重绘**：只重画蒙版圈定的那块，其余像素原样保留。
+
+    mask     : 前端涂抹传来的蒙版（白=要改的地方）；base64 / data URL / 路径 / PIL
+    regions  : 归一化矩形列表 [[x0,y0,x1,y1], ...]（0~1），拿不到涂抹蒙版时用它
+    area     : 区域预设名（face / torso / lower-third / center / whole …）
+    strength : 蒙版内的改动幅度。**inpainting 和 img2img 不是一回事** ——
+               这里 0.85 左右才敢说"改得动"，而 1.0 ≈ 完全重画蒙版内区域。
+    返回同 edit_image（含 mask_ratio：蒙版占比，用于判断"圈得对不对"）。
+    """
+    try:
+        from PIL import Image
+        if not inpaint_ready():
+            return {"ok": False,
+                    "error": ("还没装「局部重绘」模型（精确微改要用它）。"
+                              "目录：%s —— 下载一次即可："
+                              "snapshot_download('AI-ModelScope/stable-diffusion-xl-1.0-inpainting-0.1')"
+                              % inpaint_model_dir())}
+        try:
+            src = _load_pil(init_image)
+        except Exception as e:
+            return {"ok": False, "error": "无法读取参考图片: %s" % e}
+        orig_size = src.size
+        work_w, work_h = _fit_working_size(orig_size[0], orig_size[1])
+        work = src if (work_w, work_h) == orig_size else src.resize((work_w, work_h), 3)
+        # 蒙版优先级：涂抹蒙版 > 矩形区域 > 区域预设
+        m = None
+        if mask is not None:
+            try:
+                m = _load_mask(mask, (work_w, work_h))
+            except Exception as e:
+                return {"ok": False, "error": "蒙版读不出来: %s" % e}
+        if m is None and regions:
+            m = mask_from_regions((work_w, work_h), regions, feather=feather)
+        if m is None and str(area or "").strip():
+            m = mask_from_area((work_w, work_h), area, feather=feather)
+        if m is None:
+            return {"ok": False,
+                    "error": "要重绘哪一块没说清（既没有涂抹蒙版，也没有 regions / area）"}
+        # 统计蒙版占比：太小说明没圈到，太大说明等于整图重绘 —— 都值得提醒
+        hist = m.histogram()
+        total = float(work_w * work_h) or 1.0
+        ratio = sum(i * c for i, c in enumerate(hist)) / (255.0 * total)
+        try:
+            pipe, device = _get_inpaint_pipe()
+        except Exception as e:
+            return {"ok": False, "error": "局部重绘引擎加载失败: %s" % e}
+        try:
+            ratio_s = max(0.05, min(1.0, float(strength)))
+            total_steps = max(1, math.ceil(max(1, int(steps or base_steps())) / ratio_s))
+            result = pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt or "low quality, blurry, watermark, deformed",
+                image=work,
+                mask_image=m,
+                num_inference_steps=total_steps,
+                strength=ratio_s,
+                guidance_scale=guidance(),
+            ).images[0]
+            note = ""
+            if result.size != orig_size:
+                result = result.resize(orig_size, 3)
+                note = "（在 %dx%d 上重绘后还原到 %dx%d）" % (
+                    work_w, work_h, orig_size[0], orig_size[1])
+            buf = io.BytesIO()
+            result.save(buf, format="PNG")
+            return {"ok": True, "b64": base64.b64encode(buf.getvalue()).decode("utf-8"),
+                    "device": device,
+                    "model": "inpaint-" + os.path.basename(inpaint_model_dir() or "sdxl-inpaint"),
+                    "work_size": "%dx%d" % (work_w, work_h),
+                    "mask_ratio": round(ratio, 3), "size_note": note}
+        except Exception as e:
+            return {"ok": False, "error": "局部重绘失败: %s" % e}
+    except Exception as e:            # 兜底，别把请求搞挂
+        return {"ok": False, "error": "局部重绘失败: %s" % e}
+
+
 def unload():
     """释放显存（生成后可调用，把 GPU 让回 Qwen）。"""
     import gc
-    global _pipe, _edit_pipe, _device
+    # ⚠️ 新增流水线时**必须一起加进这里** —— 忘了的话 Python 会把 `_inpaint_pipe`
+    #    当成局部变量，抛 `UnboundLocalError: cannot access local variable`，
+    #    而且是在"画完图要释放显存"这条路上炸（本测试就是这么抓到的）。
+    global _pipe, _edit_pipe, _inpaint_pipe, _device
     if _pipe is not None:
         try:
             _pipe.to("cpu")
@@ -938,6 +1202,12 @@ def unload():
         except Exception:
             pass
         _edit_pipe = None
+    if _inpaint_pipe is not None:
+        try:
+            _inpaint_pipe.to("cpu")
+        except Exception:
+            pass
+        _inpaint_pipe = None
     _device = None
     gc.collect()
     try:

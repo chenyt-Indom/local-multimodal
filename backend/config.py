@@ -163,6 +163,12 @@ DEFAULT_CONFIG = {
     #    而且 negative_prompt **完全失效**（负面词靠的正是 CFG 的反向引导）。
     #    ⇒ 要"画什么就是什么"必须换 **CFG 可用**的权重：SDXL base（原生 1024，约 6.9GB）。
     "sd_model": "stabilityai/stable-diffusion-xl-base-1.0",
+    # 局部重绘（精确微改用）：把图里**圈定的那块**重画，其余像素完全保留。
+    # ⚠️ 与 sd_model（纯 img2img）的关键区别：img2img 是**整图去噪**，没有"只改这里"
+    #    的约束 —— 实测「换衣服颜色」「加眼镜」在 0.45/0.60/0.85 全都没生效，
+    #    0.85 换背景还会把脸重画。inpainting + 蒙版才能做到"只改这一块"。
+    "inpaint_model": "AI-ModelScope/stable-diffusion-xl-1.0-inpainting-0.1",
+    "inpaint_model_dir": "",
     # 本地权重目录（离线用）。留空 = 自动探测（打包目录 / 源码本机路径）。
     # 下载好的放这儿，之后就不联网。
     "sd_model_dir": "",

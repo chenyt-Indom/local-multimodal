@@ -1280,6 +1280,10 @@ class ChatRequest(BaseModel):
     messages: list[dict]
     model: str | None = None
     images_b64: list[str] | None = None   # 附加到本轮 user 消息的图片
+    # 用户在界面上**涂抹的选区蒙版**（白色=要改的地方）：给「精确微改」用。
+    # 它**不发给对话模型**（纯黑白的图对模型没意义、还白占一千多 token），
+    # 只放进工具上下文，由 edit_image 直接取用。
+    mask_b64: list[str] | None = None
     docs: list[dict] | None = None        # 拖进来的文档：[{name, text}]
     stream: bool = True
     session_id: str | None = None         # 会话标识，用于历史会话透视归档
@@ -1650,6 +1654,16 @@ def _ask_rules(cfg: dict) -> str:
         "      · **多张图要合到一起**（「把这几张拼起来 / 拼成一张 / 做个对比图 / 拼个长图」）"
         "→ 用 **compose_images**：它做**像素级拼接**（横排/竖排/网格），接缝无缝、内容不走样；"
         "用户还要求「看起来像一张图 / 色调统一」时再给 harmonize 0.25~0.4（会轻微重绘）。\n"
+        "      · **要「只改某处、别的一律不动」**（「**把她的衣服换成深蓝**」「给她**戴上眼镜**」"
+        "「只把背景换掉、人别动」）→ 这是**精确微改**，**必须给区域**：\n"
+        "        ① 用户在界面上**涂抹过选区**时，系统会自动把蒙版传给 edit_image，"
+        "你只管写 prompt（**不用**自己填 mask）；\n"
+        "        ② 没有涂抹时，**自己给 `regions`**（矩形 [x0,y0,x1,y1]，0~1 归一化）"
+        "或 `area`（face 脸 / torso 上半身衣服 / upper-third 上三分之一 / center 等）；\n"
+        "        ③ 走这条路时 strength 要 **0.75~1.0**（inpainting 的档跟整图重画不同）。\n"
+        "        ⚠️ 实测：**不给区域、只写 prompt 是改不出来的** ——「换衣服颜色」「加眼镜」"
+        "在整图 img2img 的 0.45/0.60/0.85 三档全都没生效，而 0.85 换背景还会把脸重画。"
+        "所以别空着手让用户等，先圈区域再改。\n"
         "      · ⚠️ 但「**把 A 图里的人/物放进 B 图**」这类**智能融合做不到** —— "
         "如实告诉用户，别假装做到、更别用高 strength 硬糊（那会把人物重画变形）。"
         "要改单张就用 edit_image 逐张来。\n"
@@ -3625,6 +3639,12 @@ async def chat(req: ChatRequest):
         sys_prompt += (
             "\n\n【本轮用户附了图片，已存到本机】\n"
             + "\n".join("- %s" % p for p in attach_paths)
+            # ⚠️ 这些路径是**给工具参数用的内部路径**：实测模型会把它们当成图片地址
+            #    直接贴进回复（`![图](D:\...\chat_images\xxx.png)`）—— 用户看到一串本机
+            #    路径，而前端本来就渲染不出它。所以这里明说"别贴出来"。
+            + "\n⚠️ 上面是**内部路径**，只用来填工具参数；**不要写进回复正文**"
+              "（不要说「已保存到某个磁盘路径」，也不要写成 markdown 图片）。"
+              "回复里直接说改了什么 / 做了什么即可，图片会自动展示给用户。\n"
             + "\n按用户的说法把上面的路径填到对应参数里（**不要只描述图片内容、"
               "也不要说「我无法插入图片」** —— 路径已经给你了）：\n"
               "· 说要「放封面 / 当背景 / 做封面图」→ make_pptx 的 **cover_image**\n"
@@ -4444,6 +4464,8 @@ async def chat(req: ChatRequest):
             # shown_images：本轮已展示给用户的图，供「保存到图库」工具按序号引用
             # session：记忆按对话隔离，写记忆的工具必须知道当前是哪个对话
             ctx = {"images": images or prev_img, "shown_images": [],
+                   # ★ 用户涂抹的选区蒙版（白=要改的地方）→ 透给 edit_image 做局部重绘
+                   "mask": (list(req.mask_b64 or []) or [None])[0],
                    # 询问模式（快速/深度）—— 弹框顶部会据此显示不同提示
                    "ask_mode": str(cfg.get("ask_mode") or "quick"),
                    "session": session,

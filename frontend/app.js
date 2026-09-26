@@ -2,6 +2,11 @@
 (() => {
   const $ = (s) => document.querySelector(s);
   let images = [];          // 待发送附件 base64（含 data: 前缀）
+  // ★ 涂抹选区（精确微改）：在这张图上涂过的地方才会被重画，别处一个像素不动。
+  //   实测：整图微改（img2img）**改不准** ——「换衣服颜色」「加眼镜」在
+  //   0.45/0.60/0.85 都没生效，0.85 换背景还会把脸重画；涂选区 + 局部重绘才行。
+  let selMask = null;       // 选区蒙版（base64 PNG，无前缀；白=要改）
+  let selMaskOn = null;     // 涂在哪张图上（data URL），用于「重涂」
   let docs = [];            // 待发送文档：[{name, text, chars}]（拖进来时抽取正文）
   let videoB64 = null;      // 待发送视频帧 base64 列表
   let streaming = false;
@@ -2355,6 +2360,178 @@
     scheduleMemoryRefresh();   // 记忆提炼是后端异步防抖的，延迟补刷面板
   }
 
+  // ---------- 涂抹选区编辑器 ----------
+  const maskChip = $("#maskChip");
+  const refreshMaskChip = () => { if (maskChip) maskChip.hidden = !selMask; };
+  const clearSelMask = () => { selMask = null; selMaskOn = null; refreshMaskChip(); };
+
+  const openMaskEditor = (imgDataUrl) => {
+    const layer = document.createElement("div");
+    layer.className = "mask-editor";
+    layer.innerHTML =
+      '<div class="me-box">' +
+        '<div class="me-head">✂️ 涂抹要改的地方' +
+          '<span class="me-tip">被涂到的区域才会重画，其余部分原样保留</span></div>' +
+        '<div class="me-stage"><div class="me-wrap">' +
+          '<img src="' + imgDataUrl + '" alt="">' +
+          '<canvas></canvas>' +
+        '</div></div>' +
+        '<div class="me-bar">' +
+          '<div class="seg">' +
+            '<button type="button" data-mode="brush" class="on">🖌 涂抹</button>' +
+            '<button type="button" data-mode="rect">▭ 矩形</button>' +
+            '<button type="button" data-mode="erase">🧽 擦除</button>' +
+          '</div>' +
+          '<label>粗细 <input type="range" min="8" max="140" value="40"></label>' +
+          '<span class="me-count">已涂 0%</span>' +
+          '<span class="sp"></span>' +
+          '<button type="button" class="btn ghost" data-act="clear">清空</button>' +
+          '<button type="button" class="btn ghost" data-act="cancel">取消</button>' +
+          '<button type="button" class="btn primary" data-act="ok">就用这块区域</button>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(layer);
+
+    const img = layer.querySelector("img");
+    const cv = layer.querySelector("canvas");
+    const ctx = cv.getContext("2d");
+    const countEl = layer.querySelector(".me-count");
+    let mode = "brush", size = 40, ops = [], drawing = false, cur = null;
+
+    // 记录"画了哪些笔"（而不是只存像素）：这样擦除、清空、导出蒙版都好做
+    const init = () => {
+      const w = img.naturalWidth || 1024, h = img.naturalHeight || 1024;
+      cv.width = w; cv.height = h;
+      paint();
+    };
+    const toCv = (ev) => {
+      const r = cv.getBoundingClientRect();
+      return [ (ev.clientX - r.left) * (cv.width / (r.width || 1)),
+               (ev.clientY - r.top) * (cv.height / (r.height || 1)) ];
+    };
+    const paint = () => {
+      const w = cv.width, h = cv.height;
+      ctx.clearRect(0, 0, w, h);
+      const base = Math.max(2, size * (w / (cv.getBoundingClientRect().width || w)));
+      for (const op of ops) {
+        const isErase = op.kind === "erase";
+        ctx.globalCompositeOperation = "source-over";
+        ctx.strokeStyle = ctx.fillStyle = isErase ? "rgba(0,0,0,.75)" : "rgba(255,64,64,.55)";
+        ctx.lineWidth = Math.max(2, op.size || base);
+        ctx.lineCap = "round"; ctx.lineJoin = "round";
+        if (op.kind === "rect") {
+          ctx.beginPath();
+          ctx.rect(Math.min(op.x0, op.x1), Math.min(op.y0, op.y1),
+                   Math.abs(op.x1 - op.x0), Math.abs(op.y1 - op.y0));
+          ctx.fill();
+        } else {
+          ctx.beginPath();
+          op.pts.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])));
+          if (op.pts.length === 1) ctx.lineTo(op.pts[0][0] + .1, op.pts[0][1] + .1);
+          ctx.stroke();
+        }
+      }
+    };
+    // 导出真正的蒙版：黑底 + 白笔（擦除画黑）
+    const buildMask = () => {
+      const w = cv.width, h = cv.height;
+      const out = document.createElement("canvas");
+      out.width = w; out.height = h;
+      const o = out.getContext("2d");
+      o.fillStyle = "#000"; o.fillRect(0, 0, w, h);
+      const base = Math.max(2, size * (w / (cv.getBoundingClientRect().width || w)));
+      for (const op of ops) {
+        o.strokeStyle = o.fillStyle = op.kind === "erase" ? "#000" : "#fff";
+        o.lineWidth = Math.max(2, op.size || base);
+        o.lineCap = "round"; o.lineJoin = "round";
+        if (op.kind === "rect") {
+          o.beginPath();
+          o.rect(Math.min(op.x0, op.x1), Math.min(op.y0, op.y1),
+                 Math.abs(op.x1 - op.x0), Math.abs(op.y1 - op.y0));
+          o.fill();
+        } else {
+          o.beginPath();
+          op.pts.forEach((p, i) => (i ? o.lineTo(p[0], p[1]) : o.moveTo(p[0], p[1])));
+          if (op.pts.length === 1) o.lineTo(op.pts[0][0] + .1, op.pts[0][1] + .1);
+          o.stroke();
+        }
+      }
+      // 顺带算一下覆盖率，让用户知道"涂够没涂够"
+      let on = 0;
+      const px = o.getImageData(0, 0, w, h).data;
+      for (let i = 0; i < px.length; i += 4 * 7) { if (px[i] > 127) on++; }
+      return { url: out.toDataURL("image/png"),
+               ratio: on / Math.max(1, (px.length / (4 * 7))) };
+    };
+
+    const updateCount = () => {
+      const m = buildMask();
+      countEl.textContent = "已涂 " + Math.round(m.ratio * 100) + "%";
+      if (m.ratio < 0.002 && ops.length) countEl.textContent += "（太少了，再涂一点）";
+    };
+    const stopDrag = () => {
+      if (!drawing) return;
+      drawing = false;
+      if (cur && cur.kind === "brush" && cur.pts.length === 1) { ops.push(cur); }
+      cur = null; paint(); updateCount();
+    };
+    cv.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      cv.setPointerCapture && cv.setPointerCapture(ev.pointerId);
+      const [x, y] = toCv(ev);
+      drawing = true;
+      if (mode === "rect") cur = { kind: ops.length && ev.shiftKey ? "erase" : "rect", x0: x, y0: y, x1: x, y1: y, size: 4 };
+      else cur = { kind: mode === "erase" ? "erase" : "brush", size: size * (cv.width / (cv.getBoundingClientRect().width || cv.width)), pts: [[x, y]] };
+      paint();
+    });
+    cv.addEventListener("pointermove", (ev) => {
+      if (!drawing || !cur) return;
+      const [x, y] = toCv(ev);
+      if (cur.kind === "rect") { cur.x1 = x; cur.y1 = y; }
+      else cur.pts.push([x, y]);
+      paint();
+    });
+    cv.addEventListener("pointerup", (ev) => {
+      if (cur && cur.kind === "brush") ops.push(cur);
+      else if (cur && cur.kind === "erase" && cur.pts) ops.push(cur);
+      if (cur && cur.kind === "rect") ops.push(cur);
+      cur = null; drawing = false; paint(); updateCount();
+    });
+    cv.addEventListener("pointerleave", stopDrag);
+
+    layer.querySelectorAll(".seg button").forEach((b) => {
+      b.onclick = () => {
+        mode = b.dataset.mode;
+        layer.querySelectorAll(".seg button").forEach((x) => x.classList.toggle("on", x === b));
+      };
+    });
+    layer.querySelector('input[type=range]').oninput = (e) => { size = +e.target.value; };
+    const close = () => { layer.remove(); };
+    layer.querySelector('[data-act="cancel"]').onclick = close;
+    layer.querySelector('[data-act="clear"]').onclick = () => { ops = []; paint(); updateCount(); };
+    layer.querySelector('[data-act="ok"]').onclick = () => {
+      const m = buildMask();
+      if (m.ratio < 0.002) { showToast("还没涂到东西 —— 在图上涂一块再确认", "warn"); return; }
+      selMask = m.url.split(",")[1];
+      selMaskOn = imgDataUrl;
+      refreshMaskChip();
+      close();
+      showToast("已选好区域，接着说要改成什么（例如「换成深蓝色」）", "ok");
+    };
+    layer.onclick = (e) => { if (e.target === layer) close(); };
+    if (img.complete) init(); else img.onload = init;
+  };
+
+  if (maskChip) {
+    const editBtn = $("#maskEditBtn"), clearBtn = $("#maskClearBtn");
+    if (editBtn) editBtn.onclick = () => {
+      if (selMaskOn) openMaskEditor(selMaskOn);
+      else showToast("先在图片上点「✂️ 涂抹选区」再来重涂", "warn");
+    };
+    if (clearBtn) clearBtn.onclick = () => { clearSelMask(); showToast("已清除选区", ""); };
+  }
+  refreshMaskChip();
+
   async function doSend(promptText, mediaB64, docPayload) {
     history.push({ role: "user", content: promptText });
 
@@ -2891,10 +3068,16 @@
           ui.source ? `<a href="${ui.source}" target="_blank" rel="noopener">来源页</a> · ` : ""}${
           ui.device ? "🖥 " + ui.device + " " : ""}${ui.cost_s ? "⏱ " + ui.cost_s + "s" : ""}${
           ui.size ? " · " + ui.size : ""}</div>
-        <div class="media-actions"><button class="btn sm ghost lib-save">⭐ 保存到图库</button></div>`;
+        <div class="media-actions"><button class="btn sm ghost lib-save">⭐ 保存到图库</button>
+          <button class="btn sm ghost mask-pick" title="在这张图上涂一下，之后只改涂过的地方（比整图微改准得多）">✂️ 涂抹选区</button></div>`;
       card.querySelector("img").onclick = (e) => {
         e.stopPropagation();
         showLightbox(mime, b64, badge + (caption ? "：" + caption : ""));
+      };
+      const pick = card.querySelector(".mask-pick");
+      if (pick) pick.onclick = (e) => {
+        e.stopPropagation();
+        openMaskEditor("data:" + mime + ";base64," + b64);
       };
       const btn = card.querySelector(".lib-save");
       btn.onclick = async (e) => {
@@ -2974,6 +3157,8 @@
       const resp = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" },
         signal: abortCtl.signal,
         body: JSON.stringify({ messages: history, images_b64: mediaB64,
+                               // ★ 涂抹选区（若有）：后端据此走"局部重绘"，只改涂过的地方
+                               mask_b64: selMask ? [selMask] : null,
                                docs: (docPayload && docPayload.length) ? docPayload : null,
                                // 在开发台里说话 = 就是在写代码 → 后端**直接接入编程模型**，
                                // 不再靠关键词猜意图（用户："自动接入编程的模型"）

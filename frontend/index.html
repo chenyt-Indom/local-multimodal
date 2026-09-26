@@ -226,6 +226,13 @@
         <span class="v-level" id="voiceLevel" title="麦克风电平：说话时应当跟着跳；一直不动说明没采到声音（麦克风选错 / 系统静音）"><i></i></span>
         <select class="v-dev" id="voiceDev" title="换一个麦克风（换完自动重新开始监听）"></select>
       </div>
+      <!-- 涂抹选区：图上涂一下，就只改涂过的地方，别处一个像素不动 -->
+      <div class="mask-chip" id="maskChip" hidden>
+        <span class="mc-ico">✂️</span>
+        <span class="mc-txt">已选好「要改的区域」——发消息时只改这里，别处保持原样</span>
+        <button class="mc-btn" id="maskEditBtn" type="button">重涂</button>
+        <button class="mc-btn" id="maskClearBtn" type="button">清除</button>
+      </div>
       <div class="input-row">
         <button class="icon-btn" id="attachBtn" title="上传图片">🖼</button>
         <button class="icon-btn" id="docBtn" title="上传文档（PDF / Word / Excel / PPT / txt 等，也可以直接拖进来）">📎</button>

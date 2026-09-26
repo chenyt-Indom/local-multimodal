@@ -60,10 +60,23 @@ def _dir_datas(src_root, dst_root, skip_suffixes=()):
     return out
 
 
-# 跳过 sd_turbo.safetensors.incomplete（未下载完的残片，约 693MB）
-_SD_ROOT = r"D:\local-multimodal-models\sd-turbo"
+# ⚠️ 路径要跟着"当前用的权重"走（2026-09-26 校正）：
+#   这里原来还指着 sd-turbo（SD2.1 蒸馏版），而实际用的早已换成 SDXL base。
+#   留着旧路径的后果：打包出来的 exe 里塞的是**过期权重**，画质与预期对不上，
+#   还会让人以为"代码没生效"。
+#   跳过 *.incomplete（没下完的残片，否则会把半个文件塞进包里）。
+_SD_ROOT = r"E:\local-multimodal-models\sdxl-base"           # 文生图 / 整图微改
+_INPAINT_ROOT = r"E:\local-multimodal-models\sdxl-inpaint"    # 局部重绘（精确微改）
 all_datas += _dir_datas(os.path.join(root, "frontend"), "frontend")
-all_datas += _dir_datas(_SD_ROOT, "sd_model", skip_suffixes=(".incomplete",))
+if os.path.isdir(_SD_ROOT):
+    all_datas += _dir_datas(_SD_ROOT, "sd_model", skip_suffixes=(".incomplete",))
+# 局部重绘模型（约 6.5GB）：缺了它"只在指定区域重绘"就用不了，
+# 但**不影响**文生图/整图微改 —— 所以缺了只提示，不报错。
+if os.path.isdir(_INPAINT_ROOT):
+    all_datas += _dir_datas(_INPAINT_ROOT, "sd_inpaint", skip_suffixes=(".incomplete",))
+else:
+    print("[spec] 提示：没找到局部重绘权重 %s —— 打包后「涂抹选区精确微改」将不可用"
+          % _INPAINT_ROOT)
 
 # —— 语音识别模型（离线唤醒词 + 流式识别，约 78MB）——
 _ASR_ROOT = r"D:\local-multimodal-models\sherpa-asr"

@@ -863,6 +863,12 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
             "function": {
                 "name": "edit_image",
                 "description": "对一张已有图片做**局部**修改（图生图），如「把背景改成夜晚」「戴上帽子」。\n"
+                               "⚠️ **要「只改这里、别的一律不动」时**：必须给 `regions`（矩形）"
+                               "或 `area`（预设名），或者让用户在界面上涂抹选区（系统会自动"
+                               "把蒙版传进来）—— 这时走的是**局部重绘（inpainting）**，"
+                               "圈外像素原样保留。**只写 prompt 不带区域**时走的是整图 img2img："
+                               "实测「换衣服颜色」「加眼镜」在 0.45/0.60/0.85 都**改不出来**，"
+                               "所以精确改元素**一定要给区域**，别空着手让用户等。\n"
                                "⚠️ 这是「改现成的图」，**不是重画**：改动之外的构图/主体/光线应当保持原样。\n"
                                "source 填本地路径；**若用户本轮拖入的图、或刚才生成/微改的那张要改，"
                                "就不用填 source**（系统会自动拿「最近那张图」当底图）——"
@@ -884,9 +890,36 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
                         "negative_prompt": {
                             "type": "string",
                             "description": "英文负面描述，可选，例如 'low quality, blurry, distorted'"},
+                        "mask": {
+                            "type": "string",
+                            "description": "（可选）**用户涂抹的蒙版**（白色=要改的地方）。"
+                                           "用户在界面上涂完选区再提要求时，系统会**自动**把它"
+                                           "传进来，**你不用填**。"},
+                        "regions": {
+                            "type": "array",
+                            "description": "（可选）要重绘的**矩形区域**列表，每项 "
+                                           "[x0,y0,x1,y1]，0~1 归一化（左上为原点）。"
+                                           "⚠️ **用户要「只改某处、别的一律不动」时必须给这个**"
+                                           "（或等用户涂抹）—— 否则改出来的位置和幅度都不受控。"
+                                           "例：人像换衣服颜色 → [[0.2,0.4,0.8,0.85]]；"
+                                           "换背景 → 先试 [[0.0,0.0,1.0,0.45]]（上半）。"},
+                        "area": {
+                            "type": "string",
+                            "description": "（可选）区域预设名，懒得分框就用它："
+                                           "**eyes（眼周，加眼镜/改表情用它）** / face 面部 / "
+                                           "torso 上半身（衣服）/ "
+                                           "upper-third, middle-third, lower-third 上中下三分之一 / "
+                                           "left, right, center / whole 整图。"
+                                           "⚠️ 实测提醒：框**别贪大** ——「加眼镜」用 face 会把"
+                                           "头发和眼睛一起重画（镜片后出乱纹），改用 eyes 一次就干净；"
+                                           "「换衣服颜色」框太大时模型可能改的是内衬而不是外衣，"
+                                           "**要最准就请用户在界面上涂一块**（涂抹最准）。"},
                         "strength": {
                             "type": "number",
-                            "description": "修改幅度 0~1，**默认 0.5**。"
+                            "description": "修改幅度 0~1，**默认 0.5**（走整图 img2img 时）。"
+                                           "⚠️ 若给了 mask / regions / area（走**局部重绘**），"
+                                           "这个值的含义不同：**0.75~1.0** 才是能真改动的档"
+                                           "（0.85 常用，1.0 ≈ 蒙版内完全重画）。"
                                            "⚠️⚠️ **实测结论（2026-09-26，同一张写实人像逐档试过）**："
                                            "当前底模（SDXL base，纯图生图、没有蒙版）**做不到"
                                            "「精确改动某个元素」** ——\n"
@@ -2272,6 +2305,53 @@ def _do_edit_image(arguments, ui_events, context):
         return ("错误：无法确定要修改的图片。请把要改的图片拖入对话（作为本轮附件）后再让我微改，"
                 "或通过 source 指定本地图片路径。")
 
+    # 1.5) ★ 精确微改：给了蒙版 / 区域就走**局部重绘**（圈外像素原样保留）
+    #    ⚠️ 实测：纯图生图（无蒙版）**做不到精确改元素** ——「换衣服颜色」「加眼镜」
+    #    在 0.45/0.60/0.85 全都没生效。所以只要用户要的是"只改某处"，就必须走这条路。
+    _mask = arguments.get("mask") or (context or {}).get("mask") or ""
+    _regions = arguments.get("regions") or []
+    if isinstance(_regions, dict):
+        _regions = [_regions]
+    _area = str(arguments.get("area") or "").strip()
+    if _mask or _regions or _area:
+        if not t2i.inpaint_ready():
+            return ("错误：这次是**精确微改**（只改指定区域），需要「局部重绘」模型，"
+                    "但它还没装好（目录 %s）。请把这句话**原样**转告用户，"
+                    "并说明装上后就能做到「只换衣服颜色、别的一律不动」。"
+                    % t2i.inpaint_model_dir())
+        _style_pos2, _style_neg2 = _style_for(prompt)
+        _keep2 = "keep everything outside the edited area exactly unchanged"
+        _boost2 = ", ".join(x for x in (prompt, _keep2, _style_pos2) if x)
+        _neg2 = ", ".join(x for x in (negative, _style_neg2) if x)
+        # 重绘的幅度档跟 img2img 不一样：蒙版内要真改得动，0.85 起步
+        _st2 = float(arguments.get("strength") or 0.0)
+        if _st2 < 0.5:
+            _st2 = 0.85
+        t2i.unload()
+        _start2 = time.time()
+        _r2 = t2i.inpaint(init_image, _boost2, mask=(_mask or None),
+                          regions=(_regions or None), area=_area,
+                          negative_prompt=_neg2, steps=t2i.base_steps(),
+                          strength=_st2)
+        _cost2 = time.time() - _start2
+        if not _r2.get("ok"):
+            return ("局部重绘失败：%s。请把冒号后的具体原因**原样**转告用户。"
+                    % _r2.get("error"))
+        _ui(ui_events, {"type": "image", "mime": "image/png", "b64": _r2["b64"],
+                        "prompt": "局部重绘：" + prompt, "device": _r2.get("device"),
+                        "model": _r2.get("model"), "cost_s": round(_cost2, 1),
+                        "origin": "edit"})
+        _mr = _r2.get("mask_ratio")
+        _warn = ""
+        if _mr is not None and _mr < 0.01:
+            _warn = "（⚠️ 圈选区域太小了，画面几乎没变 —— 建议把区域放大一点再来一次）"
+        elif _mr is not None and _mr > 0.9:
+            _warn = "（ℹ️ 这次区域几乎是整张图，等效于重新画一版）"
+        return ("已按**指定区域**重绘（圈外像素原样保留，用 %.1f 秒%s）%s。"
+                "图片已展示给用户。若还要调整，直接说新的要求即可，不用重新涂抹。"
+                % (_cost2, "，区域占比 %.0f%%" % (_mr * 100) if _mr is not None else "",
+                   _warn))
+
     # 2) 提示措辞：**第一位是"别动原图"** —— 用户报"微改歪曲原图"，
     #    除了分辨率那条（已在 t2i 里修），措辞上也要把"保持构图/光线/其余不变"说死。
     #    ⚠️ 注意别再追加通用摄影加成：微改的底图可能是插画，硬加"professional photography"
@@ -2293,8 +2373,13 @@ def _do_edit_image(arguments, ui_events, context):
                     "prompt": "微改：" + prompt, "device": result.get("device"),
                     "model": result.get("model"), "cost_s": round(cost, 1),
                     "origin": "edit"})   # ← 前端据此标「AI 微改」（原来没标，显示成"图片"）
+    _hint = ""
+    if strength >= 0.6:
+        _hint = ("\n⚠️ 提醒：这次是**整图重绘**（没给区域），实测「换颜色/加某个物件」这类"
+                 "精确改动**可能看不出来**。若用户要的是「只改某处、别的一律不动」，"
+                 "**改用 regions / area 再试一次**（能真改到，圈外也不动）。")
     return (f"已根据修改要求生成新图（用 {round(cost,1)} 秒）。原图已按描述微改并展示给用户。"
-            f"若还要继续调整，**直接说明新的修改点即可**，不用再拖一次图。")
+            f"若还要继续调整，**直接说明新的修改点即可**，不用再拖一次图。{_hint}")
 
 
 def _do_compose_images(arguments, ui_events, context):
