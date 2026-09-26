@@ -1066,6 +1066,21 @@
   }
 
   // ---------- 状态检测 ----------
+  // 「模型版本 + 参数大小」**一律从后端现读**（后端再去问 Ollama 的 /api/tags），
+  // 前端一个模型名都不写死 —— 用户 2026-09-26 明确要求：
+  // 界面显示的模型版本与参数大小要跟着最新的走（换模型后自动变，不用改前端）。
+  function fmtModel(info) {
+    if (!info) return "";
+    // 名 · 参数量 · 量化档 · 体积，缺哪个就跳哪个（别显示成 "· · ·"）
+    return [info.name, info.parameter_size, info.quantization_level, info.size_text]
+      .filter((x) => x && String(x).trim()).join(" · ");
+  }
+  // 家族名 → 好看的大写写法（deepseek → DeepSeek，而不是 Deepseek）
+  const MODEL_BRANDS = {
+    qwen: "Qwen", deepseek: "DeepSeek", llama: "Llama", gemma: "Gemma",
+    glm: "GLM", mistral: "Mistral", phi: "Phi",
+  };
+
   async function refreshHealth() {
     try {
       const d = await api("/api/health");
@@ -1078,6 +1093,36 @@
         dot.className = "dot off";
         t.textContent = "Ollama 未运行";
         det.textContent = "请先启动 ollama serve";
+      }
+      // ---- 模型信息那一行（用户能一眼确认自己到底在用哪个模型）----
+      const mi = $("#modelInfo");
+      if (mi) {
+        // ⚠️ 区分两种"没有信息"：**连不上** vs **真的没下载**。
+        //    连不上时写"（未下载）"是错的 —— 模型明明装着，只是没启动 Ollama。
+        const online = d.online !== false;
+        const bits = [];
+        const main = fmtModel(d.model_info);
+        if (main) bits.push("对话 " + main);
+        else if (d.model) bits.push("对话 " + d.model + (online ? "（未下载）" : ""));
+        if (d.code_model) {
+          // 就绪标记以 code_model_ready 为准（它是后端明确的结论），
+          // 有它就一定有 code_model_info
+          if (d.code_model_ready) bits.push("代码 " + fmtModel(d.code_model_info));
+          else bits.push("代码 " + d.code_model + (online ? "（未下载，暂用默认模型）" : ""));
+        }
+        mi.textContent = bits.join("　|　");
+        mi.title = bits.join("\n");
+      }
+      // ---- 左上角那句"XX 智能体"也按实际模型推导（原来写死 Qwen，换模型就说错了）----
+      const bs = $("#brandSub");
+      if (bs) {
+        const nm = String(d.model || "").toLowerCase();
+        const fam = String((d.model_info && d.model_info.family) || "").toLowerCase();
+        let brand = "";
+        for (const k of Object.keys(MODEL_BRANDS)) {
+          if (nm.includes(k) || fam.includes(k)) { brand = MODEL_BRANDS[k]; break; }
+        }
+        bs.textContent = (brand ? brand + " " : "本地") + "智能体 · 数据不出机";
       }
     } catch { /* 后端未就绪时忽略 */ }
   }

@@ -28,20 +28,72 @@ class OllamaClient:
         return resp
 
     # ---------- 健康检查 ----------
+    @staticmethod
+    def _brief(model: dict | None) -> dict | None:
+        """把 Ollama 报的一个模型，摘成界面要显示的「版本 + 参数规模」。
+
+        ⚠️ 2026-09-26 加。**必须有这个**：以前界面只显示"模型就绪/未下载"，
+        连自己在用哪个模型、多大参数都看不到 —— 换过模型（sd-turbo→SDXL、
+        qwen2.5-coder→qwen3-coder）之后用户无从确认到底生效了没有。
+        这里一律**从 Ollama 现读**（`/api/tags` 的 details），不写死任何名字，
+        所以以后不管换成什么模型，界面显示的都会自动跟着变。
+        """
+        if not model:
+            return None
+        det = model.get("details") or {}
+        size = model.get("size") or 0
+        return {
+            "name": str(model.get("name") or ""),
+            # 参数规模（Ollama 报的 8.8B / 30.5B 这种）
+            "parameter_size": str(det.get("parameter_size") or ""),
+            # 量化档（Q4_K_M …）—— 直接决定它多大、多准
+            "quantization_level": str(det.get("quantization_level") or ""),
+            # 架构家族（qwen3vl / qwen3moe …），MoE 与 dense 一眼可分
+            "family": str(det.get("family") or ""),
+            "families": det.get("families") or [],
+            "size_bytes": size,
+            "size_text": ("%.1f GB" % (size / 1e9)) if size else "",
+        }
+
     def health(self) -> dict:
-        """返回 Ollama 是否在线、默认模型是否已下载。"""
+        """返回 Ollama 是否在线、默认模型是否已下载，**以及实际模型的版本与参数规模**。"""
         online = False
         try:
             self._req("GET", "/api/version").json()
             online = True
         except OllamaError:
             online = False
-        model_ready = False
+
+        cfg = config.load_config()
+        default = str(cfg.get("default_model") or "")
+        code_model = str(cfg.get("code_model") or "").strip()
+
+        models: list = []
         if online:
-            installed = [m["name"] for m in self.list_models()]
-            model_ready = config.load_config()["default_model"] in installed
-        return {"online": online, "model_ready": model_ready,
-                "model": config.load_config()["default_model"]}
+            try:
+                models = self.list_models()
+            except OllamaError:
+                models = []
+        by_name = {str(m.get("name") or ""): m for m in models}
+
+        def _ready(name: str) -> bool:
+            # 允许"只写了仓库名没写 tag"的情况（Ollama 会补 :latest）
+            return bool(name) and (name in by_name or (name + ":latest") in by_name)
+
+        return {
+            "online": online,
+            "model_ready": _ready(default),
+            "model": default,
+            # 界面把这两段直接显示出来（模型名 · 参数量 · 量化 · 体积）
+            "model_info": self._brief(by_name.get(default) or by_name.get(default + ":latest")),
+            "code_model": code_model,
+            "code_model_ready": _ready(code_model) if code_model else False,
+            "code_model_info": (self._brief(by_name.get(code_model)
+                                            or by_name.get(code_model + ":latest"))
+                                if code_model else None),
+            # 本机装了哪些（界面的"还没下载 xxx"提示要用）
+            "installed": sorted(by_name.keys()),
+        }
 
     # ---------- 模型管理 ----------
     def list_models(self) -> list:

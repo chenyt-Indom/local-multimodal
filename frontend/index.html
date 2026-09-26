@@ -14,7 +14,10 @@
       <div class="logo">◉</div>
       <div>
         <h1>本地多模态</h1>
-        <p class="sub">Qwen 智能体 · 数据不出机</p>
+        <!-- ⚠️ 这里原来写死「Qwen 智能体」。换模型（比如换成 DeepSeek / Llama）之后
+             这句话就成了错的 —— 所以改成**按本机实际模型推导**，见 app.js 的 refreshHealth()。
+             默认文案是"认不出来时的兜底"，不含任何模型名。 -->
+        <p class="sub" id="brandSub">本地智能体 · 数据不出机</p>
       </div>
     </div>
 
@@ -23,6 +26,10 @@
       <div>
         <b id="statusTitle">检测中…</b>
         <p id="statusDetail">正在连接本地模型</p>
+        <!-- 实际在用的模型：**从 Ollama 现读**（名 / 参数量 / 量化 / 体积），
+             不写死 —— 换模型后这里自动跟着变，用户能一眼确认到底生效了没有。
+             内容由 refreshHealth() 填，见 app.js。 -->
+        <p id="modelInfo" class="model-info"></p>
       </div>
     </div>
 
@@ -189,7 +196,7 @@
       <button type="button" class="pill pill-btn" id="amapKeyBtn" title="填高德开放平台的 key —— 填了地图能搜到全国的小店、有真实评分和实时路况。不填也能用，只是退回 OpenStreetMap（数据弱一些）" onclick="window.__showAmapKey&&window.__showAmapKey()">高德 key</button>
       <button type="button" class="pill pill-btn" id="sampleBtn" title="调「温度」和「采样范围 top-p」—— 拖完立刻生效（不用重启），旁边写着建议值" onclick="window.__showSampling&&window.__showSampling()">🎛 采样</button>
       <label class="pill" data-cfg="auto_memorize"><i class="sw"></i>自动记忆</label>
-      <label class="pill" data-cfg="code_auto_route" title="写代码或写长文时，自动换用专用模型（qwen2.5-coder，非思考型，更稳更快）"><i class="sw"></i>专用模型</label>
+      <label class="pill" data-cfg="code_auto_route" title="写代码时自动换用专用代码模型（非思考型，更稳更快）。具体用哪个、多少参数、多大体积，看左侧状态栏那行模型信息 —— 那里是从本机现读的，没下载时会自动回退到默认模型"><i class="sw"></i>专用模型</label>
       <label class="pill" data-cfg="code_exec_enabled" title="让模型在本机真跑 Python 把结果算出来（默认关闭；开启后模型写的代码会在你电脑上执行）"><i class="sw"></i>本地算代码</label>
       <!-- 询问方式：**一个按钮**，按钮上直接显示当前选的是哪种，点开可切换。
            ⚠️ 故意**不加 data-cfg** —— 那条规则会把 .pill[data-cfg] 当成布尔开关处理
