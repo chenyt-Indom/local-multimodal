@@ -27,6 +27,12 @@ ARG TORCH_VER=2.14.0
 ARG TORCHVISION_VER=0.29.0
 # pip 源，默认官方；国内可传 --build-arg PIP_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG PIP_INDEX=https://pypi.org/simple
+# ⚠️ apt 源。**国内不换会在这一步卡死**（2026-09-27 实测）：
+#    默认的 deb.debian.org 在国内拉 trixie 主索引要重试几十秒到几分钟，
+#    现象是构建停在第 3 步「apt-get update」上、磁盘零增长，看起来像卡住了。
+#    传空值（默认）就保持 Debian 官方源，海外机器不受影响。
+#    例：--build-arg APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+ARG APT_MIRROR=""
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -39,7 +45,12 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /opt/app
 
 # 运行期系统依赖：curl 供健康检查，libgl1/libglib2.0-0 供 OpenCV/Pillow 处理图像
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# APT_MIRROR 非空时先把 sources.list 换到国内镜像再 update（见上面 ARG 的说明）。
+RUN if [ -n "${APT_MIRROR}" ]; then \
+        sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
+        sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list 2>/dev/null || true; \
+    fi \
+    && apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl libgl1 libglib2.0-0 tzdata \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*

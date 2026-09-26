@@ -12,9 +12,16 @@ dist-lite/
 releases/
 
 # ---------- Python ----------
-__pycache__/
-*.pyc
-*.pyo
+# ⚠️⚠️ 必须带 `**/` 前缀（2026-09-27 实测踩到）：
+#    Docker 的 .dockerignore 用的是 Go 的 filepath.Match 语义 ——
+#    `__pycache__/` **只匹配上下文根目录**下的那一层，`backend/__pycache__/` 照样会被 COPY 进去。
+#    实测后果：镜像里躺着 55 个垃圾文件（backend/__pycache__/ 下 3.13/3.14 编译的 .pyc
+#    共 50 个 + 5 个 .bak），而发版检查清单要求是 **0 个**。
+#    .pyc 还是**本机 Python 版本的**（3.13/3.14），容器跑的是 3.12，纯属白占体积。
+#    同理：`*.pyc` / `*.bak` 这种不带路径的模式也只匹配根目录。
+**/__pycache__/
+**/*.pyc
+**/*.pyo
 .venv/
 venv/
 
@@ -30,12 +37,15 @@ docker/data/
 # ---------- 残留 / 临时文件 ----------
 # 改代码前留的备份（如 frontend/app.js.bak-devdesk）绝不能进镜像：
 # 它会被 COPY frontend/ 一起打进去，白白增大体积还容易让人看错文件。
-*.bak
-*.bak-*
-*.orig
-*.incomplete
-*.tmp
-*.log
+# ⚠️ 同样必须带 `**/`：实测生成的备份在 `backend/main.py.bak`、`frontend/app.js.bak`
+#    这类**子目录**里，不带前缀一条都拦不住。
+**/*.bak
+**/*.bak-*
+**/*.bak_*
+**/*.orig
+**/*.incomplete
+**/*.tmp
+**/*.log
 
 # ---------- 模型权重 ----------
 # 模型体积达 12GB，作为独立构建上下文（--build-context models=./models）单独传入，
