@@ -8,6 +8,7 @@
 """
 import base64
 import io
+import json
 import math
 import os
 import threading
@@ -588,8 +589,21 @@ def rewarm_async() -> None:
                     _hit(m, keep)
                     _log_timing("画完把对话模型热回显存", time.time() - _t_w,
                                 extra="模型=%s（后台线程，不影响用户）" % m)
-                except Exception:
-                    _log_timing("画完预热失败", time.time() - _t_w, extra="模型=%s" % m)
+                except Exception as exc:
+                    # ⚠️⚠️ 必须把**失败原因**记下来（2026-09-27 补）。
+                    #   之前只记"失败 + 耗时"，实测打出 `画完预热失败: 0.0s`
+                    #   —— 0.0 秒说明是请求**当场被拒**，可光看这行根本查不出是谁拒的
+                    #   （是显存不够？Ollama 正忙？参数不对？），等于白记。
+                    #   顺手把服务端的原话抓出来：Ollama 的 400 里会写明原因。
+                    _detail = ""
+                    try:
+                        if hasattr(exc, "read"):
+                            _detail = " 服务端=%s" % exc.read()[:300].decode("utf-8", "replace")
+                    except Exception:
+                        pass
+                    _log_timing("画完预热失败", time.time() - _t_w,
+                                extra="模型=%s 错误=%s: %s%s"
+                                      % (m, type(exc).__name__, str(exc)[:150], _detail))
         finally:
             _REWARM_INFLIGHT = False
 
