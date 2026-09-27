@@ -90,6 +90,10 @@ _MAKE_PPTX_SCHEMA = {
             '`{"op":"add_slide","slide_spec":{...和这里的一页同格式...}}`，'
             "**每次补 1~2 页**，逐次累加；\n"
             "   · 这样每份 JSON 都短，**页数和内容量都不会缩水**，也不会把整轮搭进去。\n"
+            "⚠️⚠️ **硬性上限**（2026-09-28 又踩到一次）：不管用户要几页、内容多复杂，"
+            "**单次 make_pptx / edit_office 调用的 slides 数组都不许超过 4 页**；"
+            "用户要 6 页就 4+2，要 10 页就 4+2+2+2。"
+            "页数越多越要拆细 —— 宁可多调用几次，也不要让整轮因为一个超长 JSON 全废。\n"
             "· 每页用 layout 选版式（不写就按内容自动判断）：\n"
             "  content 标题+要点(默认) / two_col 左右两栏(用 left/right，可配 left_title/right_title)\n"
             "  / image_right|image_left 图文并排 / image_full 整页大图\n"
@@ -752,9 +756,20 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
         # 其余工具（画图、搜图、文件系统、跑代码…）这轮根本用不上。
         # 砍掉它们的收益很实在：18 个工具的 schema ≈ 5800 token，
         # 而长文生成既要思考又要写几百上千字，额度本来就很紧张。
+        #
+        # ⚠️⚠️ 2026-09-27 修：**联网工具必须留下**（用户报"写产品介绍时不联网就动笔"）。
+        #   长文里最容易出错的恰恰是**事实**：产品参数、公司背景、行业现状、
+        #   政策条款、专业术语、生僻概念 —— 凭记忆写就是在编。
+        #   原来这里把 web_search 一起砍掉了，模型**连工具都看不到**，
+        #   所以它不是"不肯搜"，是**根本没法搜**。
+        #   代价实测很小：web_search 303 + web_read 152 = **455 token**。
         picked = [_ask_user_schema(ask_mode), _LIBRARY_SCHEMA]
         if kb_enabled:
             picked.insert(0, _KB_SCHEMA)      # 写东西时查用户资料是常见需求
+        if web_enabled:
+            # web_read 一起给：搜索只给摘要，写专业内容常要点进官网看正文。
+            picked.extend([_WEB_SEARCH_SCHEMA, _WEB_READ_SCHEMA])
+            picked.append(_WEATHER_SCHEMA)    # 写"出行建议/活动方案"要用真实天气
         return picked
     # ⚠️⚠️ office=True 必须**绕过上面那个精简分支**（2026-09-25 修）。
     #   用户的请求常常同时命中"写作"和"办公产物"：
@@ -763,7 +778,9 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
     #     模型只能把内容写成一大段文字，用户根本拿不到 PPT。
     #   这是"复杂内容的 PPT 做不出来"的直接原因，所以这里要**优先保住生成工具**：
     #     留 make_pptx / make_docx / make_xlsx / edit_office + 文库 + 问细节，
-    #     其余（画图、地图、文件系统、跑代码、联网…）照旧砍掉，省下的额度给长输出。
+    #     其余（画图、地图、文件系统、跑代码…）照旧砍掉，省下的额度给长输出。
+    # ⚠️ 2026-09-27 补：**联网与天气也保留** —— 做 PPT/Word/Excel 经常要先查资料
+    #   （产品参数、行业数据、活动当天的天气），砍掉它们就只能凭记忆编内容。
     if office_gen:
         # ⚠️⚠️ 触发场景：**办公任务重试**时（见 main.py 的空回答重试）。
         #   原来的重试统一换成"写作精简集"（writing=True），而那个集合里
@@ -779,6 +796,9 @@ def make_schemas(web_enabled: bool = False, kb_enabled: bool = False,
                  "library", "ask_user"}
         if kb_enabled:
             _keep.add("search_knowledge")
+    if office or office_gen:
+        if web_enabled:
+            _keep.update({"web_search", "web_read", "get_weather"})
     schemas = [
         {
             "type": "function",
