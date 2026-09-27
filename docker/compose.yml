@@ -32,7 +32,10 @@ services:
     environment:
       # 直连模式指向宿主机；自带模式由 .env 覆盖为 http://ollama:11434
       MM_OLLAMA_URL: ${MM_OLLAMA_URL:-http://host.docker.internal:11434}
-      MM_MODEL: ${MM_MODEL:-qwen3-vl:8b}
+      # ⚠️ 这里的默认值要跟 config.py 的 DEFAULT_CONFIG.default_model 保持一致。
+      #    以前写的是 qwen3-vl:8b（上一代模型）—— 用户一旦删掉 data\ 让它重新初始化，
+      #    应用就会去找一个**根本不存在**的模型（2026-09-27 修）。
+      MM_MODEL: ${MM_MODEL:-qwen3-vl-think:30b}
       MM_DATA_DIR: /data
       # 宿主机的 data 目录实际位置（由部署脚本写入 .env）。
       # 容器里点「打开文件夹」打不开宿主机资源管理器，用这个路径提示用户。
@@ -82,7 +85,7 @@ services:
     environment:
       OLLAMA_HOST: 0.0.0.0
       OLLAMA_MODELS: /root/.ollama/models
-      OLLAMA_KEEP_ALIVE: 30m                          # 模型常驻显存，避免反复加载
+      OLLAMA_KEEP_ALIVE: 4h                           # 与 config.json 的 model_keep_alive 对齐（30B 冷加载要 20 秒，短保活等于反复重载）
     volumes:
       # 直接挂载包内已下好的模型，零下载；Ollama 需要写权限（拉取/校验时）
       - ./models/ollama:/root/.ollama/models

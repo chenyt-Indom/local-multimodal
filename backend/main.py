@@ -4679,6 +4679,60 @@ async def chat(req: ChatRequest):
             for ui in ui_events:
                 yield json.dumps({"ui": ui}) + "\n"
 
+        else:
+            # ★★ for 没被 break 打断 = **工具轮次用满**，任务没收尾就退场了。
+            #   2026-09-27 端到端实测定位：这是"任务跑到一半就不动了、
+            #   最后只看到「⚠️ 模型这次没有输出内容」"的主要来源之一。
+            #   写代码 / 做项目这类活天生是"一轮写一个文件 + 一轮跑一次"，
+            #   很容易吃满 MAX_TOOL_ROUNDS 轮；而循环一结束就**静默**退场 ——
+            #   模型那边一个字都没交代，前端只能兜一句通用的"没有输出内容"。
+            #   ⇒ 这里补一个**收尾轮**：不带工具，要它用文字把进度交代清楚。
+            #     产物都已落盘、会话历史也在，用户回一句「继续」就能接着做。
+            logger.warning("[rounds] 工具轮次用满 %d 轮，转入收尾总结", MAX_TOOL_ROUNDS)
+            yield json.dumps({"note": (
+                "已经连续用了 %d 轮工具（单轮上限），我让它先把已完成的部分交代清楚。"
+                "想接着做，回一句「继续」就行。" % MAX_TOOL_ROUNDS)}) + "\n"
+            try:
+                _wrap_params = dict(gen_params)
+                _wrap_params["max_tokens"] = min(
+                    4096, int(_wrap_params.get("max_tokens") or 4096))
+                working.append({"role": "user", "content": (
+                    "（系统提示）本轮的工具调用轮次已达上限，现在不能再调用任何工具。"
+                    "请**只用文字**向用户交代：① 已经完成了什么；② 产出在哪个文件或项目里；"
+                    "③ 还差什么没做完；④ 建议的下一步。"
+                    "不要写「我将要…」，直接把现状总结出来。")})
+                _wrap = client.chat(working, model=model, stream=True,
+                                    params=_wrap_params, tools=None)
+                for _raw in _wrap.iter_lines():
+                    if not _raw:
+                        continue
+                    if isinstance(_raw, bytes):
+                        _raw = _raw.decode("utf-8", "replace")
+                    _line = _raw.strip()
+                    if not _line:
+                        continue
+                    try:
+                        _o = json.loads(_line)
+                    except Exception:
+                        continue
+                    _mm = _o.get("message") or {}
+                    if _mm.get("thinking"):
+                        final_thinking += _mm["thinking"]
+                        yield json.dumps({"message": {"thinking": _mm["thinking"]}}) + "\n"
+                    if _mm.get("content"):
+                        final_text += _mm["content"]
+                        yield json.dumps({"message": {"content": _mm["content"]}}) + "\n"
+                    if _o.get("done"):
+                        break
+            except Exception:
+                logger.warning("[rounds] 收尾总结失败（已完成的产物不受影响）",
+                               exc_info=True)
+            if not final_text.strip():
+                # 连收尾都没写出来 → 至少要给一句**能操作**的话，别让用户对着空白
+                yield json.dumps({"note": (
+                    "工具轮次已用满，这一次也没能写出总结。"
+                    "**已完成的文件都还在**：直接回一句「继续」，它会接着往下做。")}) + "\n"
+
         # 整次生成结束 —— **这时候才**收拾"只被预览过、从没正式写入"的残缺文件。
         # 为什么不能每轮收：模型经常"这一轮只预览、下一轮才正式写"，每轮收会误伤
         # （上一版就是这么把一个刚建好的项目目录清空的）。

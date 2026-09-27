@@ -39,6 +39,16 @@ from . import docx_write
 # 为什么必须单独给"工作区"工具，而不是让模型用 read_file/write_file 传绝对路径：
 # 那样模型得先猜出工作区在哪，实测它猜不准，还会把文件写到应用安装目录里去。
 # 工作区工具的路径一律是**相对路径**，由后端拼，模型不可能写到外面。
+
+# 写代码被长度上限截断时，最多自动续写几次。
+# 为什么要有这个（2026-09-27 实测）：
+#   代码模型一次最多吐 `code_max_tokens`（默认 8192 ≈ 两三百行带注释），
+#   稍微大一点的文件必然撞上限，此时 `done_reason == "length"`。
+#   原来的实现**单跑一次、撞了就判失败**（"代码模型这次没有输出内容"），
+#   用户只能自己去点重试 —— 表现就是"生成到一半任务断了"。
+#   改成把已写出的部分回喂、让它从断点续写；3 次足够覆盖绝大多数单文件。
+_CODE_CONTINUE_MAX = 3
+
 _WS_PACK_SCHEMA = {
     "type": "function",
     "function": {
@@ -4621,9 +4631,16 @@ def _do_write_code(arguments, ui_events=None, context=None) -> str:
               "max_tokens": int(cfg.get("code_max_tokens") or 8192),
               "num_ctx": int(cfg.get("num_ctx") or 8192)}
     buf, wrote_any, last_t, last_n = "", False, 0.0, 0
-    try:
-        resp = _main.client.chat([{"role": "user", "content": prompt}],
-                               model=model, stream=True, params=params)
+
+    def _once(msgs):
+        """跑一次流式请求：边收边把"已生成的部分"预览落盘。
+
+        返回 (本次新增正文, done_reason)。done_reason 由 Ollama 给：
+        `length` = 撞到输出长度上限被截断（要续写），`stop` = 正常写完。
+        """
+        nonlocal wrote_any, last_t, last_n
+        got, reason = "", ""
+        resp = _main.client.chat(msgs, model=model, stream=True, params=params)
         for raw in resp.iter_lines():
             if not raw:
                 continue
@@ -4638,28 +4655,74 @@ def _do_write_code(arguments, ui_events=None, context=None) -> str:
                 continue
             piece = ((o.get("message") or {}).get("content") or "")
             if piece:
-                buf += piece
+                got += piece
+                _whole = buf + got
                 now = time.time()
                 # 节流预览：同文件每 60 字或每 0.3 秒写一次
-                if now - last_t >= 0.30 or len(buf) - last_n >= 60:
-                    prev = _strip_code_fence(buf)
+                if now - last_t >= 0.30 or len(_whole) - last_n >= 60:
+                    prev = _strip_code_fence(_whole)
                     if prev:
                         try:
                             _ws.stream_write(rel, prev)
                             wrote_any = True
                         except Exception:
                             pass
-                    last_t, last_n = now, len(buf)
+                    last_t, last_n = now, len(_whole)
             if o.get("done"):
+                reason = str(o.get("done_reason") or "")
                 break
+        return got, reason
+
+    try:
+        _got, done_reason = _once([{"role": "user", "content": prompt}])
+        buf += _got
     except Exception as e:
         if not wrote_any:
             return "写代码失败（调用代码模型出错）：%s" % e
+        done_reason = ""
+
+    # ★★ 被长度上限截断 → **自动续写**（2026-09-27 修）。
+    #   实测症状正是用户报的"生成到一半任务断了 / 说没有输出内容"：
+    #   代码模型单次输出到顶就停，而这里原来**单跑一次、撞了就放弃**。
+    #   现在把已写出的部分回喂给它，让它从断点接着写（最多 _CODE_CONTINUE_MAX 次）。
+    cont = 0
+    while done_reason == "length" and buf.strip() and cont < _CODE_CONTINUE_MAX:
+        cont += 1
+        logging.getLogger("uvicorn.error").warning(
+            "[write_code] 输出被截断，自动续写第 %d 次（已 %d 字）", cont, len(buf))
+        try:
+            _more, done_reason = _once([
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": _strip_code_fence(buf)},
+                {"role": "user", "content": (
+                    "上面这份代码因为输出长度限制被**截断**了。"
+                    "请**从断点往后接着写**：不要重复已经写过的内容、不要解释、"
+                    "不要重新输出整个文件，直接续上剩下的代码。")},
+            ])
+        except Exception:
+            logging.getLogger("uvicorn.error").warning(
+                "[write_code] 续写请求失败", exc_info=True)
+            break
+        _clean = _strip_code_fence(_more)
+        if not _clean:
+            break
+        buf = buf.rstrip() + "\n" + _clean
+        try:
+            _ws.stream_write(rel, _strip_code_fence(buf))
+            wrote_any = True
+        except Exception:
+            pass
 
     code = _strip_code_fence(buf)
     if not code.strip():
         return ("写代码失败：代码模型这次没有输出内容（可能是被截断）。"
                 "把需求说得更具体一点，或换个文件名重试。")
+    # 续写到头还是截断 → 如实标注，**别把半成品当成品**（半成品冒充成品最坑）
+    _trunc_note = ""
+    if done_reason == "length":
+        _trunc_note = ("\n⚠️ 注意：连续续写 %d 次后仍然撞到长度上限，"
+                       "这份代码**可能还不完整**。想接着写完，"
+                       "回一句「继续写完 %s」即可。" % (cont, rel))
 
     w = _ws.write_text(rel, code, by="ai")
     if not w.get("ok"):
@@ -4668,8 +4731,8 @@ def _do_write_code(arguments, ui_events=None, context=None) -> str:
         ui_events.append({"type": "workspace", "act": "write", "rel": rel,
                           "chars": len(code), "project": _ws.active_project()})
     head = code.splitlines()[0][:60] if code.splitlines() else ""
-    out = ("已把代码写进 %s（%d 字，模型=%s）。首行：%s\n"
-           % (rel, len(code), model, head))
+    out = ("已把代码写进 %s（%d 字，模型=%s）。首行：%s%s\n"
+           % (rel, len(code), model, head, _trunc_note))
     # 【为什么把"跑一遍"并进来】两个模型在 12GB 显存里**装不下**，
     # 每调一次代码模型就会把大脑挤出去、下一轮大脑得**重新加载**（十几秒起）。
     # 原流程是 write_code → 大脑 → workspace_run → 大脑 ——
