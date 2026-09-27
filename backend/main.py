@@ -2088,7 +2088,8 @@ def _mentions_local_path(text: str) -> bool:
     return bool(_LOCAL_PATH_RE.search(text or ""))
 
 
-def _needs_task_model(text: str, prev_code: bool = False) -> bool:
+def _needs_task_model(text: str, prev_code: bool = False,
+                      has_images: bool = False) -> bool:
     """要不要换用"专用模型"（非思考型）。
 
     ⚠️ **长文创作不算在内**（试过，更糟）：换成 qwen2.5-coder 之后确实不出空答案了，
@@ -2099,11 +2100,23 @@ def _needs_task_model(text: str, prev_code: bool = False) -> bool:
 
     ⚠️ **带本机路径的请求也不算** —— 见 `_mentions_local_path` 的说明。
 
+    ⚠️⚠️ **本轮带了图片的更不算**（2026-09-27 补）——
+    代码模型 `qwen3-coder:30b` 的能力段里**只有 completion / tools，没有 vision**
+    （`ollama show` 实测），切过去图片**必然丢失**。而路由只看文本、不看有没有图，
+    所以这些说法都会踩到：
+      · 「**这张截图**里的报错怎么修，帮我改一下」→ 命中"报错+改" → 切代码模型 ❌
+      · 「分析一下**这张图**的数据，写个脚本处理」→ 命中"脚本+写" → 切 ❌
+      · 上一轮写过代码、这一轮贴图说「再帮我改两处」→ `prev_code` 命中 → 切 ❌
+    用户主动贴图就是最强的"我要你看图"信号，**看不到图等于白传**。
+    留在视觉模型上还能两全：qwen3-vl 既看图、也照样能写代码。
+
     prev_code：上一轮回答里有没有代码块。**迭代轮次全靠这个兜住** ——
     用户第二轮往往只说「再帮我改两处：加个深色模式」，这句话里一个代码关键词都没有，
     只按本句判定就会掉回默认（思考型）模型；而那个模型的系统提示里写着 library 工具，
     它会直接编「已保存到 xxx.html（3580 字节）」，**一个字代码都不给**（实测）。
     """
+    if has_images:
+        return False          # 图必须被"看见" → 只能留在有视觉能力的模型上
     if _mentions_local_path(text):
         return False          # 要读写本机文件 → 必须留在有工具的默认模型上
     if prev_code:
@@ -3006,7 +3019,7 @@ def _reconcile_streamed(state: dict, ui_events: list, final: bool = False) -> li
 
 
 def _route_code_model(cfg: dict, text: str, fallback: str, prev_code: bool = False,
-                      force: bool = False):
+                      force: bool = False, has_images: bool = False):
     """**聊天这一轮永远用默认模型**（保留函数只为兼容调用点）。
 
     ⚠️⚠️ 这里以前是"代码类请求就切到 qwen2.5-coder"，**2026-09-16 改掉了**，
@@ -3040,7 +3053,17 @@ def _route_code_model(cfg: dict, text: str, fallback: str, prev_code: bool = Fal
     want = str(cfg.get("code_model") or "").strip()
     if not want or want == fallback:
         return fallback, ""
-    if not force and not _needs_task_model(text, prev_code=prev_code):
+    # ⚠️⚠️ 本轮带了图片 → **一律留在视觉模型上**（连开发台的 force 也不例外）。
+    #   代码模型 `qwen3-coder:30b` 的能力段里**没有 vision**（`ollama show` 实测：
+    #   只有 completion / tools），切过去图片必然丢，用户贴图就白贴了。
+    #   留在默认模型还能两全：qwen3-vl 既看得见图，也照样能写代码。
+    #   （开发台那轮给一句提示，因为用户明确期望"进开发台=用代码模型"，
+    #    不然他会以为是切换坏了。）
+    if has_images:
+        return fallback, ("本轮带了图片，已留在视觉模型上 —— 代码模型看不了图"
+                          if force else "")
+    if not force and not _needs_task_model(text, prev_code=prev_code,
+                                           has_images=has_images):
         return fallback, ""
     if want not in _installed_models():
         # 还没下载 → 静默用回默认模型。配置名留着，用户下载后自动生效，不用改设置。
@@ -3697,7 +3720,10 @@ async def chat(req: ChatRequest):
         # 开发台里提问 = 明确在写代码 → **直接接入编程模型**，不用再猜意图
         model, model_note = _route_code_model(
             cfg, last_user, model, prev_code=prev_code,
-            force=bool(getattr(req, "studio", False)))
+            force=bool(getattr(req, "studio", False)),
+            # ⚠️ 本轮带图 → 不能切到代码模型（它没有视觉能力，图会白传）。
+            #    判据见 _needs_task_model / _route_code_model。
+            has_images=bool(model_images))
     # 本轮实际用的模型是不是"专用代码模型"？
     # 它不支持原生工具调用，工具定义必须整轮砍掉（见下面 tool_schemas 的处理）。
     _code_model_name = str(cfg.get("code_model") or "").strip()

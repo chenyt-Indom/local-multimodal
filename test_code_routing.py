@@ -203,6 +203,41 @@ check("上一轮只是闲聊天、这轮说「再加一句」：不判代码迭�
                              {"role": "assistant", "content": "你好，有什么可以帮你？"},
                              {"role": "user", "content": "再加一句"}], "再加一句"))
 
+print()
+print("=" * 62)
+print("⑧ 带图片的轮次：绝不允许切到代码模型（代码模型没有视觉能力）")
+# 2026-09-27：`ollama show qwen3-coder:30b` 的能力段里**只有 completion / tools，
+# 没有 vision**，而路由原来只看文本、不看有没有图 —— 于是这些说法都会把图丢掉：
+#   · 「这张截图里的报错怎么修，帮我改一下」 → "报错 + 改" 命中 → 切 ❌
+#   · 「分析一下这张图的数据，写个脚本处理」 → "脚本 + 写" 命中 → 切 ❌
+#   · 上一轮写过代码、这轮贴图说「再帮我改两处」 → prev_code 命中 → 切 ❌
+# 用户主动贴图就是最强的"我要你看图"信号，看不到图 = 白传。
+IMAGE_TURNS = [
+    ("这张截图里的报错怎么修，帮我改一下", False),
+    ("分析一下这张图的数据，写个脚本处理", False),
+    ("帮我把这份 PPT 内容改成代码示例", False),
+    ("再帮我改两处", True),
+    ("帮我看看这张图的代码哪里错了", False),
+    ("把这张图里的表格转成 Excel", False),
+]
+for text, pc in IMAGE_TURNS:
+    m, _ = M._route_code_model(cfg, text, "qwen3-vl:8b", prev_code=pc, has_images=True)
+    check("带图：%s → 留在视觉模型" % text[:18], m == "qwen3-vl:8b", m)
+
+check("⚠️ 不带图时同一句话仍会切（不能把正常路由修坏）",
+      M._route_code_model(cfg, "分析一下这张图的数据，写个脚本处理", "qwen3-vl:8b")[0]
+      == "qwen2.5-coder:14b")
+check("带图 + 上一轮写过代码，也不切",
+      M._route_code_model(cfg, "再帮我改两处", "qwen3-vl:8b",
+                          prev_code=True, has_images=True)[0] == "qwen3-vl:8b")
+_m, _n = M._route_code_model(cfg, "帮我写个脚本", "qwen3-vl:8b",
+                             force=True, has_images=True)
+check("开发台带图：也留在视觉模型，并说明原因", _m == "qwen3-vl:8b" and "看不了图" in _n,
+      "%s / %s" % (_m, _n))
+check("开发台不带图：仍进代码模型",
+      M._route_code_model(cfg, "帮我写个脚本", "qwen3-vl:8b", force=True)[0]
+      == "qwen2.5-coder:14b")
+
 shutil.rmtree(TMP, ignore_errors=True)
 print()
 print("=" * 62)
