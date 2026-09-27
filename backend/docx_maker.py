@@ -200,7 +200,10 @@ _INLINE = re.compile(r"(\*\*[^*]+\*\*|`[^`]+`|==[^=\n]+==|\*[^*\n]+\*)")
 
 def _add_runs(p, text, size, color, font, bold=False, italic=False):
     """把 `**粗**` / `*斜*` / `` `码` `` 解析成多个 run，其余为普通文本。"""
-    for seg in _INLINE.split(str(text or "")):
+    # 兜底：先还原 HTML 实体、清掉孤立强调符（模型 Markdown 写法的残留）。
+    # 走 `_tidy_markdown_marks` 而不是内联几行，是为了**和 expand_text_blocks
+    # 用同一套规则**，免得两条路径行为不一致。
+    for seg in _INLINE.split(_tidy_markdown_marks(str(text or ""))):
         if not seg:
             continue
         if seg.startswith("==") and seg.endswith("==") and len(seg) > 4:
@@ -765,6 +768,151 @@ def markdown_blocks(text):
     return blocks
 
 
+# ⚠️ HTML 实体 → 真字符（`&amp;` 放最后，否则 `&amp;gt;` 会被二次还原）。
+# 2026-09-28 实测：模型写 Markdown 正文时会把行首的 `>` 转义成 `&gt;`，
+# 文档里就字面显示 "&gt; 某个瞬间…"。导出 .md→docx 这条路上也必须还原。
+_HTML_ENTITY_MAP = (
+    ("&nbsp;", " "), ("&#160;", " "),
+    ("&lt;", "<"), ("&gt;", ">"),
+    ("&quot;", '"'), ("&#34;", '"'),
+    ("&apos;", "'"), ("&#39;", "'"),
+    ("&mdash;", "—"), ("&ndash;", "–"), ("&hellip;", "…"),
+    ("&middot;", "·"), ("&times;", "×"), ("&laquo;", "«"), ("&raquo;", "»"),
+    ("&amp;", "&"),
+)
+
+
+def _unescape_entities(s):
+    """把常见 HTML 实体还原成真字符。"""
+    if not s or "&" not in s:
+        return s
+    for k, v in _HTML_ENTITY_MAP:
+        if k in s:
+            s = s.replace(k, v)
+    return s
+
+
+# 行首块级标记：`# 标题` / `> 引用` / `- 列表` / `1. 编号` / `***` `---` 分隔线
+_BLOCK_LINE = re.compile(
+    r"^\s*(#{1,4}\s+\S|>\s?|[-*+]\s+\S|\d+[.)]\s+\S|\*{3,}\s*$|[-_]{3,}\s*$)")
+
+
+def _tidy_markdown_marks(s):
+    """清掉模型 Markdown 写作留下的**孤立强调符**（正常成对的保留）。
+
+    ⚠️ 2026-09-28 实测：模型写散文时输出 `***夜晚降临后…`（只有开头三星、
+    没有结尾），以及 `*  *也许有一天…`（把列表符号写成了两个星号）。
+    `_add_runs` 只认严格成对的 `**粗**`/`*斜*`，这些畸形标记就**原样排进正文**。
+    """
+    s = _unescape_entities(s)
+    if not s or "*" not in s:
+        return s
+    # 1) ***x*** → **x**（粗体就够，不必粗斜体）
+    s = re.sub(r"\*{3}([^*\n]+)\*{3}", r"**\1**", s)
+    # 2) 行首 "* *" / "*  *"（两星之间**至少一个空白**）→ 噪声
+    #    ⚠️ 窗口必须写 `[ \t]+`：写成 `[ \t]*` 会把合法的 `**粗体**` 开头也吃掉（已踩）
+    s = re.sub(r"(?m)^[ \t]*\*[ \t]+\*[ \t]*", "", s)
+    # 3) 行首连续 2+ 星号、而本行后面没有同数量的星号 = 不闭合的强调 → 去掉
+    out = []
+    for ln in s.split("\n"):
+        m = re.match(r"^[ \t]*(\*{2,})[ \t]*(.*)$", ln)
+        if m and m.group(1) not in m.group(2):
+            ln = m.group(2)
+        out.append(ln)
+    return "\n".join(out)
+
+
+def _looks_like_prose_markdown(text):
+    """这段 text 像是"模型直接把整篇正文写成 Markdown"吗？
+
+    判据（任一满足）：
+      · 任一行带行首块级标记（# > - * 1. 或分隔线）—— **单行也算**，
+        因为 `> 某句话` 单行也是引用块；
+      · 多行（>=3 个非空行）而无标记 —— 模型习惯用 \\n 当段落分隔，
+        python-docx 会把 \\n 变成**软换行**、段落全挤在一起（实测就是这样）。
+
+    单行的普通文本**不拆**，免得把正常的一句话切碎。
+    """
+    s = str(text or "")
+    if not s.strip():
+        return False
+    lines = [x for x in s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+             if x.strip()]
+    if not lines:
+        return False
+    if any(_BLOCK_LINE.match(x) for x in lines):
+        return True
+    return len(lines) >= 3
+
+
+def _lines_to_blocks(text):
+    """按行拆块：标记行按 Markdown 语义，普通行**各自成段**。
+
+    和 `markdown_blocks` 的区别：那边把连续普通行**合并成一段**（Markdown 标准），
+    这里**不合并** —— 模型习惯用 `\\n` 当段落分隔，合并会让整篇挤成一块
+    （实测就是这么垮的）。`markdown_blocks` 保持原样给"导出 md"用，两者互不影响。
+    """
+    out = []
+    for ln in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        s = ln.strip()
+        if not s:
+            continue
+        m = re.match(r"^(#{1,4})\s+(.*)$", s)
+        if m:                                          # # 标题
+            out.append({"type": "heading", "level": len(m.group(1)),
+                        "text": m.group(2).strip()})
+            continue
+        if re.match(r"^([-_*])\1{2,}$", s):             # --- / ___ / *** 分隔线
+            out.append({"type": "divider"})
+            continue
+        if s.startswith(">"):                          # > 引用
+            out.append({"type": "quote", "text": s.lstrip(">").strip()})
+            continue
+        m = re.match(r"^\s*([-*+]|\d+[.)])\s+(\S.*)$", ln)
+        if m:                                          # - 列表 / 1. 编号
+            ordered = bool(re.match(r"^\s*\d+[.)]\s+", ln))
+            out.append({"type": "number" if ordered else "bullet",
+                        "items": [m.group(2).strip()]})
+            continue
+        out.append({"type": "para", "text": s})
+    return out
+
+
+def expand_text_blocks(blocks):
+    """把"一坨 Markdown 正文"拆成真正的结构化内容块（兜底）。
+
+    ⚠️ 2026-09-28 实测踩到：让模型写一篇散文（《镜城夜语》），它**没用结构化
+    blocks**，而是把整篇塞进少数 para 的 text 里，还带着 Markdown 写法：
+        ***夜晚降临后，整座城市变成了无边界的舞台。
+        *  *也许有一天你会站在这个世界的中心位置…
+        &gt; 某个瞬间突然意识到：…
+    于是 docx 里字面显示 `***`、`&gt;`，段落挤成一团，标题也没了层级。
+
+    这里做一层兜底：text 里出现行首块级标记、或本身是多行时，
+    用 `markdown_blocks` 重排成 heading / quote / bullet / para。
+    **已经规范的结构化块（单行、无标记）原样保留**，不会被动到。
+    """
+    out = []
+    for b in blocks or []:
+        if not isinstance(b, dict):
+            continue
+        t = str(b.get("type") or "").strip().lower()
+        text = b.get("text")
+        if t in ("para", "paragraph", "p", "text", "quote", "callout") \
+                and isinstance(text, str) and _looks_like_prose_markdown(text):
+            inner = _lines_to_blocks(_tidy_markdown_marks(text))
+            if inner:
+                st = b.get("style")
+                if st:
+                    # 继承原块的样式微调（字号/颜色/对齐…）
+                    for ib in inner:
+                        ib.setdefault("style", st)
+                out.extend(inner)
+                continue
+        out.append(b)
+    return out
+
+
 def build_docx_text(path, title, text, **kw):
     """把一个 Markdown 风格文本文件**排成正经 Word 文档**（export_docx 用）。"""
     return build_docx(path, title, markdown_blocks(text), **kw)
@@ -816,7 +964,7 @@ def build_docx(path, title, blocks, subtitle="", author="", date_text="",
             _render_toc(doc, {}, ctx)
 
         n = 0
-        for b in (blocks or []):
+        for b in expand_text_blocks(blocks):
             if add_block(doc, b, ctx):
                 n += 1
 

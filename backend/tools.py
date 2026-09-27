@@ -423,6 +423,13 @@ _MAKE_DOCX_SCHEMA = {
             "        系统会联网搜一张插进来，可配 caption 图注、style.width 控宽度 cm）\n"
             "  / code 代码块（text）/ divider 分隔线\n"
             "  pagebreak 分页 / toc 目录 / end 结束语\n"
+            "⚠️⚠️ **text 里只写纯文字 + 局部强调**（2026-09-28 实测踩坑）：\n"
+            "  · **不要**写 Markdown 块标记 —— `#`、`***`、`> `、`- ` 这些工具**不认**，"
+            "会原样排进 Word（实测正文里出现字面量 `***` 和 `&gt;`）。"
+            "要标题就建 heading 块、要引用就建 quote 块、要列表就建 bullet/number 块；\n"
+            "  · **不要**写 HTML 标签或实体（`<b>`、`<br>`、`&gt;`、`&nbsp;`）；\n"
+            "  · **一个 para 只放一段话**，不要在 text 里敲换行塞多段 —— 换行在 Word 里"
+            "只会变成软换行、段落全挤成一团。多段就多给几个 para 块。\n"
             "· 正文里可用 **加粗**、*斜体*、`等宽`、==高亮== 做局部强调"
             "（==高亮== 是荧光笔，用来标出重点句）。\n"
             "· 列表里以「- 」或两个空格开头＝二级条目。\n"
@@ -3641,6 +3648,32 @@ def _is_plain_coverish(sl) -> bool:
     return not has_body
 
 
+# HTML 实体 → 真字符。
+# ⚠️ 2026-09-28 实测：模型把正文当 Markdown 写时，会顺手把行首的 `>` 转义成
+# `&gt;`（它以为在写 HTML），而文档工具只当纯文本排进去 —— 用户就在 Word 里
+# 看到字面量 "&gt; 某个瞬间突然意识到…"。必须在**进 docx 之前**还原。
+# ⚠️ 顺序：`&amp;` 必须放最后，否则 `&amp;gt;` 会被二次还原成 `>`。
+_HTML_ENTITY_MAP = (
+    ("&nbsp;", " "), ("&#160;", " "),
+    ("&lt;", "<"), ("&gt;", ">"),
+    ("&quot;", '"'), ("&#34;", '"'),
+    ("&apos;", "'"), ("&#39;", "'"),
+    ("&mdash;", "—"), ("&ndash;", "–"), ("&hellip;", "…"),
+    ("&middot;", "·"), ("&times;", "×"), ("&laquo;", "«"), ("&raquo;", "»"),
+    ("&amp;", "&"),
+)
+
+
+def unescape_html_entities(s):
+    """把常见 HTML 实体还原成真字符（`&` 放最后，避免二次还原）。"""
+    if not s or "&" not in s:
+        return s
+    for k, v in _HTML_ENTITY_MAP:
+        if k in s:
+            s = s.replace(k, v)
+    return s
+
+
 def _clean_stray_inline_html(obj):
     """递归清理模型误写进内容里的 HTML 内联标签（**保留标签里的文字**）。
 
@@ -3656,7 +3689,7 @@ def _clean_stray_inline_html(obj):
     而且通常放在代码块里）。
     """
     if isinstance(obj, str):
-        s = obj
+        s = unescape_html_entities(obj)                # 先还原实体，再清标签
         if "<" not in s:
             return s
         s = re.sub(r"(?i)<br\s*/?>", "\n", s)          # 换行标签 → 真换行
