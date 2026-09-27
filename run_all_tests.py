@@ -9,7 +9,10 @@ import subprocess
 import sys
 import time
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+# ⚠️ 必须加 line_buffering：不加的话重定向到文件时会**整块缓存**，
+#    跑十几分钟一行都看不到，很容易被误判成"卡住了"（2026-09-27 实测踩到）。
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
+                              line_buffering=True)
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TIMEOUT = 420          # 单个测试最多 7 分钟（图片生成类偏慢）
 
