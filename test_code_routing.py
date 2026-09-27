@@ -127,6 +127,82 @@ check("⚠️ 「做个」不能退化成光杆「做」", "做" not in M._BUILD
 check("弱术语 + 光杆动作仍能命中（API 没被削弱）",
       M._is_code_task("帮我改一下这段 python 代码"))
 
+print()
+print("=" * 62)
+print("⑤ 多轮：文档任务（作文 / PPT / Excel）不许被误切到代码模型")
+# 2026-09-27 用户报："有时候让它写作文、做 PPT 或 Excel，结果给我用了代码模型。"
+# 现场：上一轮做 Excel 时助手回答里贴了一段 python 代码（"已生成，代码如下：…"），
+# 这一轮只说「再帮我加一列合计」——一个写作/办公关键词都没有，只有接续词"再/加"，
+# 于是被判成"还在改代码" → 切 qwen3-coder。伤害不只是模型换错：**代码模型那一轮
+# 工具被整轮清空**（见 code_model_on），make_xlsx / make_pptx / edit_office 全没了，
+# 用户不是"感觉不对"，是**根本改不动那份文件**。离线实测 12 条全中。
+REPLY_WITH_CODE = ("已生成《月度开支.xlsx》，代码如下：\n"
+                   "```python\nfrom openpyxl import Workbook\n```\n文件已保存到生成文库。")
+DOC_ITERATION = [
+    ("帮我做一个 Excel 表格，记录这个月开支", "再帮我加一列合计", "Excel 加列"),
+    ("帮我做一个 Excel 表格", "再加一行小计", "Excel 加行"),
+    ("帮我做一个 Excel 表格", "顺便把表格底色换成浅灰", "Excel 改样式"),
+    ("帮我做一个 Excel 表格", "再帮我加个图表", "Excel 加图表"),
+    ("帮我做一个 Excel 表格", "再帮我做个 Excel 汇总表", "Excel 再造一份"),
+    ("帮我做一个介绍广州的 PPT", "再加一页讲公司简介", "PPT 加页"),
+    ("帮我做一个介绍广州的 PPT", "把第 3 页改一下", "PPT 改页"),
+    ("帮我做一个介绍广州的 PPT", "再改一下封面标题", "PPT 改标题"),
+    ("帮我写一篇关于春天的作文", "再改一下开头", "作文改开头"),
+    ("帮我写一篇关于春天的作文", "再帮我加一段", "作文加段"),
+    ("帮我写一篇关于春天的作文", "继续，再加个结尾", "作文加结尾"),
+    ("帮我写一份工作总结", "再补充一下第二点", "总结补充"),
+]
+for pu, cur, why in DOC_ITERATION:
+    _msgs = [{"role": "user", "content": pu},
+             {"role": "assistant", "content": REPLY_WITH_CODE},
+             {"role": "user", "content": cur}]
+    got = M._prev_code_flag(_msgs, cur)
+    check("%s：%s → 不判成代码迭代" % (why, cur[:18]), not got,
+          "被当成还在改代码 → 会切代码模型且工具被清空")
+    m, _ = M._route_code_model(cfg, cur, "qwen3-vl:8b", prev_code=got)
+    check("%s：留在默认模型" % why, m == "qwen3-vl:8b", m)
+
+print()
+print("=" * 62)
+print("⑥ 多轮：真·代码迭代仍必须切（别把这个修坏）")
+CODE_ITERATION = [
+    ("帮我写一个网页，番茄钟", "再帮我加个深色模式"),
+    ("帮我写一个网页，番茄钟", "再改一处样式"),
+    ("帮我写一个网页，番茄钟", "继续优化性能"),
+    ("帮我用 python 写个脚本读 csv", "再改成支持 xlsx"),   # 句中有 xlsx，但这是代码迭代
+    ("帮我写个爬虫抓标题", "再加个存数据库的功能"),
+]
+for pu, cur in CODE_ITERATION:
+    _msgs = [{"role": "user", "content": pu},
+             {"role": "assistant", "content": REPLY_WITH_CODE},
+             {"role": "user", "content": cur}]
+    got = M._prev_code_flag(_msgs, cur)
+    check("代码迭代：%s → %s 仍判代码" % (pu[:12], cur[:14]), got, "漏判，思考型模型写代码很慢")
+    m, _ = M._route_code_model(cfg, cur, "qwen3-vl:8b", prev_code=got)
+    check("代码迭代：切到代码模型", m == "qwen2.5-coder:14b", m)
+
+print()
+print("=" * 62)
+print("⑦ 多轮：跨任务边界（改主意时要跟得上）")
+_msgs = [{"role": "user", "content": "帮我做一个介绍广州的 PPT"},
+         {"role": "assistant", "content": REPLY_WITH_CODE},
+         {"role": "user", "content": "再帮我写个 python 脚本读这个 pptx"}]
+_cur = "再帮我写个 python 脚本读这个 pptx"
+check("文档 → 代码：用户改主意要代码，仍切代码模型",
+      M._route_code_model(cfg, _cur, "qwen3-vl:8b",
+                          prev_code=M._prev_code_flag(_msgs, _cur))[0] == "qwen2.5-coder:14b")
+_msgs = [{"role": "user", "content": "帮我写个读 csv 的脚本"},
+         {"role": "assistant", "content": REPLY_WITH_CODE},
+         {"role": "user", "content": "再帮我做个 Excel 汇总表"}]
+_cur = "再帮我做个 Excel 汇总表"
+check("代码 → 要文件：留在默认模型（保住 make_xlsx，否则拿不到文件）",
+      M._route_code_model(cfg, _cur, "qwen3-vl:8b",
+                          prev_code=M._prev_code_flag(_msgs, _cur))[0] == "qwen3-vl:8b")
+check("上一轮只是闲聊天、这轮说「再加一句」：不判代码迭代",
+      not M._prev_code_flag([{"role": "user", "content": "你好"},
+                             {"role": "assistant", "content": "你好，有什么可以帮你？"},
+                             {"role": "user", "content": "再加一句"}], "再加一句"))
+
 shutil.rmtree(TMP, ignore_errors=True)
 print()
 print("=" * 62)

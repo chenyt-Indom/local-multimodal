@@ -1945,6 +1945,92 @@ def _is_office_task(text: str) -> bool:
     return any(k in t for k in _OFFICE_HINTS)
 
 
+def _is_doc_task(text: str) -> bool:
+    """这句话要的是**文档类产物**（写文章 / 做 PPT / 做表格）而不是写代码吗。
+
+    ⚠️⚠️ 2026-09-27 加。用户报："有时候让它写作文、做 PPT 或 Excel，
+    **结果给我用了代码模型**。" 根因就在 `prev_code` 那条兜底路上：
+
+      判"这轮是不是还在改代码"时，原来只看**上一轮回答里有没有 ```**。
+      而上一轮做 Excel / PPT 时，助手的回答里**经常贴一段 python 代码**
+      （实测："已生成，代码如下：" + ```python from openpyxl import Workbook …```）：
+        上一轮「帮我做一个 Excel 表格」→ 回答里带代码块
+        这一轮「再帮我加一列合计」    → 只有接续词"再 / 加"，没有任何写作或办公关键词
+        ⇒ prev_code = True ⇒ **切到 qwen3-coder** ❌
+
+    伤害不只是"模型换错"：**代码模型那一轮的工具被整轮清空**
+    （见 `code_model_on`，只留文本协议工具），make_xlsx / make_pptx /
+    make_docx / edit_office **全没了** —— 用户不是"感觉不对"，是**根本改不动那份文件**。
+
+    离线判定实测（`test_code_routing.py` ⑤）：12 条文档迭代句
+    （Excel 5 条 / PPT 4 条 / 作文 3 条）**12 条全被误切**。
+
+    ⚠️ 判据顺序要紧：**真的是代码任务就不算文档任务** ——
+    上一轮"帮我写个程序把数据导出成 xlsx"虽含 Excel 字样，但那是在写代码，
+    后面几轮的"再加一列"就该继续按代码迭代走。
+    """
+    if _is_code_task(text):
+        return False
+    return _is_writing_task(text) or _is_office_task(text)
+
+
+def _prev_code_flag(messages: list, last_user: str) -> bool:
+    """上一轮刚写过代码、而这轮**还在改它**吗（决定要不要继续用代码模型）。
+
+    这正是用户报的"写作文 / 做 PPT / 做 Excel 却被用了代码模型"的现场 ——
+    抽成函数只为一件事：**能被测试直接覆盖**（见 `test_code_routing.py` ⑤），
+    以前它内联在 `chat()` 里，测试只能靠复刻，改坏了也发现不了。
+
+    ⚠️ 判据只能看"上一轮回答里有没有 ```"是**不够**的，两个坑：
+      ① 太宽：助手解释一下、贴个示例都会带代码块，用户接着聊别的也会被切；
+      ② **会自锁**：切到代码模型后它的回答**必然**带代码块 →
+         下一轮 prev_code 又是真 → **永远切不回来**。
+         （用户实测反馈："明明只是日常对话，却一直显示模型不思考"。）
+    → 所以要求**三个条件**：上轮有代码块 + 本轮带"接着改"的意图 + **上下文确实是代码**。
+
+    ⚠️⚠️ 第三个条件里"上一轮的意图"最要紧（2026-09-27 补）：
+    上一轮做 Excel / PPT 时，助手的回答里**经常贴一段 python 代码**
+    （实测："已生成，代码如下：" + ```python from openpyxl …```）——
+    那不能说明后面几轮还在写代码。漏掉它就会：
+      上一轮「帮我做一个 Excel 表格」→ 回答带代码块
+      这一轮「再帮我加一列合计」    → 只有接续词"再/加"
+      ⇒ 切 qwen3-coder ❌（而它那轮**工具被整轮清空**，用户根本改不动那份文件）
+    离线实测：12 条文档迭代句（Excel 5 / PPT 4 / 作文 3）**12 条全中**。
+    """
+    last_user = str(last_user or "")
+    _last_u = next((i for i in range(len(messages) - 1, -1, -1)
+                    if messages[i].get("role") == "user"), len(messages))
+    prev_code_raw = False
+    for _m in reversed(messages[:_last_u]):
+        if _m.get("role") == "assistant":
+            prev_code_raw = "```" in str(_m.get("content") or "")
+            break
+    prev_user = ""
+    for _m in reversed(messages[:_last_u]):
+        if _m.get("role") == "user":
+            prev_user = str(_m.get("content") or "")
+            break
+    # 本轮是不是"要一个能点开的办公文件"（造物口吻 + 办公名词）。
+    # ⚠️ 只看本轮的办公词是危险的：上轮写"读 csv 的脚本"、本轮"再改成支持 xlsx"
+    #    —— 句中也有 xlsx，但这是**代码迭代**，必须让它切代码模型。
+    #    所以额外要求"造物口吻"：只有用户**要文件**时才拦住（代码模型那轮工具被清空、
+    #    make_xlsx 根本不在，拦下来才拿得到文件）。
+    office_build = (_is_office_task(last_user)
+                    and any(w in last_user for w in _BUILD_REQ))
+    return (prev_code_raw
+            and any(w in last_user for w in _CONTINUE_HINTS)
+            # ⚠️ 写作 / 办公请求不受上一轮代码影响 ——
+            # 「帮我写一篇作文，再改一下开头」里有"再/改"，上一轮又刚写过代码的话，
+            # 光看前两个条件会被切到**代码模型**去写作文（它会跑偏，实测过）。
+            # ⚠️ 这两条只拦**兜底路**：如果本轮用户明说要写代码，
+            #   `_needs_task_model` 里的 `_is_code_task` 照样会切，不会漏。
+            and not _is_writing_task(last_user)
+            and not office_build
+            # ⚠️ 上一轮的意图决定这是不是代码迭代：上轮写代码 → 继续按代码迭代；
+            #   上轮写文档 → 按文档迭代（见上面 _is_doc_task 的说明）。
+            and not _is_doc_task(prev_user))
+
+
 _model_tags_cache = {"t": 0.0, "names": set()}
 
 def _installed_models() -> set:
@@ -2008,7 +2094,8 @@ def _needs_task_model(text: str, prev_code: bool = False) -> bool:
     ⚠️ **长文创作不算在内**（试过，更糟）：换成 qwen2.5-coder 之后确实不出空答案了，
     但它是代码模型，多轮里会跑偏 —— 把工具调用当 JSON 文本吐出来、
     话题漂到无关内容（让它写作文，它导出了一份"Python 网络请求示例"）。
-    长文创作改走"砍工具 + 加额度"的路子（见 _writing_tools），用回默认模型。
+    长文创作改走"保住输出额度 + 砍掉无关工具"的路子（见下面系统提示里
+    "写作文 / 拟方案 / 写报告这类创作任务"那一段），仍用默认模型。
 
     ⚠️ **带本机路径的请求也不算** —— 见 `_mentions_local_path` 的说明。
 
@@ -3602,28 +3689,8 @@ async def chat(req: ChatRequest):
 
     # ⚠️ 迭代轮次：上一轮刚写过代码时，这轮用户可能只说「再改两处」——
     # 里面一个代码关键词都没有，只按本句判定就会掉回默认模型。
-    #
-    # ⚠️⚠️ 但**不能只看"上一轮回答里有没有 ```"** —— 两个坑：
-    #   ① 太宽：助手解释一下、贴个示例都会带代码块，用户只是接着聊别的也会被切；
-    #   ② **会自锁**：切到代码模型后，它的回答**必然**带代码块 →
-    #      下一轮 `prev_code` 又是真 → **永远切不回来**。
-    #      用户实测反馈："明明只是日常对话，却一直显示模型不思考"。
-    # → 现在要求**两个条件同时成立**：上一轮确实有代码块，**并且**这一轮带着
-    #   "接着改"的意图（再/继续/改/加…）。日常寒暄、问概念都不满足，不会误切。
-    prev_code_raw = False
-    _last_u = next((i for i in range(len(messages) - 1, -1, -1)
-                    if messages[i].get("role") == "user"), len(messages))
-    for _m in reversed(messages[:_last_u]):
-        if _m.get("role") == "assistant":
-            prev_code_raw = "```" in str(_m.get("content") or "")
-            break
-    prev_code = (prev_code_raw
-                 and any(w in str(last_user) for w in _CONTINUE_HINTS)
-                 # ⚠️ 写作请求不受上一轮代码影响 ——
-                 # 「帮我写一篇作文，再改一下开头」里有"再/改"，上一轮又刚写过代码的话，
-                 # 光看前两个条件会被切到**代码模型**去写作文（它会跑偏，实测过）。
-                 # 写作和代码本来就是互斥的，这里跟 writing_mode 用同一个判断。
-                 and not _is_writing_task(last_user))
+    # 判据与三个坑都写在 `_prev_code_flag` 里（抽成函数是为了能被测试直接覆盖）。
+    prev_code = _prev_code_flag(messages, last_user)
 
     # 本轮像写代码 → 换专用代码模型（只影响这一轮，下一轮自动回默认模型）
     if not req.model:
@@ -3716,7 +3783,10 @@ async def chat(req: ChatRequest):
         "- ⚠️ **要什么文件就用哪个工具，别搞混**：\n"
         "    · 要 **Word 文档**（「写成文档」「来个报告/方案/说明书」「导出成 Word」）"
         "→ 用 **make_docx**（封面/目录/表格/提示框一次成型），**不要**用 library 写 .md 再让用户自己转；\n"
-        "    · 要 **PPT / 演示稿 / 汇报材料** → 用 **make_pptx**；\n"
+        "    · 要 **PPT / 演示稿 / 汇报材料** → 用 **make_pptx**"
+        "（⚠️ **页数 ≥6 就别一次写完**：先给封面 + 3~4 页，剩下的用 **edit_office** 的 "
+        "`{\"op\":\"add_slide\",\"slide_spec\":{...}}` **每次补 1~2 页**。"
+        "实测把 8 页塞进一个 slides 数组时 JSON 会被写坏，整轮白跑）；\n"
         "    · 要 **Excel / 表格 / 统计表 / 报表 / 台账 / 预算表**"
         "（尤其用户直接给了一堆数据）→ 用 **make_xlsx**；\n"
         "    · 要**改已有的 Word / PPT / 表格**（「把第 3 页标题换掉」「加一页」「换个配色」）"
