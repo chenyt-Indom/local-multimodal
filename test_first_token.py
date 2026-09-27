@@ -132,8 +132,33 @@ print()
 print("=" * 62)
 print("⑤ 模型保活（避免 5 分钟不用就被卸载、下次冷加载）")
 check("配置里有 model_keep_alive", "model_keep_alive" in CFG, str(CFG.get("model_keep_alive")))
-check("默认值是 30m（不再是 Ollama 的 5 分钟默认）",
-      str(CFG.get("model_keep_alive") or "").endswith("m"), CFG.get("model_keep_alive"))
+
+
+def _keep_alive_minutes(v) -> float:
+    """把 Ollama 的 keep_alive 写法折成分钟："30m" / "4h" / "3600s" / -1（永久）。
+
+    ⚠️ 这里以前写死判 `.endswith("m")`，保活时长从 30m 调成 4h 后就直接误报了 ——
+    （2026-09-27 实测：30B 冷加载要 20 秒，拍脑袋延长到 4 小时更划算）。
+    要守住的是"**明显长于 Ollama 默认的 5 分钟**"这个意图，不是那个具体字符串。
+    """
+    s = str(v or "").strip().lower()
+    try:
+        if s in ("-1", "-1s", "0"):
+            return -1.0              # -1 = 永不卸载
+        if s.endswith("h"):
+            return float(s[:-1]) * 60
+        if s.endswith("m"):
+            return float(s[:-1])
+        if s.endswith("s"):
+            return float(s[:-1]) / 60
+        return float(s) / 60         # 纯数字按秒算
+    except Exception:
+        return 0.0
+
+
+check("保活时长明显长于 Ollama 默认的 5 分钟（>= 30 分钟）",
+      _keep_alive_minutes(CFG.get("model_keep_alive")) >= 30,
+      CFG.get("model_keep_alive"))
 check("ollama_client.chat 会把 keep_alive 带进请求体",
       'payload["keep_alive"]' in SRC_OC)
 

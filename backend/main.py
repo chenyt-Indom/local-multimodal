@@ -4101,8 +4101,19 @@ async def chat(req: ChatRequest):
         #   一个字都不吐 —— 没有这条提示，界面上就是"发出去完全没反应"，
         #   用户会以为卡死了（2026-09-27 反馈："每次模型启动都要等那么久"）。
         #   ⚠️ 必须放在**第一次 client.chat 之前**，否则起不到作用。
+        #
+        #   ⚠️⚠️ 2026-09-27 补：**不能只看 `_ollama_loaded_models()`** ——
+        #   实测 `api/ps` 会报旧数：画图时对话模型已被请出显存，ps 依旧报
+        #   "已加载、占 9.69GB 显存"，于是这条提示**根本不触发**，
+        #   用户对着空白等了 **397 秒**（见 t2i.rewarm_async 的实测记录）。
+        #   所以再加一个判据：后台正在做"请出去 + 请回来"时，也算"在加载"。
         try:
-            if model not in _ollama_loaded_models():
+            _need_load = model not in _ollama_loaded_models()
+            try:
+                _need_load = _need_load or t2i.rewarm_in_flight()
+            except Exception:
+                pass
+            if _need_load:
                 yield json.dumps({"status": "⏳ 正在加载模型 %s（首次加载较慢，之后就是秒回）…"
                                             % model}) + "\n"
         except Exception:
@@ -5338,12 +5349,17 @@ def _warm_models(models: list) -> None:
     except Exception:
         cfg = {}
     base = str(cfg.get("ollama_url") or "http://127.0.0.1:11434").rstrip("/")
-    keep = str(cfg.get("model_keep_alive") or "30m")
+    keep = str(cfg.get("model_keep_alive") or "4h")
+    # ⚠️⚠️ options 必须和真实聊天请求**同一套**（尤其是 num_ctx）——
+    #    否则 Ollama 会认为"配置变了"，把刚预热的模型卸掉重装：
+    #    实测日志里每 20 秒一次 `loading model via llama-server`，
+    #    用户体感"每句话都要等 25 秒"。详见 ollama_client.warm_options 的说明。
+    warm_opts = ollama_client.warm_options()
     for m in models:
         try:
             raw = json.dumps({"model": m, "prompt": "", "stream": False,
                               "keep_alive": keep,
-                              "options": {"num_predict": 1}}).encode()
+                              "options": warm_opts}).encode()
             req = _u.Request(base + "/api/generate", data=raw,
                              headers={"Content-Type": "application/json"})
             _u.urlopen(req, timeout=600).read()

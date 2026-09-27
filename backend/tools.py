@@ -2368,6 +2368,18 @@ def _do_generate_image(arguments, ui_events):
                     "model": result.get("model"), "cost_s": round(cost, 1),
                     "size": result.get("size"),
                     "origin": "gen"})     # ← 前端据此标注「AI 生成」
+    # ★★ 图片已经交给前端了，**在这里（请求线程）把 SDXL 从显存里放掉**。
+    #    为什么必须在这里、而不是画完由后台预热线程顺手放：
+    #      · 12GB 卡装不下 SDXL(11.5GB) + 30B(9.7GB)，共存时两边都被挤进共享内存；
+    #      · 实测后果：画完图后的**第一条消息等 397.5 秒**（另一轮 161.8s、27.9s）；
+    #      · 而在后台线程里调 `t2i.unload()` 会**和后端卡死**撞上
+    #        （跨线程竞态：请求线程可能正在用同一份管道，实测 `/api/config` 都超时）。
+    #    ⇒ 释放动作跟着生成走（都在请求线程），预热线程只负责把对话模型热回来。
+    #    代价：下一张图要重载 SD（约 10 秒），与 hd 分支早就接受的取舍一致。
+    try:
+        t2i.unload()
+    except Exception:
+        pass
     real_size = result.get("size") or ("%d x %d" % (width, height))
     extra = f"（{result['hd_note']}）" if (hd and result.get("hd_note")) else ""
     style_note = "（已按「%s」风格加强）" % style_pos.split(",")[0] if style_pos else ""

@@ -432,6 +432,14 @@ def free_ollama_vram() -> list:
 # 被 free_ollama_vram() 请出显存、等着画完请回来的模型名
 _REWARM_PENDING: list = []
 
+# 后台预热是否正在进行（main.py 用它决定要不要提示"正在加载模型"）
+_REWARM_INFLIGHT = False
+
+
+def rewarm_in_flight() -> bool:
+    """后台预热/重载是否正在进行。前端据此提示"正在加载模型"，别让用户干等。"""
+    return bool(_REWARM_INFLIGHT)
+
 
 def rewarm_async() -> None:
     """**画完图后，在后台把对话模型请回显存**（不阻塞返回）。
@@ -443,54 +451,96 @@ def rewarm_async() -> None:
       · 这里在图片生成**返回之后**立刻后台预热，用户读图/看结果那几秒里
         模型就已经在加载了，下一轮基本是热的。
 
+    ⚠️⚠️ 2026-09-27 二次修正（端到端实测抓到的）：**真正的病根是"SDXL 不放显存"**。
+      第一版只做了"没加载才热"，真机上完全不够 ——
+      非 hd 的生成路径**画完不会 unload**（unload 只在 hd 分支里），
+      所以画完那一刻 SDXL 还赖在显存里；此时把 30B 塞回来就是
+      "SDXL 11.5GB + 30B 9.7GB 同抢 12GB"，两边都被挤进共享内存：
+
+        画完图后的**第一条消息**实测：**397.5 秒**（另一轮 161.8s、27.9s，波动极大）
+        请求线程里放掉 SDXL 之后再热：**25.8 秒**，紧接着第二条 **3.57 秒**
+
+      更坑的是这种"虚加载"**从外面看不出来**：`api/ps` 依旧报"已加载、占 9.69GB 显存"，
+      连"⏳ 正在加载模型"的提示都不会触发，用户只能对着空白干等几分钟。
+      ⇒ 所以现在 main.py 会同时看 `rewarm_in_flight()`，预热期间就提示"在加载"。
+
+    ⚠️⚠️ 但**释放显存这件事不归这里管**（走过两条弯路，都留了实测记录）：
+      ① 在本函数里发 `keep_alive=0` 把对话模型"先卸后装" → 整轮 **997.6 秒**
+         （本函数是在"工具已返回、模型还在写图中总结"那一刻跑的，
+          等于把正在用的模型从底下抽走）；
+      ② 在本函数里调 `unload()` 去放 SDXL → **后端直接卡死**：
+         `/api/config` 请求 5 秒超时无响应，Ollama 里模型也被卸掉、重载要 38.8 秒。
+         根因是**跨线程竞态** —— 本函数在后台线程，请求线程可能正在用同一份 SDXL 管道。
+      ⇒ 结论：**显存释放只能由请求线程做**（已放到 `tools._do_generate_image`
+        生成完成之后）。本函数只做一件事：把对话模型热回来。
+
     设计取舍：
       · **后台线程 + daemon**：绝不能让预热把画图响应卡住；
       · **失败静默**：预热只是优化，失败了大不了下一轮慢一次；
       · 幂等：`_REWARM_PENDING` 取完即清，重复调用不会反复加载。
     """
-    global _REWARM_PENDING
+    global _REWARM_PENDING, _REWARM_INFLIGHT
     if not _REWARM_PENDING:
         return
     models = list(_REWARM_PENDING)
     _REWARM_PENDING = []
 
     def _run():
+        global _REWARM_INFLIGHT
+        _REWARM_INFLIGHT = True
         try:
-            cfg = config.load_config() or {}
-        except Exception:
-            cfg = {}
-        keep = str(cfg.get("model_keep_alive") or "4h")
-        base = str(cfg.get("ollama_url") or "http://127.0.0.1:11434").rstrip("/")
-
-        def _already_loaded() -> set:
-            """当前真正在显存/内存里的模型。查不到就当"没加载"，宁可多热一次。"""
             try:
-                req = urllib.request.Request(base + "/api/ps")
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    data = json.load(r)
-                return {str(x.get("name") or "") for x in (data.get("models") or [])}
+                cfg = config.load_config() or {}
             except Exception:
-                return set()
+                cfg = {}
+            keep = str(cfg.get("model_keep_alive") or "4h")
+            base = str(cfg.get("ollama_url") or "http://127.0.0.1:11434").rstrip("/")
 
-        # ⚠️ 先等一会儿再探：Ollama 的卸载是**异步**的，keep_alive=0 刚发出去时
-        #    `api/ps` 里还看得见它。此时立刻预热等于把它又拉回來（白热一趟）。
-        #    实测卸载后 5 秒左右列表才清空，这里给 6 秒余量。
-        time.sleep(6)
-        loaded = _already_loaded()
-        for m in models:
-            if m in loaded:
-                continue              # 还活着（用户正在用 / 压根没卸掉）→ 别打扰
-            try:
+            def _hit(m: str, keep_alive) -> None:
+                """发个空请求，只为带着 keep_alive 把模型装上（顺带把权重热回显存）。
+
+                ⚠️⚠️ options 必须与真实聊天请求**同一套**（尤其 num_ctx）——
+                  之前这里只给了 num_predict，Ollama 就用默认窗口装好模型，
+                  用户下一条消息带 num_ctx=28672 又被判定"配置变了"→ 卸掉重装。
+                  Ollama 日志实测：**每 20 秒一次** `loading model via llama-server`，
+                  体感就是"每句话都要等 25 秒"。详见 ollama_client.warm_options。
+                """
                 body = json.dumps({"model": m, "prompt": "", "stream": False,
-                                   "keep_alive": keep,
-                                   "options": {"num_predict": 1}}).encode("utf-8")
+                                   "keep_alive": keep_alive,
+                                   "options": _warm_opts()}).encode("utf-8")
                 req = urllib.request.Request(
                     base + "/api/generate", data=body,
                     headers={"Content-Type": "application/json"})
                 with urllib.request.urlopen(req, timeout=600) as r:
                     r.read()
-            except Exception:
-                pass                  # 预热失败无所谓，真正请求时还会再加载
+
+            def _warm_opts() -> dict:
+                try:
+                    from .ollama_client import warm_options
+                    return warm_options()
+                except Exception:
+                    return {"num_predict": 1}
+
+            # ⚠️⚠️ 这里**不做任何显存释放动作**（不放 SDXL、不发 keep_alive=0）。
+            #   走过两条弯路，都记在这里：
+            #   ① 发 `keep_alive=0` 把对话模型"先卸后装" → 整轮 **997.6 秒**。
+            #      rewarm 是在"工具已返回、模型还在写图中总结"那一刻跑的，
+            #      等于把正在用的模型从底下抽走。
+            #   ② 在这里调 `unload()` 去放 SDXL → 后端**直接卡死**
+            #      （`/api/config` 请求 5 秒超时无响应，Ollama 里模型也被卸了要 38.8 秒重载）。
+            #      原因是跨线程竞态：本函数跑在后台线程，而请求线程可能正在用同一份
+            #      SDXL 管道（`unload()` 会把 `_pipe.to("cpu")` 并置 None）。
+            #   ⇒ 显存释放必须由**请求线程**在合适时机做（已放在 tools._do_generate_image
+            #     生成完成之后），这里只负责"把对话模型热回来"这一件事。
+            #   ③ 顺序上也只能如此：SDXL 早已在请求线程里放掉，这里再热对话模型就不会打架。
+            for m in models:
+                try:
+                    _hit(m, keep)
+                except Exception:
+                    pass                    # 预热失败无所谓，真正请求时还会再加载
+        finally:
+            _REWARM_INFLIGHT = False
+
     threading.Thread(target=_run, daemon=True, name="ollama-rewarm").start()
 
 

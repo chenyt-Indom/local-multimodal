@@ -163,6 +163,37 @@ class OllamaClient:
         return self._req("POST", "/api/chat", json=payload)
 
 
+def warm_options() -> dict:
+    """**预热 / 空推理**请求用的 options —— 必须和真实聊天请求**同一套**。
+
+    ⚠️⚠️ 2026-09-27 实测踩到（Ollama 自己的日志为证）：
+      之前预热只给了 `num_predict`，**没给 `num_ctx`** → Ollama 按**默认窗口**把模型
+      装好；用户下一条消息带 `num_ctx=28672`，又被判定"配置变了" → **卸掉重装**。
+      `%LOCALAPPDATA%\\Ollama\\server.log` 里就是**每 20 秒一次**
+      `loading model via llama-server`（每次约 17 秒），
+      用户体感"每句话都要等 25 秒"，而且怎么调保活时长都没用。
+
+      这还解释了两个一直没想通的现象：
+        · 启动时明明"已预热模型"，用户第一条消息却仍要等 **48 秒** ——
+          预热用默认窗口装好，第一条消息又重装了一遍；
+        · 画完图预热完，接着聊天还是要等 **25 秒** —— 同一原因。
+
+    ⇒ 结论：预热也要走 `chat()` 那套 options。与其要求每个调用点自觉对齐，
+      不如在这里统一收口（和 `chat()` 里 num_ctx 收口是同一个道理）。
+    """
+    try:
+        cfg = config.load_config() or {}
+    except Exception:
+        cfg = {}
+    opts = {"num_ctx": int(cfg.get("num_ctx") or 8192), "num_predict": 1}
+    for k in ("temperature", "repeat_penalty", "repeat_last_n",
+              "presence_penalty", "frequency_penalty", "top_p", "top_k"):
+        v = cfg.get(k)
+        if v not in (None, "", 0):
+            opts[k] = v
+    return opts
+
+
 def encode_image_bytes(data: bytes) -> str:
     """把二进制图片编码为 base64 字符串（Ollama 需要的格式）。"""
     return base64.b64encode(data).decode("utf-8")
