@@ -3621,6 +3621,35 @@ def _is_plain_coverish(sl) -> bool:
     return not has_body
 
 
+def _clean_stray_inline_html(obj):
+    """递归清理模型误写进内容里的 HTML 内联标签（**保留标签里的文字**）。
+
+    ⚠️ 2026-09-27 实测踩到：让模型「查天气，据此写份出行建议，**做成 Word 文档**」，
+    它把正文写成这样：
+        • <b>校内日常</b>
+        • 上课前务必涂抹 SPF50+ 防晒霜<br><small>(推荐：…)</small>
+    文档工具不认这些标签，会**当纯文本原样排进 docx** ——
+    用户在正式文档里看到一堆字面量 `<b>` / `<br>` / `<small>`（实测 docx 里就是这样）。
+
+    只清理**实测出现过的那几种内联标签**，不做通用 HTML 解析 ——
+    免得把"用户真的在讲 HTML"的内容也吃掉（那种多半写 `<div>` / `<span>`，
+    而且通常放在代码块里）。
+    """
+    if isinstance(obj, str):
+        s = obj
+        if "<" not in s:
+            return s
+        s = re.sub(r"(?i)<br\s*/?>", "\n", s)          # 换行标签 → 真换行
+        for t in ("b", "strong", "i", "em", "u", "s", "small", "sub", "sup", "mark"):
+            s = re.sub(r"(?i)</?%s\s*/?>" % t, "", s)   # 成对/单个都去掉，只留文字
+        return s
+    if isinstance(obj, list):
+        return [_clean_stray_inline_html(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _clean_stray_inline_html(v) for k, v in obj.items()}
+    return obj
+
+
 def _do_make_pptx(arguments=None, ui_events=None) -> str:
     """把结构化内容生成 .pptx，存进生成文库，返回可点下载链接。
 
@@ -3632,7 +3661,7 @@ def _do_make_pptx(arguments=None, ui_events=None) -> str:
     from . import doclib as _dl
     from . import pptx_maker as _pp
 
-    a = arguments or {}
+    a = _clean_stray_inline_html(arguments or {})
     title = str(a.get("title") or "").strip()
     slides = _pick_slides(a)
     if not title:
@@ -3806,7 +3835,7 @@ def _do_make_docx(arguments=None, ui_events=None) -> str:
     from . import doclib as _dl
     from . import docx_maker as _dm
 
-    a = arguments or {}
+    a = _clean_stray_inline_html(arguments or {})
     title = str(a.get("title") or "").strip()
     blocks = _pick_blocks(a)
     if not title:
@@ -3884,7 +3913,7 @@ def _do_make_xlsx(arguments=None, ui_events=None) -> str:
     import tempfile
     from . import doclib as _dl          # 同其它 maker：函数内导入
     from . import xlsx_maker as _xl
-    a = arguments or {}
+    a = _clean_stray_inline_html(arguments or {})
     sheets = a.get("sheets") or []
     # 容错：模型可能写成 sheets 以外的名字，或者直接把单张表塞在顶层
     if not sheets:
