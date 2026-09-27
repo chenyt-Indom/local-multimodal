@@ -1725,6 +1725,18 @@ def json_dumps(o) -> str:
 
 def dispatch(name: str, arguments: dict, ui_events: list, context: dict) -> str:
     """执行一个工具调用，返回给模型的文本。ui_events 收集前端副作用。"""
+    # ⚠️ 2026-09-28：统一还原「被模型 URL 编码的文件名」。
+    # 实测：模型会把 make_docx 返回的下载链接里的编码名
+    # （`%E5%B1%B1%E4%B8%9C%E8%88%B0...docx`）照抄到别的工具的 name/rel/path 上，
+    # 于是工具报「文件不存在」，用户看到的就是"上传的文件读不出来 / 乱读"。
+    # 在这里一次兜住，省得每个 _do_* 各自处理；只动下面这些**文件名类字段**，
+    # 绝不碰 content / text / 正文（正文里出现 `%20` 是用户自己的内容）。
+    if isinstance(arguments, dict):
+        for _k in ("name", "filename", "rel", "path", "new_name", "old_name",
+                   "to", "file", "src", "dst", "doc", "docx", "pptx", "xlsx"):
+            _v = arguments.get(_k)
+            if isinstance(_v, str) and "%" in _v:
+                arguments[_k] = _fix_filename(_v)
     if name == "workspace_list":
         return _do_workspace_list()
     if name == "workspace_read":
@@ -3674,6 +3686,36 @@ def unescape_html_entities(s):
     return s
 
 
+def _fix_filename(s):
+    """把模型误传的 **URL 编码文件名**还原成真实文件名。
+
+    ⚠️ 2026-09-28 实测踩到：模型调 `library` 读文件时，name 传的是
+    `%E5%B1%B1%E4%B8%9C%E8%88%B0%E4%B8%93%E9%A2%98%E6%8A%A5%E5%91%8A.docx`
+    （"山东舰专题报告.docx" 的 URL 编码）—— 因为它**照抄了 make_docx /
+    export 返回的下载链接**，而那个链接里的文件名是 `urllib.parse.quote(base)`
+    编码过的。结果工具直接报「文件不存在」，用户看到的就是
+    "上传的文件读不出来 / 乱读一遍"。
+
+    这里统一容错：看着像 URL 编码就解一次；解不出合法结果就原样返回。
+    工具侧兜住，不指望模型每次都传对。
+    """
+    s = str(s or "").strip()
+    # ⚠️ 2026-09-28 实测：模型会连"引用文件名时的包裹符号"一起抄进来 ——
+    # 用户说「读一下《山东舰专题报告.md》」，它就把 name 传成 `《山东舰专题报告.md》`
+    # （有时还带反引号、中英文引号、尖括号）。这些显然不是文件名的一部分，去掉。
+    s = s.strip('《》〈〉「」『』“”"\'`<>【】[]').strip()
+    if not s or "%" not in s:
+        return s
+    try:
+        d = urllib.parse.unquote(s)
+    except Exception:
+        return s
+    # 只在"确实变了、且没解出替换字符"时才采用
+    if d and d != s and "\ufffd" not in d:
+        return d
+    return s
+
+
 def _clean_stray_inline_html(obj):
     """递归清理模型误写进内容里的 HTML 内联标签（**保留标签里的文字**）。
 
@@ -3955,10 +3997,11 @@ def _do_make_docx(arguments=None, ui_events=None) -> str:
     return ("已生成文档《%s》——共 %d 个内容块，%.0f KB。\n"
             "下载链接（**直接点就能存下来，原样给用户**）：\n"
             "/api/doclib/download?rel=%s\n"
-            "（源文件也放在「生成文库」里，文件名 %s。"
-            "之后要改它，用 edit_office 传这个文件名。）%s"
+            "⚠️ 真实文件名就是 `%s`（原样，含中文）。**链接里那串 %%XX 是 URL 编码，"
+            "不要拿它去调 library / edit_office**，否则会报「文件不存在」。\n"
+            "之后要改这份文档，用 edit_office 传 `%s`。%s"
             % (title, r.get("blocks") or len(blocks), len(data) / 1024.0,
-               urllib.parse.quote(base), base, tip))
+               urllib.parse.quote(base), base, base, tip))
 
 
 def _do_make_xlsx(arguments=None, ui_events=None) -> str:
@@ -5003,9 +5046,10 @@ def _do_run_python(arguments, ui_events=None, context=None):
 def _do_library(arguments, ui_events=None):
     """生成文库的增删改查 + 导出 Word。"""
     action = str((arguments or {}).get("action") or "list").strip().lower()
-    name = str((arguments or {}).get("name") or "").strip()
+    # ⚠️ 模型常把 URL 编码的文件名直接传进来（照抄下载链接），统一还原（见 _fix_filename）
+    name = _fix_filename((arguments or {}).get("name"))
     content = (arguments or {}).get("content")
-    new_name = str((arguments or {}).get("new_name") or "").strip()
+    new_name = _fix_filename((arguments or {}).get("new_name"))
     content = "" if content is None else str(content)
 
     def _notify(kind, **kw):
@@ -5317,6 +5361,17 @@ def _do_ask_user(arguments, context=None):
     if not answers:
         return ("用户没有回答（可能直接关掉了弹框）。请**按最合理的默认假设继续做**，"
                 "并在回答开头明确写出你替他假设了哪些条件，方便他纠正。")
+    # ⚠️ 2026-09-28 实测：用户"打开了提问框但一条都没填"时，answers 是**非空列表**、
+    # 只是每条 answer 都是空串 —— 于是生成出「1. 问题 → 」（箭头后什么都没有），
+    # 模型拿到一串空答案，会以为"用户答了但什么都没说"，原地打转或自己乱编。
+    # 这和"完全没答"其实是一回事，按同一套兜底处理。
+    if isinstance(answers, (list, tuple)):
+        _filled = [a for a in answers
+                   if str((a.get("answer") if isinstance(a, dict) else a) or "").strip()]
+        if not _filled:
+            return ("用户打开了提问框但**一条都没填**。请**按最合理的默认假设继续做**，"
+                    "并在回答开头写明你替他假设了什么，方便他纠正 —— "
+                    "不要停下来等，也不要重复问同样的问题。")
     lines = ["【用户补充的信息】"]
     for i, a in enumerate(answers, 1):
         if isinstance(a, dict):
