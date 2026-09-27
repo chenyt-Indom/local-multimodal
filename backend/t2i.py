@@ -374,6 +374,27 @@ def _log_exc(where: str, exc: Exception) -> None:
         pass
 
 
+def _log_timing(where: str, seconds: float, extra: str = "") -> None:
+    """把"这一步花了多久"写进同一个日志文件。
+
+    ⚠️ 为什么单独记时间（2026-09-27 补）：用户报「画图/切模型太慢」，
+    但**光看界面看不出一张图的一百多秒花在哪一步** —— 是卸载对话模型？
+    是 import torch？是读 6.6GB 权重？还是采样本身？
+    实测画一次图：工具在 23.5s 就被调用，显卡却到 118s 才让出来（空了 94.5s），
+    而单独测「卸载」只要 2s、「import torch+diffusers」只要 6.4s —— 对不上，
+    说明真正的瓶颈在别处，只能靠**逐步计时**定位。
+    统一写进 t2i_error.log（同目录，出问题时要一起看）。
+    """
+    import datetime
+    try:
+        path = config.data("logs", "t2i_error.log")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} [计时] "
+                    f"{where}: {seconds:.1f}s{('  ' + extra) if extra else ''}\n")
+    except Exception:
+        pass
+
+
 def free_ollama_vram() -> list:
     """画图前让 Ollama 的对话模型**退出显存**，返回被卸载的模型名。
 
@@ -402,6 +423,7 @@ def free_ollama_vram() -> list:
         return []
     base = str(cfg.get("ollama_url") or "http://127.0.0.1:11434").rstrip("/")
     freed = []
+    _t0 = time.time()
     for m in names:
         try:
             body = json.dumps({"model": m, "keep_alive": 0}).encode("utf-8")
@@ -413,6 +435,33 @@ def free_ollama_vram() -> list:
             freed.append(m)
         except Exception:
             pass                      # Ollama 没开 / 模型没装：忽略，别把画图搞挂
+    _log_timing("free_ollama_vram 发卸载请求", time.time() - _t0,
+                extra="模型=%s" % (",".join(names) or "无"))
+
+    # ⚠️⚠️ 2026-09-27 补：**必须等它真的退出显存**，不能发完就往下走。
+    #   `keep_alive=0` 只是让 Ollama"尽快卸载"，是**异步**的（实测约 2 秒才落地）。
+    #   不等的话紧接着就 import torch + 读 6.6GB SDXL 权重，
+    #   那一瞬间显卡上还占着对话模型的 ~11.6GB，SDXL 只能被挤进共享内存 ——
+    #   正是"切模型慢/出图慢"的元凶。这里轮询到真的空了再返回（最多 12 秒）。
+    def _still_loaded() -> list:
+        try:
+            with urllib.request.urlopen(base + "/api/ps", timeout=10) as r:
+                d = json.load(r)
+            # 保守：ps 查不到就当"还没卸载完"，宁可多等一轮
+            return [str(x.get("name") or "") for x in (d.get("models") or [])]
+        except Exception:
+            return []
+
+    _tw = time.time()
+    waited = 0.0
+    if names:
+        for _ in range(24):           # 24 × 0.5s = 12s 上限
+            if not _still_loaded():
+                break
+            time.sleep(0.5)
+        waited = time.time() - _tw
+    _log_timing("等待显存真正腾空", waited,
+                extra="剩余=%s" % (",".join(_still_loaded()) or "无"))
     # 记下"为了画图可能被请出去"的模型，画完由 rewarm_async() 请回来。
     #
     # ⚠️ 记的是**尝试过的全部**，不是 `freed`。2026-09-27 实测踩到的坑：
@@ -534,10 +583,13 @@ def rewarm_async() -> None:
             #     生成完成之后），这里只负责"把对话模型热回来"这一件事。
             #   ③ 顺序上也只能如此：SDXL 早已在请求线程里放掉，这里再热对话模型就不会打架。
             for m in models:
+                _t_w = time.time()
                 try:
                     _hit(m, keep)
+                    _log_timing("画完把对话模型热回显存", time.time() - _t_w,
+                                extra="模型=%s（后台线程，不影响用户）" % m)
                 except Exception:
-                    pass                    # 预热失败无所谓，真正请求时还会再加载
+                    _log_timing("画完预热失败", time.time() - _t_w, extra="模型=%s" % m)
         finally:
             _REWARM_INFLIGHT = False
 
@@ -546,9 +598,15 @@ def rewarm_async() -> None:
 
 def _load_pipe():
     """实际加载流水线（拆出来便于失败后重试）。"""
+    _t_all = time.time()
+    _t = time.time()
     free_ollama_vram()                # ★ 先把对话模型请出显存（见该函数说明）
+    _log_timing("① 让对话模型退出显存", time.time() - _t)
+    _t = time.time()
     import torch
     from diffusers import AutoPipelineForText2Image
+    _log_timing("② import torch + diffusers", time.time() - _t)
+    _t = time.time()
 
     # 设备选择：用户在界面上手动切过就听用户的，否则自动探测
     device = _pick_device(torch)
@@ -577,7 +635,12 @@ def _load_pipe():
         pipe = AutoPipelineForText2Image.from_pretrained(
             model_repo(), torch_dtype=dtype,
             variant="fp16" if device == "cuda" else None)
+    _log_timing("③ 读取 SD 权重（磁盘→内存）", time.time() - _t,
+                extra="device=%s variant=%s" % (device, "fp16"))
+    _t = time.time()
     pipe.to(device)
+    _log_timing("④ 权重搬到显卡", time.time() - _t)
+    _log_timing("=== 流水线就绪合计 ===", time.time() - _t_all)
     return pipe, device
 
 

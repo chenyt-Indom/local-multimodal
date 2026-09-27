@@ -122,6 +122,44 @@ def ps_models():
         return {}
 
 
+def ollama_load_duration(model=None):
+    """直连 Ollama 发一次极短请求，返回 `load_duration`（毫秒）。
+
+    ⚠️ 这是判断"模型有没有被重载"的**权威信号**，比任何墙钟指标都可靠：
+      已加载 → 个位数毫秒；重新加载 30B → 2 万毫秒级，差 3 个数量级。
+    为什么不能看 `api/ps`：Ollama 卸载/加载是**异步**的，ps 会报旧值
+    （实测显卡只剩 1196 MiB 时它还坚称占着 9.69 GB）。
+    量不到返回 None。
+    """
+    try:
+        m = model
+        cfg = {}
+        try:
+            cfg = http_get(BASE + "/api/config", timeout=10).get("config") or {}
+        except Exception:
+            pass
+        if not m:
+            m = cfg.get("default_model")
+        # ⚠️⚠️ **必须带上 num_ctx**，且要和应用一致（2026-09-27 踩到）：
+        #   只给 num_predict 的话，Ollama 会用**默认窗口**加载模型；
+        #   紧接着应用的下一条消息带着 num_ctx=40960 → 判定"配置变了"→ 卸载重装。
+        #   于是这个探针**自己把模型搞重载了**，量到的 load_duration 上万毫秒，
+        #   把一条本来正常的链路判成"重载失败"（实测就这么误报过一次）。
+        opts = {"num_predict": 1}
+        if cfg.get("num_ctx"):
+            opts["num_ctx"] = int(cfg["num_ctx"])
+        body = json.dumps({"model": m, "messages": [{"role": "user", "content": "1"}],
+                           "stream": False, "keep_alive": "4h",
+                           "options": opts}).encode("utf-8")
+        req = urllib.request.Request(OLLAMA + "/api/chat", data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=600) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+        return (d.get("load_duration") or 0) / 1e6
+    except Exception:
+        return None
+
+
 def chat(messages, model=None, stop_after_first=False, max_wait=600):
     """POST /api/chat 并读 NDJSON 流。
 
@@ -378,8 +416,21 @@ def main() -> int:
     rd2 = chat(h2, model=args.model or None, stop_after_first=True)
     print("  再来一条    首段 %s  用时 %.2fs" % (rd2["first_kind"], rd2["first_t"] or -1))
     mark("D 再来一条 首段 %.2fs" % (rd2["first_t"] or -1))
-    check("画完图后能快速衔接（首段 < 5 秒 = 没重载）", (rd2["first_t"] or 99) < 5.0,
-          "%.2fs" % (rd2["first_t"] or -1))
+
+    # ⚠️ 判据必须用 **load_duration**，不能用"首段墙钟 < N 秒"（2026-09-27 修）。
+    #   墙钟里混着"预填充 + 思考多久才开始吐字"，两者都随上下文和采样波动：
+    #   实测同一天同一台机，画完图后第一条 3.43s、第二条 **7.19s** —— 按 <5s 会误报，
+    #   但直连 Ollama 量 `load_duration` 只有 **4~5 ms**，明确没重载。
+    #   重载的真身是 20 秒级 + load_duration 上万毫秒，两者相差 3 个数量级。
+    ld_ms = ollama_load_duration(model=args.model or dm)
+    if ld_ms is None:
+        # 量不到（Ollama 没开）就退回墙钟，但阈值放宽到 10 秒
+        check("画完图后能快速衔接（首段 < 10 秒 ≈ 没重载）",
+              (rd2["first_t"] or 99) < 10.0, "%.2fs" % (rd2["first_t"] or -1))
+    else:
+        print("  直连 Ollama 量 load_duration = %.0f ms（>500ms 才是真重载）" % ld_ms)
+        check("画完图后对话模型没有被重载（load_duration < 500ms）",
+              ld_ms < 500, "%.0f ms" % ld_ms)
     if (rd["first_t"] or 0) > 10:
         print("  ⚠️ 注意：画完图后**第一条**消息等了 %.1fs —— 那是因为画图时"
               "对话模型被请出了显存，这条触发了重新加载。" % rd["first_t"])
