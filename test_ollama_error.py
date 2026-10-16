@@ -273,6 +273,38 @@ def main():
         check("前端读到了 explained 标记", "obj.explained" in js)
         check("只有没被解释过的错误才补那句通用提示",
               'err.explained ? "" : "（可能内存/模型未就绪，请查看状态）"' in js)
+
+        print("\n=== 8. 2026-10-16：「申请不到内存」要能认出来 + 自动清残留 ===")
+        # 用户报的原话（真身是**上次加载失败留下的 llama-server 孤儿**把提交内存顶满了：
+        # 实测两个孤儿 → 提交内存 87.8GB/96.6GB，清掉后立刻 37GB。)
+        _alloc_msg = ("llama-server startup failed after projector CPU offload retry: "
+                      "llama-server process has terminated: exit status 1: "
+                      "ggml_backend_cpu_buffer_type_alloc_buffer: failed to allocate "
+                      "buffer of size 17742723072")
+        sys.path.insert(0, ROOT)
+        import backend.main as M      # noqa: E402
+        check("认出 ggml 的 allocate buffer 失败", M._is_alloc_err(_alloc_msg))
+        check("也认出 `failed to allocate CUDA_Host buffer` 这种写法",
+              M._is_alloc_err("failed to allocate CUDA_Host buffer of size 17742723072"))
+        check("不误判 model not found", not M._is_alloc_err("model 'x' not found"))
+        check("不误判上下文超限", not M._is_alloc_err("exceeds the available context size"))
+        _zh = M._friendly_ollama_error(_alloc_msg)
+        check("翻译成中文并说清怎么办（英文原文只作为附注跟在后面）",
+              _zh.startswith("模型这次") and "内存" in _zh and "不是模型坏了" in _zh)
+        check("提到了「关掉占内存的程序 / 调小 num_ctx」这两条出路",
+              "num_ctx" in _zh and "关掉" in _zh)
+        _src = open(os.path.join(ROOT, "backend", "main.py"), encoding="utf-8").read()
+        check("有清理孤儿 llama-server 的函数", "def _reap_orphan_llama_servers" in _src)
+        check("清理判据看的是 /api/ps（不能靠父进程判断）", "/api/ps" in _src)
+        check("启动时会自检清理一次", '_reap_orphan_llama_servers("应用启动自检")' in _src)
+        check("报这个错时顺手清理", '_reap_orphan_llama_servers("报错后自动清理")' in _src)
+        check("只杀我们自己 Ollama 目录下的 llama-server（避免误杀系统那份）",
+              'MM_BUNDLE_ROOT' in _src and '"\\\\ollama\\\\"' in _src)
+        check("枚举进程不依赖 psutil（用 Win32 Toolhelp）",
+              "CreateToolhelp32Snapshot" in _src and "Process32FirstW" in _src)
+        _lch = open(os.path.join(ROOT, "launcher", "启动窗口.pyw"), encoding="utf-8").read()
+        check("包内 Ollama 限制同时只常驻一个模型（OLLAMA_MAX_LOADED_MODELS=1）",
+              'OLLAMA_MAX_LOADED_MODELS"] = "1"' in _lch)
     finally:
         try:
             proc.terminate()

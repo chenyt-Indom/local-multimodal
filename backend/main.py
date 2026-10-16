@@ -1748,6 +1748,135 @@ def _is_toolparse_err(msg) -> bool:
     return any(k in m for k in _TOOLPARSE_MARKS)
 
 
+def _is_alloc_err(msg) -> bool:
+    """Ollama 因为**内存/显存申请不下来**而启动失败的标志。
+
+    实测原文（2026-10-16）：
+      `llama-server startup failed after projector CPU offload retry: ...
+       ggml_backend_cpu_buffer_type_alloc_buffer: failed to allocate buffer of size 17742723072
+       ... failed to allocate CUDA_Host buffer of size ...`
+    """
+    m = str(msg or "").lower()
+    # ⚠️ 别只匹配 `failed to allocate buffer` —— 原文还有
+    #    `failed to allocate CUDA_Host buffer of size …` 这种中间插了词的说法，
+    #    漏了它就等于这个功能不存在（实测一开始就漏了）。
+    return (("failed to allocate" in m and "buffer" in m)
+            or ("alloc_buffer" in m and "failed" in m)
+            or ("startup failed after projector" in m))
+
+
+def _list_llama_servers() -> list:
+    """列出 llama-server 进程的 (pid, ppid, exe路径)。
+
+    用 Win32 的 Toolhelp 快照 + QueryFullProcessImageName，
+    **不引入 psutil**（这个项目的依赖表里没有它）。
+    ⚠️ 一定要拿到 exe 全路径：机器上可能装着**另一个** Ollama（比如系统托盘版），
+    不能把别人的 runner 一起杀了。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    k = ctypes.windll.kernel32
+    out = []
+    snap = k.CreateToolhelp32Snapshot(0x2, 0)          # TH32CS_SNAPPROCESS
+    if not snap or snap == -1:
+        return out
+    try:
+        e = PROCESSENTRY32W()
+        e.dwSize = ctypes.sizeof(e)
+        ok = k.Process32FirstW(snap, ctypes.byref(e))
+        while ok:
+            if str(e.szExeFile).lower().startswith("llama-server"):
+                path = ""
+                h = k.OpenProcess(0x1000, False, e.th32ProcessID)   # QUERY_LIMITED_INFORMATION
+                if h:
+                    buf = ctypes.create_unicode_buffer(1024)
+                    size = wintypes.DWORD(1024)
+                    if k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                        path = buf.value
+                    k.CloseHandle(h)
+                out.append((int(e.th32ProcessID),
+                            int(e.th32ParentProcessID), path))
+            ok = k.Process32NextW(snap, ctypes.byref(e))
+    finally:
+        k.CloseHandle(snap)
+    return out
+
+
+def _reap_orphan_llama_servers(reason: str = "") -> int:
+    """清掉**我们自己那份 Ollama** 留下的 llama-server 孤儿进程。
+
+    ⚠️⚠️ 这是 2026-10-16 实测出来的**粘性故障**（用户报"内存/模型未就绪"的真正原因）：
+    模型加载失败（内存/显存不够）时，Ollama 会留下 `llama-server.exe` 进
+    程**没有回收** —— 每个占着约 **9GB 显存** + 约 **25GB 提交内存**，
+    而 `/api/ps` 里**看不到它**（显示 0 个模型）。
+    后果：用户"关掉别的程序再重试"依然失败，看起来像"这台机器内存永远不够"，
+    其实是孤儿把提交内存顶满了。实测：两个孤儿让提交内存到 **87.8GB / 上限 96.7GB**，
+    清掉后立刻降到 **37GB**、显存从 10.3GB 降到 1.2GB，对话马上恢复。
+
+    只杀**路径在我们自己 Ollama 目录下**的 llama-server：
+    - 优先按 `MM_BUNDLE_ROOT/ollama` 判断（便携包布局）；
+    - 回退到"进程 exe 路径里带 `ollama`"。
+    拿不到路径的一律**不杀**（宁可留着，也不要误杀系统里另一个 Ollama 的 runner）。
+
+    ⚠️ 判"孤儿"不能看父进程：llama-server 的父进程是 `ollama.exe`（不是另一个
+    llama-server），父进程一直活着。**可靠的判据是 `/api/ps`**：
+    Ollama 正常服务时它一定列得出模型；列不出（0 个）却还挂着 llama-server，
+    那这些 runner 就是加载失败后留下的僵尸。
+    """
+    import os as _os
+    servers = _list_llama_servers()
+    if not servers:
+        return 0
+    # 先问 Ollama：现在有没有在正常服务的模型？有 ⇒ 一个都不动。
+    try:
+        from . import config as _cfg
+        base = str((_cfg.load_config() or {}).get("ollama_url")
+                   or "http://127.0.0.1:11434").rstrip("/")
+        with urllib.request.urlopen(base + "/api/ps", timeout=5) as r:
+            if (json.loads(r.read().decode("utf-8")).get("models") or []):
+                return 0
+    except Exception:
+        return 0          # 问不到就先不动手（宁可漏清，也不要误杀）
+    roots = []
+    bundle = _os.environ.get("MM_BUNDLE_ROOT")
+    if bundle:
+        roots.append(_os.path.join(bundle, "ollama").lower())
+    killed = 0
+    import ctypes
+    k = ctypes.windll.kernel32
+    for pid, _ppid, path in servers:
+        low = (path or "").lower()
+        mine = bool(roots) and any(low.startswith(r) for r in roots)
+        if not mine and path:
+            mine = "\\ollama\\" in low or "/ollama/" in low
+        if not mine:
+            continue
+        try:
+            h = k.OpenProcess(0x0001, False, pid)        # PROCESS_TERMINATE
+            if h:
+                k.TerminateProcess(h, 1)
+                k.CloseHandle(h)
+                killed += 1
+        except Exception:
+            continue
+    if killed:
+        logger.warning("[ollama] 已清理 %d 个残留的 llama-server 进程（%s）",
+                       killed, reason or "启动自检")
+    return killed
+
+
 def _friendly_ollama_error(msg) -> str:
     """把 Ollama 的内部英文报错翻成用户能懂、也知道下一步怎么办的话。
 
@@ -1785,6 +1914,21 @@ def _friendly_ollama_error(msg) -> str:
                 "⚠️ **前提是显存装得下**：超了会有一部分算到 CPU 上，明显变慢\n"
                 "  （实测 12GB 卡：24576 是 100% 在显卡上的上限；调到 32768 会有约 1GB 落到内存）。\n"
                 "**这不是内存或显存坏了**，纯粹是这一轮带的内容太长。\n`%s`" % m)
+    # ⚠️ 「申请不到内存」：2026-10-16 用户报的就是这个（原话附了整段英文原文）。
+    #    真凶往往是**上次加载失败留下的 llama-server 孤儿**把提交内存顶满了，
+    #    所以这里顺手清一次，并明确告诉用户"直接再发一次"。
+    if _is_alloc_err(m):
+        n = _reap_orphan_llama_servers("报错后自动清理")
+        extra = ("\n✅ **已自动清理 %d 个上次失败留下的残留进程**，"
+                 "**直接再发一次通常就好了**。" % n) if n else ""
+        return ("模型这次**没能装进内存**（显存 + 内存不够），所以没启动起来。\n"
+                "**不是模型坏了，也不是没下载**。\n"
+                "**怎么办**（任选）：\n"
+                "· 关掉占内存的程序（浏览器 / 游戏 / 微信…）再发一次；\n"
+                "· 把设置里的「上下文长度 num_ctx」调小一点"
+                "（40k 的 KV 缓存本身就要好几个 GB 内存）；\n"
+                "· 机器上如果还装着**另一个 Ollama**（系统托盘版），建议退出它。"
+                + extra + "\n`%s`" % m)
     return m
 
 
@@ -5593,6 +5737,15 @@ def _reap_ide_orphans():
             logger.info("已回收上次残留的 code-server 进程")
     except Exception as e:
         logger.warning("回收 code-server 残留进程失败：%s", e)
+    # ⚠️ 2026-10-16 补：模型加载失败会留下 llama-server 孤儿，占着显存+提交内存
+    #    却不在 /api/ps 里 —— 不清理的话，用户"关掉别的程序再重试"照样失败。
+    #    放在启动时清一次，保证"重启应用 = 回到干净状态"。
+    try:
+        n = _reap_orphan_llama_servers("应用启动自检")
+        if n:
+            logger.info("已清理 %d 个残留的模型进程（llama-server）", n)
+    except Exception as e:
+        logger.warning("清理 llama-server 残留进程失败：%s", e)
 
 
 @app.post("/api/ide/start")

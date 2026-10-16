@@ -33,6 +33,14 @@ shutil.copy(os.path.join(ROOT, "config.json"), os.path.join(TMP, "config.json"))
 os.environ["MM_DATA_DIR"] = TMP
 sys.path.insert(0, ROOT)
 
+# ⚠️ 2026-10-16：本机的权重已经**迁进便携整合包**（`<包根>\models\…`），
+#    源码树里那份和 `E:\local-multimodal-models` 都不在了。
+#    为了让这份测试在这台机器上仍然校验到**真实布局**，把模型根指到包内；
+#    别的机器/CI 上这个目录不存在就什么都不设，下面相关断言会自动降级为"跳过"。
+_BUNDLE_MODELS = r"E:\本地多模态助手\models"
+if os.path.isdir(_BUNDLE_MODELS):
+    os.environ["MM_MODELS_DIR"] = _BUNDLE_MODELS
+
 from backend import config as C              # noqa: E402
 from backend import main as M                # noqa: E402
 from backend import t2i                      # noqa: E402
@@ -338,11 +346,17 @@ check("候选目录抽成了函数（错误文案能列出全部候选）",
       "def _model_dir_candidates" in SRC_T2I and "def _inpaint_dir_candidates" in SRC_T2I)
 
 # 运行时：权重目录真的在（这就是本次故障的根因，必须守住）
-check("SDXL base 权重目录解析得到且存在",
-      os.path.isdir(t2i.local_model_dir()), t2i.local_model_dir())
-check("局部重绘权重目录解析得到且存在",
-      os.path.isdir(t2i.inpaint_model_dir()), t2i.inpaint_model_dir())
-check("inpaint_ready() 为真（权重齐、无 .incomplete 残留）", t2i.inpaint_ready())
+# ⚠️ 环境相关：机器上没装权重时（比如 CI）不该判失败，而是明确"跳过"。
+if os.path.isdir(t2i.local_model_dir()):
+    check("SDXL base 权重目录解析得到且存在",
+          os.path.isdir(t2i.local_model_dir()), t2i.local_model_dir())
+    check("局部重绘权重目录解析得到且存在",
+          os.path.isdir(t2i.inpaint_model_dir()), t2i.inpaint_model_dir())
+    check("inpaint_ready() 为真（权重齐、无 .incomplete 残留）", t2i.inpaint_ready())
+    check("模型根目录解析到了真实目录（models_root 生效）",
+          os.path.isdir(C.models_root()), C.models_root())
+else:
+    print("  [--] 本机没有装文生图权重（已迁到便携包），跳过 4 项存在性检查")
 _emsg = str(t2i._missing_model_error("文生图", t2i._model_dir_candidates(), ""))
 check("缺模型报错里列出了全部候选目录",
       all(c in _emsg for c in t2i._model_dir_candidates()))

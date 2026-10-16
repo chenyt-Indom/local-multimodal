@@ -151,6 +151,11 @@ def ensure_ollama(timeout: float = 90.0) -> str:
     env["OLLAMA_MODELS"] = os.path.join(_BUNDLE_MODELS, "ollama")
     env["OLLAMA_HOST"] = "127.0.0.1:%d" % _BUNDLE_OLLAMA_PORT
     env.setdefault("OLLAMA_KEEP_ALIVE", "30m")
+    # ⚠️ 一次只允许常驻**一个**模型（2026-10-16 实测）。
+    # 这台机器 33.8GB 内存，19.6GB 的 30B 模型里约 17.7GB 必须落在内存；
+    # 若"对话模型 + 代码模型"同时常驻就是 35GB+ ⇒ 必然 "failed to allocate buffer"。
+    # 代价：按轮路由切换时要卸载/重载（这个项目本来就这样，见技能里的实测数据）。
+    env["OLLAMA_MAX_LOADED_MODELS"] = "1"
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     try:
         subprocess.Popen(
