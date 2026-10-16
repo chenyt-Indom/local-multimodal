@@ -25,6 +25,7 @@
 import io
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -242,8 +243,16 @@ def main():
               e.get("explained") is True)
         check("是中文说明，不是裸英文", "工具调用格式不对" in msg, msg[:70].replace("\n", " "))
         check("明确说不是内存/显存问题", "不是" in msg and "内存" in msg)
+        # ⚠️ 2026-10-16 修：这条原来写死 `<= 3`，而 2026-09-28 已把
+        #    `_MAX_TOOLPARSE_RETRIES` 从 2 提到 4（30B 写坏工具调用 JSON 的频率不低，
+        #    "只重试 2 次经常还不够"）—— 改了产品没同步改测试，于是它一直**假失败**。
+        #    现在从源码里读上限（重试 4 次 + 首次 = 最多 5 次调用），以后调参不会再对不上。
+        _main_src = open(os.path.join(ROOT, "backend", "main.py"), encoding="utf-8").read()
+        _mm = re.search(r"_MAX_TOOLPARSE_RETRIES = (\d+)", _main_src)
+        _retry_bound = (int(_mm.group(1)) + 1) if _mm else 5
         check("重试有上限（不会无限循环）",
-              STUB_ROUNDS.count("一直坏") <= 3, f"{STUB_ROUNDS.count('一直坏')} 次")
+              STUB_ROUNDS.count("一直坏") <= _retry_bound,
+              f"{STUB_ROUNDS.count('一直坏')} 次（上限 {_retry_bound}）")
 
         print("\n=== 5. 别的错误（模型不存在）→ 立刻报，不许重试 ===")
         STUB_ROUNDS.clear()
