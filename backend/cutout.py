@@ -171,6 +171,7 @@ def _resolve_home() -> str:
     if env:
         return env
     candidates = [
+        os.path.join(config.models_root(), "rembg"),          # ← 自包含布局优先（便携包）
         config.res("rembg"),                                  # 打包后：_internal/rembg
         r"E:\本地多模态助手-Docker\models\rembg",              # Docker 挂载目录
         r"D:\local-multimodal-models\rembg",                   # 本机源码运行

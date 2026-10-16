@@ -222,9 +222,10 @@ def strip_wake_prefix(text: str) -> str:
 # 模型定位
 # --------------------------------------------------------------------------
 def _model_candidates() -> list[str]:
-    """ASR 模型目录候选：优先打包资源，其次本机模型目录。"""
+    """ASR 模型目录候选：优先包内自包含布局，其次打包资源 / 本机模型目录。"""
     from . import config
     return [
+        os.path.join(config.models_root(), "asr"),     # ← 便携包：<包根>\models\asr
         config.res("asr_model"),
         r"D:\local-multimodal-models\sherpa-asr",
         os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

@@ -41,6 +41,40 @@ def res(*parts: str) -> str:
     return os.path.join(res_root(), *parts)
 
 
+def models_root() -> str:
+    """模型权重根目录（2026-10-16 补：便携整合包的核心）。
+
+    为什么要单独有这个概念：原来权重路径是**写死的绝对路径**
+    （`E:\\local-multimodal-models\\sdxl-base`），一旦包被挪到别的盘、
+    或者别人拿到的是便携包，就找不到权重 —— 而代码在找不到时会去联网下载
+    （国内下不动），用户只看到"一直等待上线中"。
+    改成**相对自身**解析后，整个目录整块拷到任何位置都能直接用。
+
+    优先级：
+      1) 环境变量 `MM_MODELS_DIR`（便携包的启动器会设成 `<包根>\\models`）；
+      2) 环境变量 `MM_BUNDLE_ROOT` 下的 `models\\`；
+      3) 源码/包内约定：代码在 `app\\` 里 ⇒ 用 `<包根>\\models`；
+      4) `<资源根>\\models`（开发机把权重放源码树里时）；
+    都不存在时返回第 3（或 4）条候选 —— 调用方会用 `_missing_model_error`
+    把"找过哪些位置"告诉用户。
+    """
+    env = os.environ.get("MM_MODELS_DIR")
+    if env:
+        return env
+    bundle = os.environ.get("MM_BUNDLE_ROOT")
+    if bundle:
+        return os.path.join(bundle, "models")
+    root = res_root().rstrip("\\/") or res_root()
+    cands = []
+    if os.path.basename(root).lower() == "app":
+        cands.append(os.path.join(os.path.dirname(root), "models"))
+    cands.append(os.path.join(root, "models"))
+    for c in cands:
+        if os.path.isdir(c):
+            return c
+    return cands[-1]
+
+
 def data(*parts: str) -> str:
     """拼可写数据路径，并确保父目录存在。"""
     path = os.path.join(data_root(), *parts)

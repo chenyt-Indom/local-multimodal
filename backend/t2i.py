@@ -36,10 +36,16 @@ def model_repo() -> str:
 # 本地已下载的模型目录（fp16 权重），优先使用，避免联网拉取。
 # 打包运行时会自动探测随应用分发的 sd_model 资源目录；源码运行时用配置/环境变量/本机路径。
 def _model_dir_candidates() -> list:
-    """找 SDXL base 权重的候选目录（按优先级）。"""
+    """找 SDXL base 权重的候选目录（按优先级）。
+
+    ⚠️ 2026-10-16：**第一位是"包内相对路径"**（`<包根>\\models\\sd\\sdxl-base`）。
+    原来这里全是写死的绝对路径（`E:\\local-multimodal-models\\...`），
+    包一挪窝/换台机器就全落空 → 回退去联网下载 → 用户看到"一直等待上线中"。
+    """
     return [
+        os.path.join(config.models_root(), "sd", "sdxl-base"),   # ← 自包含布局优先
         config.res("sd_model"),                        # 打包后：_internal/sd_model
-        r"E:\local-multimodal-models\sdxl-base",       # 本机下载的 SDXL
+        r"E:\local-multimodal-models\sdxl-base",       # 开发机旧的绝对路径（保底）
         r"D:\local-multimodal-models\sdxl-base",
         # ⚠️ 2026-09-26 移除：原来这里还挂着 `sd-turbo`（SD2.1 蒸馏版）作"保底"。
         #    它已经彻底弃用（CFG=0 导致"画什么不像什么"），且会误导后来人以为
@@ -67,7 +73,7 @@ def _hf_endpoint() -> str:
 
 
 def _download_reachable(repo: str) -> bool:
-    """能不能真的从模型仓库取到这个仓库的文件。
+    r"""能不能真的从模型仓库取到这个仓库的文件。
 
     ⚠️ 2026-10-16 补：本地权重被删后（用户清盘时把 `E:\local-multimodal-models`
     整个删了），代码会**闷头去 HuggingFace 下载 6.9GB** —— 国内大概率连不上，
@@ -216,8 +222,10 @@ def _resolve_esrgan_path() -> str | None:
     env = os.environ.get("ESRGAN_MODEL")
     candidates = [env] if env else []
     candidates += [
-        r"D:\training_data\RealESRGAN_x4plus.pth",
+        # 自包含布局：<包根>\models\upscale\RealESRGAN_x4plus.pth（便携包放这里）
+        os.path.join(config.models_root(), "upscale", "RealESRGAN_x4plus.pth"),
         config.res("esrgan", "RealESRGAN_x4plus.pth"),
+        r"D:\training_data\RealESRGAN_x4plus.pth",     # 开发机原有位置（保底）
     ]
     for c in candidates:
         if c and os.path.isfile(c):
@@ -1272,8 +1280,9 @@ AREA_PRESETS = {
 
 
 def _inpaint_dir_candidates() -> list:
-    """找「局部重绘」权重的候选目录（按优先级）。"""
+    """找「局部重绘」权重的候选目录（按优先级；同样**包内相对路径优先**）。"""
     return [
+        os.path.join(config.models_root(), "sd", "sdxl-inpaint"),
         config.res("sd_inpaint"),
         r"E:\local-multimodal-models\sdxl-inpaint",
         r"D:\local-multimodal-models\sdxl-inpaint",
@@ -1289,7 +1298,7 @@ def inpaint_model_dir() -> str:
     for c in candidates:
         if os.path.isdir(c) and os.path.exists(os.path.join(c, "model_index.json")):
             return c
-    return candidates[1]
+    return candidates[0]
 
 
 def inpaint_ready() -> bool:
