@@ -35,11 +35,9 @@ def model_repo() -> str:
 
 # 本地已下载的模型目录（fp16 权重），优先使用，避免联网拉取。
 # 打包运行时会自动探测随应用分发的 sd_model 资源目录；源码运行时用配置/环境变量/本机路径。
-def _resolve_model_dir() -> str:
-    env = os.environ.get("SD_MODEL_DIR") or _cfg_sd("sd_model_dir")
-    if env:
-        return env
-    candidates = [
+def _model_dir_candidates() -> list:
+    """找 SDXL base 权重的候选目录（按优先级）。"""
+    return [
         config.res("sd_model"),                        # 打包后：_internal/sd_model
         r"E:\local-multimodal-models\sdxl-base",       # 本机下载的 SDXL
         r"D:\local-multimodal-models\sdxl-base",
@@ -47,6 +45,78 @@ def _resolve_model_dir() -> str:
         #    它已经彻底弃用（CFG=0 导致"画什么不像什么"），且会误导后来人以为
         #    系统还在用它。SDXL 就位后这个保底只会掩盖"SDXL 目录没配好"的问题。
     ]
+
+
+def _probe_endpoint(base: str, repo: str, timeout: float = 8.0) -> bool:
+    """HEAD 仓库里的一个真实文件，判断这个端点能不能真下到东西。"""
+    import urllib.request as _u
+    path = "%s/resolve/main/model_index.json" % str(repo or "").strip("/")
+    try:
+        req = _u.Request("%s/%s" % (base.rstrip("/"), path), method="HEAD",
+                         headers={"User-Agent": "local-multimodal/1.0"})
+        with _u.urlopen(req, timeout=timeout) as r:
+            return getattr(r, "status", 200) < 400
+    except Exception:
+        return False
+
+
+def _hf_endpoint() -> str:
+    """diffusers/huggingface_hub 这次**真正会用的**端点。"""
+    return str(os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/") \
+        or "https://huggingface.co"
+
+
+def _download_reachable(repo: str) -> bool:
+    """能不能真的从模型仓库取到这个仓库的文件。
+
+    ⚠️ 2026-10-16 补：本地权重被删后（用户清盘时把 `E:\local-multimodal-models`
+    整个删了），代码会**闷头去 HuggingFace 下载 6.9GB** —— 国内大概率连不上，
+    表现就是界面**一直"等待上线中"、好几分钟后才吐一句看不懂的报错**，
+    用户完全不知道发生了什么。所以"要联网下模型"之前先探一下。
+
+    ⚠️ 两个反直觉的点（都实测踩过）：
+      1. **要探仓库里的真实文件**，不能只 ping 根域名 ——
+         实测 `https://huggingface.co` 的 HEAD 会"假成功"，而
+         `/resolve/main/model_index.json` 超时（WinError 10060）。
+      2. **只探这次真正会用的端点**（有 `HF_ENDPOINT` 就是它，否则 huggingface.co）。
+         把 hf-mirror 也算"可达"是错的 —— 探测会通过，可真下载还是走 huggingface.co 而失败。
+         （hf-mirror 只在报错文案里当**可选出路**提示。）
+
+    需要绕过这道检查时设 `SD_ALLOW_DOWNLOAD=1`。
+    """
+    if str(os.environ.get("SD_ALLOW_DOWNLOAD") or "").strip().lower() in ("1", "true", "yes"):
+        return True
+    return _probe_endpoint(_hf_endpoint(), repo)
+
+
+def _missing_model_error(kind: str, candidates: list, repo: str = "") -> RuntimeError:
+    """本地没权重、又下不下来时给用户的**可执行**报错（别让它干等）。
+
+    若探测到国内镜像可用，就把 `HF_ENDPOINT` 这条现成的出路一并告诉他。
+    """
+    paths = "\n".join("    · %s" % c for c in candidates)
+    hint = ""
+    if not str(os.environ.get("HF_ENDPOINT") or "").strip() and repo \
+            and _probe_endpoint("https://hf-mirror.com", repo, timeout=5.0):
+        hint = ("\n  💡 检测到国内镜像 hf-mirror.com 可以连 —— 设一个环境变量就能自动下载：\n"
+                "       HF_ENDPOINT=https://hf-mirror.com   （设完重启应用）")
+    return RuntimeError(
+        "本地没有找到%s权重，而且连不上模型仓库（%s），没法自动下载 —— "
+        "所以刚才一直卡在「等待」而不是报错。\n"
+        "  找过这些位置：\n%s\n"
+        "  怎么办（任选一条）：\n"
+        "   1) 把已下好的权重放进上面任意一个目录（目录里要有 model_index.json）；\n"
+        "   2) 在设置里把 %s 指到已有目录；\n"
+        "   3) 有离线包的话，直接从它的 models/ 里复制一份过来。%s"
+        % (kind, _hf_endpoint(), paths,
+           "sd_model_dir" if kind == "文生图" else "inpaint_model_dir", hint))
+
+
+def _resolve_model_dir() -> str:
+    env = os.environ.get("SD_MODEL_DIR") or _cfg_sd("sd_model_dir")
+    if env:
+        return env
+    candidates = _model_dir_candidates()
     for c in candidates:
         if os.path.isdir(c) and os.path.exists(os.path.join(c, "model_index.json")):
             return c
@@ -646,6 +716,11 @@ def _load_pipe():
         if pipe is None:
             raise last_err or RuntimeError("本地模型加载失败")
     else:
+        # ⚠️ 2026-10-16：本地没权重时**先探一下能不能联网**，连不上就立刻报错 ——
+        #    否则它会去下 6.9GB，国内大概率连不上，界面就被吊在"等待上线中"永远不报错
+        #    （用户 2026-10-16 的原话："文生图模型一直显示模型等待上线中"）。
+        if not _download_reachable(model_repo()):
+            raise _missing_model_error("文生图", _model_dir_candidates(), model_repo())
         pipe = AutoPipelineForText2Image.from_pretrained(
             model_repo(), torch_dtype=dtype,
             variant="fp16" if device == "cuda" else None)
@@ -1196,16 +1271,21 @@ AREA_PRESETS = {
 }
 
 
+def _inpaint_dir_candidates() -> list:
+    """找「局部重绘」权重的候选目录（按优先级）。"""
+    return [
+        config.res("sd_inpaint"),
+        r"E:\local-multimodal-models\sdxl-inpaint",
+        r"D:\local-multimodal-models\sdxl-inpaint",
+    ]
+
+
 def inpaint_model_dir() -> str:
     """局部重绘模型的本地目录（优先本地，避免联网）。"""
     env = os.environ.get("SD_INPAINT_DIR") or _cfg_sd("inpaint_model_dir")
     if env:
         return env
-    candidates = [
-        config.res("sd_inpaint"),
-        r"E:\local-multimodal-models\sdxl-inpaint",
-        r"D:\local-multimodal-models\sdxl-inpaint",
-    ]
+    candidates = _inpaint_dir_candidates()
     for c in candidates:
         if os.path.isdir(c) and os.path.exists(os.path.join(c, "model_index.json")):
             return c
@@ -1330,8 +1410,12 @@ def _load_inpaint_pipe():
         if pipe is None:
             raise last_err or RuntimeError("本地重绘模型加载失败")
     else:
+        # 同文生图：连不上仓库就立刻报错，别把界面吊在"等待"上
+        _inj_repo = str(_cfg_sd("inpaint_model") or INPAINT_DEFAULT_REPO)
+        if not _download_reachable(_inj_repo):
+            raise _missing_model_error("局部重绘", _inpaint_dir_candidates(), _inj_repo)
         pipe = AutoPipelineForInpainting.from_pretrained(
-            str(_cfg_sd("inpaint_model") or INPAINT_DEFAULT_REPO),
+            _inj_repo,
             torch_dtype=dtype, variant="fp16" if device == "cuda" else None)
     pipe.to(device)
     return pipe, device

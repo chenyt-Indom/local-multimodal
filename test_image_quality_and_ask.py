@@ -317,6 +317,36 @@ check("不再承诺「0.35~0.45 = 换颜色 / 加小物件」",
       "0.35~0.45 = 换颜色" not in _src_tools)
 check("写明了会如实告诉用户、不假装改到了", "别假装改到了" in _src_tools)
 
+print()
+print("=" * 68)
+print("⑥ 2026-10-16：权重被删后「一直等待上线中」—— 必须快速失败并说清怎么办")
+# 真相：模型目录 E:\local-multimodal-models（13.88GB）在 2026-09-30 被删进回收站，
+# 代码找不到本地权重就**闷头去 HuggingFace 下 6.9GB** —— 国内连不上，
+# 界面就一直"等待"，实测 194 秒后才吐一句看不懂的报错（does not appear to have
+# a file named model_index.json）。用户完全不知道是"模型没了"。
+check("t2i 有仓库可达性探测（别无声地去下 6.9GB）", "def _download_reachable" in SRC_T2I)
+check("探测打的是仓库里的真实文件，不是只 ping 根域名",
+      "resolve/main/model_index.json" in SRC_T2I)
+check("探测只认这次真正会用的端点（HF_ENDPOINT 优先）",
+      "def _hf_endpoint" in SRC_T2I and "HF_ENDPOINT" in SRC_T2I)
+check("留了 SD_ALLOW_DOWNLOAD 手动放行开关", "SD_ALLOW_DOWNLOAD" in SRC_T2I)
+check("文生图缺权重时先探再报错", "_download_reachable(model_repo())" in SRC_T2I)
+check("局部重绘那条链路也有这道闸", "_download_reachable(_inj_repo)" in SRC_T2I)
+check("报错给出可执行出路（候选目录 / sd_model_dir / 离线包）",
+      "找过这些位置" in SRC_T2I and "sd_model_dir" in SRC_T2I and "离线包" in SRC_T2I)
+check("候选目录抽成了函数（错误文案能列出全部候选）",
+      "def _model_dir_candidates" in SRC_T2I and "def _inpaint_dir_candidates" in SRC_T2I)
+
+# 运行时：权重目录真的在（这就是本次故障的根因，必须守住）
+check("SDXL base 权重目录解析得到且存在",
+      os.path.isdir(t2i.local_model_dir()), t2i.local_model_dir())
+check("局部重绘权重目录解析得到且存在",
+      os.path.isdir(t2i.inpaint_model_dir()), t2i.inpaint_model_dir())
+check("inpaint_ready() 为真（权重齐、无 .incomplete 残留）", t2i.inpaint_ready())
+_emsg = str(t2i._missing_model_error("文生图", t2i._model_dir_candidates(), ""))
+check("缺模型报错里列出了全部候选目录",
+      all(c in _emsg for c in t2i._model_dir_candidates()))
+
 shutil.rmtree(TMP, ignore_errors=True)
 print()
 print("=" * 68)
