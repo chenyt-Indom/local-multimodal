@@ -45,6 +45,11 @@ CODE_EXCLUDE_DIRS = {
     ".git", "build", "build-lite", "dist-lite", "_qa_out", "_qa_docs",
     "__pycache__", "releases", "saved_images", "image_library", "sessions",
     "logs", "data", "rembg", "test_config.json", ".venv", "env",
+    # ⚠️ 2026-10-16 打包时发现这两个测试残留被带进了包里（合计 50KB）——
+    #    `.webtest-data` 是点开头的，原来的名单没覆盖到。
+    ".webtest-data", "asr_model", "sd_model", "sd_inpaint",
+    # ⚠️ 另外：打包前要确认 `app/` 下没有测试生成的 `.webtest-data` / `data`
+    #    （它们不在源码仓里，是跑测试跑出来的）。
 }
 CODE_EXCLUDE_FILES = {
     ".DS_Store",
