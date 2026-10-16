@@ -61,6 +61,15 @@ _BUNDLE_OLLAMA_EXE = os.path.join(_BUNDLE_DIR, "ollama", "ollama.exe")
 _BUNDLE_MODELS = os.path.join(_BUNDLE_DIR, "models")
 _BUNDLE_DATA = os.path.join(_BUNDLE_DIR, "data")
 
+# ⚠️⚠️ 包内 Ollama 用**独立端口 11435**，不抢系统的 11434（2026-10-16 定的）。
+# 为什么必须这样：系统装的 Ollama Windows 托盘版在"启动"文件夹里**开机自启**，
+# 它会先占住 11434；而它**无视 OLLAMA_MODELS**、只认自己 db.sqlite 的模型目录。
+# 于是会出现：整合包启动 → 看到 11434 有人在听 → 直接复用 → 而那个 Ollama
+# 手里根本没有我们的模型 → 又变成"model not found"。
+# 换个端口后，包内 Ollama 永远是权威的，机器上装没装 Ollama 都不影响它。
+_BUNDLE_OLLAMA_PORT = 11435
+_BUNDLE_OLLAMA_URL = "http://127.0.0.1:%d" % _BUNDLE_OLLAMA_PORT
+
 _SRC_DIR = r"D:\local-multimodal-src"
 _SRC_RUN = os.path.join(_SRC_DIR, "run.py")
 # 注意：本机有两个 Python，**只有下面这个装了项目依赖**（fastapi/torch 等），
@@ -104,12 +113,16 @@ def ensure_bundle_env() -> bool:
 
     用 `setdefault` 之外的强制赋值是故意的 —— 包内布局就是唯一真相，
     这样整块拷到别的盘/别的机器（盘符变了）也照样对。
+    同时把 `MM_OLLAMA_URL` 指向**包内 Ollama 的独立端口**（见 `_BUNDLE_OLLAMA_PORT`），
+    这样就算机器上还跑着别的 Ollama，也不会被"复用"到空壳上。
     """
     if not os.path.isdir(_BUNDLE_MODELS):
         return False
     os.environ["MM_BUNDLE_ROOT"] = _BUNDLE_DIR
     os.environ["MM_MODELS_DIR"] = _BUNDLE_MODELS
     os.environ["MM_DATA_DIR"] = _BUNDLE_DATA
+    if os.path.isfile(_BUNDLE_OLLAMA_EXE):
+        os.environ["MM_OLLAMA_URL"] = _BUNDLE_OLLAMA_URL
     try:
         os.makedirs(_BUNDLE_DATA, exist_ok=True)
     except Exception:
@@ -118,7 +131,7 @@ def ensure_bundle_env() -> bool:
 
 
 def ensure_ollama(timeout: float = 90.0) -> str:
-    """确保 Ollama 在跑；便携包里用**自带的** ollama.exe，不依赖系统托盘版。
+    """确保**包内的** Ollama 在跑（独立端口，不依赖系统托盘版）。
 
     ⚠️ 为什么必须自带（2026-10-16 的教训）：Windows 托盘版 `ollama app.exe`
     **无视 OLLAMA_MODELS 环境变量**，只认它自己 `%LOCALAPPDATA%\\Ollama\\db.sqlite`
@@ -126,14 +139,17 @@ def ensure_ollama(timeout: float = 90.0) -> str:
     （那通常是个目录联接，而 Ollama 0.40 读不了 reparse point）——
     用户看到的就是"模型全没了 / 404 model not found"。
     自己拉起 + 把 OLLAMA_MODELS 指到包内 `models\\ollama`，这个变量就彻底消失了。
+
+    ⚠️ 端口用 `_BUNDLE_OLLAMA_PORT`（11435）而不是 11434：系统的托盘版开机自启、
+    会先占住 11434，而它手里没有我们的模型 —— 复用它就等于又坏一次。
     """
-    if _port_open("127.0.0.1", 11434):
-        return "11434 上已有 Ollama 在跑，直接复用"
+    if _port_open("127.0.0.1", _BUNDLE_OLLAMA_PORT):
+        return "包内 Ollama 已在 %d 端口上运行" % _BUNDLE_OLLAMA_PORT
     if not os.path.isfile(_BUNDLE_OLLAMA_EXE):
         return "包内没有 ollama.exe，跳过（将使用系统安装的 Ollama）"
     env = dict(os.environ)
     env["OLLAMA_MODELS"] = os.path.join(_BUNDLE_MODELS, "ollama")
-    env["OLLAMA_HOST"] = "127.0.0.1:11434"
+    env["OLLAMA_HOST"] = "127.0.0.1:%d" % _BUNDLE_OLLAMA_PORT
     env.setdefault("OLLAMA_KEEP_ALIVE", "30m")
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     try:
@@ -145,12 +161,14 @@ def ensure_ollama(timeout: float = 90.0) -> str:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     except Exception as e:
-        return f"⚠️ 包内 Ollama 启动失败：{e}"
+        return "⚠️ 包内 Ollama 启动失败：%s" % e
     t0 = time.time()
     while time.time() - t0 < timeout:
         try:
-            with urllib.request.urlopen("http://127.0.0.1:11434/api/version", timeout=3):
-                return "包内 Ollama 已启动（模型目录 = models\\ollama）"
+            with urllib.request.urlopen(
+                    _BUNDLE_OLLAMA_URL + "/api/version", timeout=3):
+                return ("包内 Ollama 已启动（端口 %d，模型目录 = models\\ollama）"
+                        % _BUNDLE_OLLAMA_PORT)
         except Exception:
             time.sleep(1.0)
     return "⚠️ 包内 Ollama 启动超时（请检查 ollama 目录与显卡驱动）"
