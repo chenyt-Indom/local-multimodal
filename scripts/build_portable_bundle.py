@@ -175,8 +175,14 @@ def main():
 
     # 7) 启动器 / 配置 / 说明
     step(7, total, "放启动器、配置与说明")
-    shutil.copy2(os.path.join(DIST, "启动窗口.pyw"),
-                 os.path.join(BUNDLE, "启动窗口.pyw"))
+    # ⚠️ 启动器优先取**仓库里纳管的**那份（`launcher\启动窗口.pyw`）——
+    #    2026-10-16 才发现它原来只散落在 D:\local-multimodal-dist 里、**没进 git**，
+    #    改一次就丢一次。dist 那份留作回退。
+    launcher_src = os.path.join(SRC, "launcher", "启动窗口.pyw")
+    if not os.path.isfile(launcher_src):
+        launcher_src = os.path.join(DIST, "启动窗口.pyw")
+    shutil.copy2(launcher_src, os.path.join(BUNDLE, "启动窗口.pyw"))
+    log("    启动器来源: %s" % launcher_src)
     cfg_src = os.path.join(SRC, "config.json")
     if os.path.isfile(cfg_src):
         shutil.copy2(cfg_src, os.path.join(BUNDLE, "data", "config.json"))
