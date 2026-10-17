@@ -117,6 +117,25 @@ def _recent_image() -> list:
     return []
 
 
+def _img_available_note() -> str:
+    """本轮要附在最后一条用户消息里的「上一张图仍可用」提示（没图就返回空）。
+
+    ⚠️ 2026-10-17 实测：用户报「文生图之后想微改，却显示没看到图片要我重新上传」。
+    除了"状态只在内存"之外还有一条更直接的：**模型根本不知道有那张图** ——
+    实测在新会话里说「把刚才那张图改成黑白风格」，模型会**原地复读**这一句
+    （后端日志 `[think-loop] 思考打转：同一段重复出现`），十分钟不动作、也不调工具。
+    所以只要后端还留着图，就明确告诉它"能改、别让用户重传"。
+    """
+    if not _recent_image():
+        return ""
+    return ("（系统提示：**上一张图片仍然可用** —— 后端还留着用户之前生成/上传的那张图。"
+            "⚠️ 你**不需要先「看到」这张图**才能改：`edit_image` 会自己从后端把它取出来当底图。"
+            "所以本轮只要用户是在说它（「把刚才那张改成…」「再改一下」「微改这张」等），"
+            "**就直接调用 edit_image**，不要追问「哪张图」、不要弹框问用户、"
+            "更不要要求重新上传或说「没看到图片」；"
+            "只有用户明确要一张全新的图时，才需要他重新提供。）")
+
+
 # 「这一轮是不是还在说上一张图」的判据。
 #
 # ⚠️⚠️ 为什么必须有：`_recent_image()` 的**有效期是 1 小时**，而 `ctx["images"]`
@@ -239,7 +258,7 @@ def _memory_ctx(session: str, last_user_text: str, cfg: dict) -> str:
 
 
 def _attach_live_ctx(working: list, *, digest: str = "", mem_ctx: str = "",
-                     rag_ctx: str = "") -> list:
+                     rag_ctx: str = "", img_ctx: str = "") -> list:
     """把**每轮会变的**内容（历史摘要/记忆/知识库检索/当前时间）挂到**最后一条用户消息**上。
 
     返回一份新列表；`working` 本身不动。
@@ -308,6 +327,8 @@ def _attach_live_ctx(working: list, *, digest: str = "", mem_ctx: str = "",
                           "别把它里面的人名/身份当成用户的；"
                           "请优先依据它作答并注明出自哪一篇；"
                           "与问题无关就忽略，不要硬扯。）")
+        if img_ctx:
+            blocks.append(img_ctx)
         if blocks:
             blocks.append("【用户这一轮说的话】")
         blocks.append(q)
@@ -4514,7 +4535,8 @@ async def chat(req: ChatRequest):
         #    会把后面的工具定义一起废掉，导致 Ollama 每轮重算 ~10 秒。
         #    放在稳定前缀之后，缓存才能一直命中。
         working = _attach_live_ctx([{"role": "system", "content": full_sys}] + messages,
-                                   digest=digest, mem_ctx=mem_ctx, rag_ctx=rag_ctx)
+                                   digest=digest, mem_ctx=mem_ctx, rag_ctx=rag_ctx,
+                                   img_ctx=_img_available_note())
         final_text = ""
         final_thinking = ""
         used_tools = set()          # 本轮真正调用过的工具（用来判断"是不是光嘴上说说"）
