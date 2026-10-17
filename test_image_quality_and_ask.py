@@ -361,6 +361,22 @@ _emsg = str(t2i._missing_model_error("文生图", t2i._model_dir_candidates(), "
 check("缺模型报错里列出了全部候选目录",
       all(c in _emsg for c in t2i._model_dir_candidates()))
 
+print("\n=== 10. 画完图必须把内存真正还回去（2026-10-17「切不回大模型」）===")
+# 实测：unload() 里先 `pipe.to("cpu")` 会把 6.9GB 权重搬进系统内存，
+# 丢掉后还被 PyTorch/CRT 缓存着不还 OS → 画完一张图后端提交 18.28GB、
+# unload 后仍剩 11.62GB，紧接着让 30B（要 17.7GB）加载就卡死。
+check("unload() 里不再把流水线 .to('cpu')",
+      '_pipe.to("cpu")' not in _src_t2i and '_inpaint_pipe.to("cpu")' not in _src_t2i)
+check("unload() 仍会 gc.collect() + empty_cache()",
+      "gc.collect()" in _src_t2i and "empty_cache()" in _src_t2i)
+check("提供 any_loaded()（供聊天入口兜底判断）", "def any_loaded()" in _src_t2i)
+_src_main = open(os.path.join(ROOT, "backend", "main.py"), encoding="utf-8").read()
+check("聊天入口会先放掉残留的绘图引擎",
+      "t2i.any_loaded()" in _src_main and "t2i.unload()" in _src_main)
+check("放掉动作在 chat() 里且早于读配置",
+      _src_main.find("t2i.any_loaded()") < _src_main.find("cfg = config.load_config()",
+                                                          _src_main.find("async def chat(")))
+
 shutil.rmtree(TMP, ignore_errors=True)
 print()
 print("=" * 68)

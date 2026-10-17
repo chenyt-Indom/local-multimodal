@@ -3890,6 +3890,18 @@ def _ollama_loaded_models() -> set:
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
+    # ⚠️⚠️ 2026-10-17：**开跑前先把绘图引擎放掉**（如果它还占着）。
+    #   用户报的现象：画完图切回大模型，「加载很久没反应」。
+    #   实测根因有两条：① unload() 之前会 `pipe.to("cpu")`，把 6.9GB 权重搬进
+    #   系统内存后还不回去（已修，见 t2i.unload 注释）；② 生图/微改的**失败分支
+    #   会提前 return、跳过 unload**，SDXL 就一直占着约 16GB 提交内存。
+    #   这里兜最后一道：有残留就释放（正常情况是空操作，耗时 <1ms）。
+    try:
+        if t2i.any_loaded():
+            logger.info("[chat] 检测到绘图引擎仍占着内存，先释放再对话")
+            t2i.unload()
+    except Exception:
+        logger.warning("对话前释放绘图引擎失败（不影响对话）", exc_info=True)
     cfg = config.load_config()
     model = req.model or cfg["default_model"]
     model_note = ""

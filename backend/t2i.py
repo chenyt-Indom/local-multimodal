@@ -657,7 +657,7 @@ def rewarm_async() -> None:
             #   ② 在这里调 `unload()` 去放 SDXL → 后端**直接卡死**
             #      （`/api/config` 请求 5 秒超时无响应，Ollama 里模型也被卸了要 38.8 秒重载）。
             #      原因是跨线程竞态：本函数跑在后台线程，而请求线程可能正在用同一份
-            #      SDXL 管道（`unload()` 会把 `_pipe.to("cpu")` 并置 None）。
+            #      SDXL 管道（`unload()` 会把 `_pipe` 置 None）。
             #   ⇒ 显存释放必须由**请求线程**在合适时机做（已放在 tools._do_generate_image
             #     生成完成之后），这里只负责"把对话模型热回来"这一件事。
             #   ③ 顺序上也只能如此：SDXL 早已在请求线程里放掉，这里再热对话模型就不会打架。
@@ -772,6 +772,18 @@ def _get_pipe():
 
 def _pipe_loaded():
     return _pipe is not None
+
+
+def any_loaded() -> bool:
+    """有没有**任何**绘图流水线还占着显存/内存（文生图 / 微改 / 局部重绘）。
+
+    ⚠️ 2026-10-17 补：生图工具的失败分支会 `return` 掉、跳过 unload
+    （`_do_generate_image` 里 `if not result.get("ok"): return ...`、
+    `_do_edit_image` 的几处报错提前返回）。只要漏一次，下一轮对话就要
+    跟一个占着 ~16GB 的 SDXL 抢内存 —— 表现就是"切回大模型卡很久没反应"。
+    所以由聊天入口在开跑前兜一次（见 main.chat）。
+    """
+    return (_pipe is not None) or (_edit_pipe is not None) or (_inpaint_pipe is not None)
 
 
 def refine_detail(image, prompt: str, negative_prompt: str = "",
@@ -1520,35 +1532,38 @@ def inpaint(init_image, prompt: str, mask=None, regions=None, area: str = "",
 
 
 def unload():
-    """释放显存（生成后可调用，把 GPU 让回 Qwen）。"""
+    """释放显存与内存（生成后可调用，把 GPU 和内存都让回 Qwen）。
+
+    ⚠️⚠️ 2026-10-17 实测修正：**不要**先 `pipe.to("cpu")` 再丢引用。
+    那一步会把 6.9GB 的 fp16 权重**搬进系统内存**，丢掉后这块内存被
+    PyTorch / CRT 堆缓存在进程里、不还给操作系统。实测（RTX 5070Ti 12G + 33.8G 内存）：
+
+        没画图        后端提交  1.76 GB
+        画完一张图    后端提交 18.28 GB
+        调 unload     后端提交 11.62 GB   ← 显存清零了，内存却还剩约 10GB
+
+    后果正是用户报的现象：**画完图切回大模型，30B 要 17.7GB 提交内存，
+    申请不到 → 界面「加载很久没反应」**（严重时后端被整段换页，连 /api/health 都超时）。
+    正确做法：直接丢引用 —— CUDA 张量随之销毁，显存和内存一起释放，
+    也不会凭空多出一份 CPU 副本。
+    """
     import gc
     # ⚠️ 新增流水线时**必须一起加进这里** —— 忘了的话 Python 会把 `_inpaint_pipe`
     #    当成局部变量，抛 `UnboundLocalError: cannot access local variable`，
     #    而且是在"画完图要释放显存"这条路上炸（本测试就是这么抓到的）。
     global _pipe, _edit_pipe, _inpaint_pipe, _device
-    if _pipe is not None:
-        try:
-            _pipe.to("cpu")
-        except Exception:
-            pass
-        _pipe = None
-    if _edit_pipe is not None:
-        try:
-            _edit_pipe.to("cpu")
-        except Exception:
-            pass
-        _edit_pipe = None
-    if _inpaint_pipe is not None:
-        try:
-            _inpaint_pipe.to("cpu")
-        except Exception:
-            pass
-        _inpaint_pipe = None
+    _pipe = None
+    _edit_pipe = None
+    _inpaint_pipe = None
     _device = None
     gc.collect()
     try:
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()     # 回收跨进程显存句柄，避免残留
+            except Exception:
+                pass
     except Exception:
         pass
