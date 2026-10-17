@@ -267,7 +267,12 @@ echo       本地还没有模型，正在从镜像仓库提取（约 50GB，第一次会久一点）...
 docker pull %REG%/multimodal-models:latest
 if errorlevel 1 exit /b 1
 docker rm -f mm-models-tmp >nul 2>&1
-docker create --name mm-models-tmp %REG%/multimodal-models:latest >nul 2>&1
+REM  [!] 末尾那个 `placeholder` **不能省**（2026-09-30 实测踩到）：
+REM      multimodal-models 是 `FROM scratch` 的**数据镜像、没有 CMD**，
+REM      `docker create` 不带命令会直接报 `no command specified`，
+REM      导致"从镜像仓库部署"这一步直接失败。给个占位命令即可
+REM      （create 不执行它，只创建容器，之后 docker cp 取文件）。
+docker create --name mm-models-tmp %REG%/multimodal-models:latest placeholder >nul 2>&1
 if errorlevel 1 exit /b 1
 if not exist "models" mkdir "models"
 REM  [!] 路径**千万别写成 "models\"** —— cmd 会把末尾的 `\"` 当成**转义的引号**，
@@ -278,6 +283,18 @@ docker cp mm-models-tmp:/models/. "models"
 set "CPERR=%errorlevel%"
 docker rm -f mm-models-tmp >nul 2>&1
 if not "%CPERR%"=="0" exit /b 1
+REM ---- 拼回被切开的超大模型文件 ----
+REM  为什么会有分片：镜像仓库的**上传会话只活 60 分钟**，19.5GB 的层在 5MB/s
+REM  下要传 68 分钟，永远传不完（实测传到 89% 处全部归零）。所以上传时把超大
+REM  文件切成 <=8GB 的 .partN 分片，这里用上传脚本自带的 _join_parts.bat 拼回。
+if exist "models\_join_parts.bat" (
+    echo       正在拼回模型分片（首次会花几分钟）...
+    call "models\_join_parts.bat"
+    if errorlevel 1 (
+        echo       [!] 模型分片拼回失败，请检查磁盘空间是否足够
+        exit /b 1
+    )
+)
 echo       模型提取完成
 exit /b 0
 
