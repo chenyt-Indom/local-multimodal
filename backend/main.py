@@ -57,14 +57,56 @@ except Exception:
 
 # 最近一次出现过的图片（base64），供后续「把这张图改成…」直接微改，免去重新导入。
 # 单用户桌面应用，保存最近一张即可；换新图时自动覆盖。
+#
+# ⚠️⚠️ 2026-10-17：**必须落盘**。以前只存内存，应用一重启（改代码 / 崩溃 / 正常退出）
+#   "上一张图"就没了 → 用户说「把刚才那张改成…」时底图为空 →
+#   工具回「无法确定要修改的图片，请拖入对话」→ 用户被迫重新上传。
+#   用户原话：「文生图之后我想让它微改图片，却显示没有看到图片要我重新上传，
+#   我不想重新上传」。
 _LAST_IMAGE: dict = {"b64": None, "ts": 0.0, "ttl": 3600.0}
+_LAST_IMAGE_NAME = "last_image.json"
+
+
+def _last_image_path() -> str:
+    return config.data(_LAST_IMAGE_NAME)
+
+
+def _load_last_image() -> None:
+    """启动时把上次的「最近一张图」读回来（仍在有效期内才算）。"""
+    try:
+        p = _last_image_path()
+        if not os.path.isfile(p):
+            return
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+        b64 = d.get("b64")
+        ts = float(d.get("ts") or 0)
+        if b64 and (time.time() - ts) < _LAST_IMAGE["ttl"]:
+            _LAST_IMAGE["b64"] = b64
+            _LAST_IMAGE["ts"] = ts
+    except Exception:
+        logger.warning("读取上次的图片失败（不影响使用）", exc_info=True)
 
 
 def _remember_image(images: list) -> None:
-    """记住本轮图片，供下一轮引用。"""
+    """记住本轮图片，供下一轮引用（**同时落盘**，重启后还能接着微改）。"""
     if images:
         _LAST_IMAGE["b64"] = images[-1]
         _LAST_IMAGE["ts"] = time.time()
+        try:
+            p = _last_image_path()
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"b64": _LAST_IMAGE["b64"], "ts": _LAST_IMAGE["ts"]}, f)
+            os.replace(tmp, p)
+        except Exception:
+            logger.warning("保存上次的图片失败（本次仍可用）", exc_info=True)
+
+
+try:
+    _load_last_image()
+except Exception:
+    pass
 
 
 def _recent_image() -> list:
@@ -4932,6 +4974,12 @@ async def chat(req: ChatRequest):
             # shown_images：本轮已展示给用户的图，供「保存到图库」工具按序号引用
             # session：记忆按对话隔离，写记忆的工具必须知道当前是哪个对话
             ctx = {"images": images or prev_img, "shown_images": [],
+                   # ★ 「上一张图」**不经过指代判断**也透一份给工具（2026-10-17）：
+                   #   模型既然已经**决定调用 edit_image**，那就是明确要改上一张图，
+                   #   此时用它是安全的（不存在"把旧图接到别的话题"的串扰）。
+                   #   以前只给 ctx["images"]（受 _refers_to_prev_image 约束），
+                   #   用户说「再改一下 / 改改看」这类不含指代词的短句就取不到底图。
+                   "last_image": (_recent_image() or [None])[0],
                    # ★ 用户涂抹的选区蒙版（白=要改的地方）→ 透给 edit_image 做局部重绘
                    "mask": (list(req.mask_b64 or []) or [None])[0],
                    # 询问模式（快速/深度）—— 弹框顶部会据此显示不同提示

@@ -2475,6 +2475,15 @@ def _do_edit_image(arguments, ui_events, context):
         init_image = source  # edit_image 支持路径
     else:
         imgs = (context or {}).get("images") or []
+        if not imgs:
+            # ⚠️ 2026-10-17：没拿到图时**退一步用「上一张图」**。
+            #   模型既然已经决定调 edit_image，就说明它要改的是上一张，
+            #   这个意图是明确的（不会造成"把旧图接到别的话题"的串扰）。
+            #   不加这一步，用户说「再改一下」「改改看」这类不含指代词的短句
+            #   就会被要求重新上传 —— 用户原话：「我不想重新上传」。
+            _last = (context or {}).get("last_image")
+            if _last:
+                imgs = [_last]
         if imgs:
             raw = imgs[0]
             if isinstance(raw, str) and "," in raw and raw.startswith("data:"):

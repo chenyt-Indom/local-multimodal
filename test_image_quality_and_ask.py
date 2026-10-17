@@ -377,6 +377,24 @@ check("放掉动作在 chat() 里且早于读配置",
       _src_main.find("t2i.any_loaded()") < _src_main.find("cfg = config.load_config()",
                                                           _src_main.find("async def chat(")))
 
+print("\n=== 11. 「上一张图」必须能跨重启复用（2026-10-17「不想重新上传」）===")
+# 用户原话：文生图之后想微改，却显示没看到图片、要我重新上传。
+# 实测根因：`_LAST_IMAGE` 只存内存，应用一重启就没了 → 底图为空 → 工具报
+# 「无法确定要修改的图片」。改法：① 落盘 ② 启动时读回 ③ 工具侧兜底。
+check("「最近一张图」会落盘（last_image.json）",
+      "_LAST_IMAGE_NAME" in _src_main and "last_image.json" in _src_main)
+check("启动时会把它读回来", "def _load_last_image" in _src_main
+      and "_load_last_image()" in _src_main)
+check("落盘是原子写（先写 .tmp 再 os.replace）",
+      ".tmp" in _src_main and "os.replace" in _src_main)
+check("ctx 里透出未受指代判断约束的 last_image",
+      '"last_image":' in _src_main)
+_src_tools2 = open(os.path.join(ROOT, "backend", "tools.py"), encoding="utf-8").read()
+check("微改工具在本轮无附件时会退一步用 last_image",
+      'context or {}).get("last_image")' in _src_tools2)
+check("彻底没图时仍明确报错（不静默降级）",
+      "无法确定要修改的图片" in _src_tools2)
+
 shutil.rmtree(TMP, ignore_errors=True)
 print()
 print("=" * 68)
